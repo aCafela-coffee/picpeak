@@ -25,6 +25,8 @@ interface PhotosTabProps {
   setFeedbackFilters: React.Dispatch<React.SetStateAction<FeedbackFilters>>;
   filterSummary: FilterSummary | undefined;
   showMediaFilter: boolean;
+  // From the event's own counts, like showMediaFilter (issue 1430, item 3).
+  hasVideos: boolean;
 }
 
 export const PhotosTab: React.FC<PhotosTabProps> = ({
@@ -40,7 +42,8 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
   feedbackFilters,
   setFeedbackFilters,
   filterSummary,
-  showMediaFilter
+  showMediaFilter,
+  hasVideos
 }) => {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -103,6 +106,7 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
         onChange={setFeedbackFilters}
         summary={filterSummary || null}
         isLoading={photosLoading}
+        hasVideos={hasVideos}
       />
 
       {/* Actions Bar */}
