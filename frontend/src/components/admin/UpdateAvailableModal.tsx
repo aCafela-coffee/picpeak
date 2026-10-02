@@ -1,3 +1,4 @@
+import { screenDateLocale } from '../../i18n/dateLocale';
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -77,7 +78,7 @@ const fetchInstructions = async (): Promise<InstructionsResponse> => {
 const formatDate = (iso: string | null): string => {
   if (!iso) return '';
   try {
-    return new Date(iso).toLocaleDateString();
+    return new Date(iso).toLocaleDateString(screenDateLocale());
   } catch {
     return iso;
   }

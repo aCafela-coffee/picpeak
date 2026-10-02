@@ -1,3 +1,4 @@
+import { screenDateLocale } from '../../../i18n/dateLocale';
 /**
  * Clients → Newsletters — campaign list (#1264).
  *
@@ -167,7 +168,7 @@ export const NewsletterListPage: React.FC = () => {
                       {c.failedCount}
                     </td>
                     <td className="px-4 py-3 text-muted">
-                      {new Date(c.createdAt).toLocaleDateString()}
+                      {new Date(c.createdAt).toLocaleDateString(screenDateLocale())}
                     </td>
                     <td className="px-4 py-3 text-right">
                       {/* Only a draft or a cancelled campaign can be deleted —

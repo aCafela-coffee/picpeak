@@ -436,7 +436,7 @@ export const EventsListPage: React.FC = () => {
     <ErrorBoundary>
       <div>
         {/* Page Header */}
-        <div className="flex justify-between items-center mb-6">
+        <div className="flex flex-col items-start gap-3 sm:flex-row sm:justify-between sm:items-center mb-6">
           <div>
             <h1 className="text-2xl font-bold text-heading">{t('events.title')}</h1>
             <p className="text-soft mt-1">{t('events.subtitle')}</p>

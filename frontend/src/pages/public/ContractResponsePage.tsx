@@ -1,3 +1,4 @@
+import { applyServerLanguage } from '../../i18n/screenLanguage';
 /**
  * Public contract signing page (/contract/:token). No login.
  *
@@ -72,7 +73,7 @@ function useContractLanguage(language: string | null | undefined) {
   const { i18n } = useTranslation();
   useEffect(() => {
     if (language && language !== i18n.language) {
-      i18n.changeLanguage(language).catch(() => { /* tolerate */ });
+      applyServerLanguage(i18n, language).catch(() => { /* tolerate */ });
     }
   }, [language, i18n]);
 }
@@ -1441,7 +1442,7 @@ export const ContractResponseView: React.FC<{ adapter: ContractDocumentAdapter }
   // customer experience (matches QuoteResponsePage).
   useEffect(() => {
     if (data?.contract.language && data.contract.language !== i18n.language) {
-      i18n.changeLanguage(data.contract.language).catch(() => { /* tolerate */ });
+      applyServerLanguage(i18n, data.contract.language).catch(() => { /* tolerate */ });
     }
   }, [data, i18n]);
 

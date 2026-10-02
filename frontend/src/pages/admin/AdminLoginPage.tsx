@@ -1,3 +1,4 @@
+import { LanguageSelector } from '../../components/common/LanguageSelector';
 import React, { useState, useEffect } from 'react';
 import { Navigate, useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -233,6 +234,7 @@ export const AdminLoginPage: React.FC = () => {
   return (
     <div className="min-h-screen flex items-center justify-center p-4" style={{ backgroundColor: 'var(--color-background, #fafafa)' }}>
       <div className="w-full max-w-md">
+        <div className="flex justify-end mb-4"><LanguageSelector /></div>
         {/* Logo/Header — frame visibility and size are admin-controllable
             via Branding → "Login pages logo" settings. Both knobs apply
             to /admin/login and /customer/login exclusively. */}

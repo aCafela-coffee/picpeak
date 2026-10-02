@@ -478,6 +478,7 @@ export interface PublicQuoteView {
   responseLockedAt: string | null;
   canRespond: boolean;
   lineItems: Array<{
+    id?: number;
     position: number;
     quantity: number;
     description: string;

@@ -1,3 +1,4 @@
+import { screenDateLocale } from '../../../i18n/dateLocale';
 /**
  * Clients → Newsletters → campaign detail (#1264).
  *
@@ -180,7 +181,7 @@ export const NewsletterDetailPage: React.FC = () => {
                     {t(`newsletters.recipientStatus.${r.status}`, r.status)}
                   </td>
                   <td className="px-4 py-2 text-xs text-muted">
-                    {r.errorMessage || (r.sentAt ? new Date(r.sentAt).toLocaleString() : '')}
+                    {r.errorMessage || (r.sentAt ? new Date(r.sentAt).toLocaleString(screenDateLocale()) : '')}
                   </td>
                 </tr>
               ))}

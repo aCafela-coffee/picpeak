@@ -1,3 +1,5 @@
+import { screenDateLocale } from '../../../i18n/dateLocale';
+import { CompactLanguageSelector } from '../../common/LanguageSelector';
 import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { MasonryPhotoAlbum } from 'react-photo-album';
@@ -508,7 +510,7 @@ export const GalleryPremiumLayout: React.FC<GalleryPremiumLayoutProps> = ({
     }
   }, [allowDownloads, filteredPhotos, slug, downloadPhotoMutation, downloadQuota]);
 
-  const formattedDate = eventDate ? new Date(eventDate).toLocaleDateString('en-US', {
+  const formattedDate = eventDate ? new Date(eventDate).toLocaleDateString(screenDateLocale('en-US'), {
     year: 'numeric',
     month: 'long',
     day: '2-digit'
@@ -637,7 +639,8 @@ export const GalleryPremiumLayout: React.FC<GalleryPremiumLayoutProps> = ({
                 <DownloadIcon className="w-4 h-4" />
               </button>
             )}
-            {onLogout && (
+            <CompactLanguageSelector />
+          {onLogout && (
               <button
                 className="gallery-premium-nav-btn"
                 title={t('common.logout', 'Logout')}

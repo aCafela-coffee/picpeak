@@ -1,3 +1,4 @@
+import { screenDateLocale } from '../../../i18n/dateLocale';
 import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
@@ -51,7 +52,7 @@ const friendlyType = (t: string) =>
   TYPE_LABELS[t] || t.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 
 const fmt = (s?: string | null) =>
-  s ? new Date(s).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '';
+  s ? new Date(s).toLocaleString(screenDateLocale(), { dateStyle: 'medium', timeStyle: 'short' }) : '';
 
 // Compact mailbox label — just the local part + '@' (the domain clutters the
 // narrow sidebar); full address stays in the hover title.

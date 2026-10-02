@@ -1,3 +1,4 @@
+import { documentLanguage } from '../../../i18n/screenLanguage';
 import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
@@ -138,7 +139,7 @@ export const ShareLinkCard: React.FC<ShareLinkCardProps> = ({ event, setShowPass
       if (kind === 'png' || kind === 'svg') {
         saveBlob(await eventsService.getQrBlob(event.id, kind, 1024), `qr-${event.slug}.${kind}`);
       } else {
-        const lang = (i18n.language || 'en').split('-')[0];
+        const lang = documentLanguage(i18n.language).split('-')[0];
         saveBlob(await eventsService.getQrPrintBlob(event.id, kind, lang), `qr-${kind}-${event.slug}.pdf`);
       }
     } catch {

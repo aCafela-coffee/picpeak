@@ -1,3 +1,4 @@
+import { CompactLanguageSelector } from '../../common/LanguageSelector';
 import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { Search, Heart, LogOut, Download, CheckSquare, X, Package } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -458,6 +459,7 @@ export const GalleryStoryLayout: React.FC<GalleryStoryLayoutProps> = ({
               )}
             </button>
           )}
+          <CompactLanguageSelector />
           {onLogout && (
             <button
               className="story-nav-btn"
