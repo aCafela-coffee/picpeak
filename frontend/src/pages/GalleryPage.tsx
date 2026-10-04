@@ -1,3 +1,5 @@
+import { LanguageSelector } from '../components/common/LanguageSelector';
+import { applyServerLanguage } from '../i18n/screenLanguage';
 import React, { useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { AlertCircle, Check, Clock, Copy } from 'lucide-react';
@@ -139,7 +141,7 @@ export const GalleryPage: React.FC = () => {
   // Set language from admin settings when on login page
   React.useEffect(() => {
     if (!isAuthenticated && settingsData?.default_language) {
-      i18n.changeLanguage(settingsData.default_language);
+      applyServerLanguage(i18n, settingsData.default_language);
     }
   }, [settingsData, isAuthenticated, i18n]);
 
@@ -493,6 +495,7 @@ export const GalleryPage: React.FC = () => {
     <div className="min-h-screen" style={{ backgroundColor: 'var(--color-background, #fafafa)' }}>
       <div className="min-h-screen flex items-center justify-center p-4">
         <div className="w-full max-w-lg">
+          <div className="flex justify-end mb-4"><LanguageSelector /></div>
           {/* Logo/Header. The logo can be hidden per gallery (#894). */}
           <div className="text-center mb-4 sm:mb-6">
             {galleryInfo?.login_logo_visible !== false && (

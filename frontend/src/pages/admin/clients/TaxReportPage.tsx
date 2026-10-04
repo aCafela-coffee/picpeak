@@ -1,3 +1,4 @@
+import { documentLanguage } from '../../../i18n/screenLanguage';
 /**
  * CRM → Tax / Steuer Report sub-page.
  *
@@ -112,7 +113,7 @@ export const TaxReportPage: React.FC = () => {
     }
   };
 
-  const params: TaxReportParams = { from, to, currency, locale: i18n.language };
+  const params: TaxReportParams = { from, to, currency, locale: documentLanguage(i18n.language) };
 
   const { data: report, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['tax-report', params],

@@ -299,7 +299,7 @@ export const CustomerGroupsPanel: React.FC<{ canManage: boolean }> = ({ canManag
             {t('customers.groups.confirmDelete', 'Delete "{{name}}"? No customer is removed by this.', { name: confirmDelete.name })}
           </p>
           <div className="mt-2 flex gap-2">
-            <Button size="sm" variant="danger" isLoading={deleteGroup.isPending} onClick={() => deleteGroup.mutate(confirmDelete.id)}>
+            <Button size="sm" variant="ghost" className="text-red-700 hover:bg-red-100 dark:text-red-300 dark:hover:bg-red-900" isLoading={deleteGroup.isPending} onClick={() => deleteGroup.mutate(confirmDelete.id)}>
               {t('customers.groups.delete', 'Delete')}
             </Button>
             <Button size="sm" variant="ghost" onClick={() => setConfirmDelete(null)} leftIcon={<X className="h-4 w-4" />}>

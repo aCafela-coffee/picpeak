@@ -1,3 +1,4 @@
+import { applyServerLanguage } from '../i18n/screenLanguage';
 import React, { useEffect } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -12,7 +13,7 @@ export const MaintenanceMode: React.FC = () => {
   // Set language based on system settings
   useEffect(() => {
     if (settings?.default_language && settings.default_language !== i18n.language) {
-      i18n.changeLanguage(settings.default_language);
+      applyServerLanguage(i18n, settings.default_language);
     }
   }, [settings?.default_language, i18n]);
 

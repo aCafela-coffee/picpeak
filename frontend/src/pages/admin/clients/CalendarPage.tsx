@@ -52,6 +52,7 @@ import interactionPlugin from '@fullcalendar/interaction';
 // `locale` prop then resolves to it by code. Other locales (fr/nl/
 // pt/ru) fall back to English day/month names.
 import deLocale from '@fullcalendar/core/locales/de';
+import koLocale from '@fullcalendar/core/locales/ko';
 import { Card, Button, Loading } from '../../../components/common';
 import {
   calendarService,
@@ -105,7 +106,9 @@ export function formatDayHeader(date: Date, viewType: string, language: string):
   }
   const day = String(date.getUTCDate()).padStart(2, '0');
   const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-  return `${weekday} ${day}.${month}.`;
+  return language.toLowerCase().startsWith('ko')
+    ? `${month}월 ${day}일 (${weekday})`
+    : `${weekday} ${day}.${month}.`;
 }
 
 /**
@@ -513,8 +516,8 @@ export const CalendarPage: React.FC = () => {
           // fall back to FC's default English. Times are gated on the
           // admin's general_time_format via the shared fcTimeFormat
           // object below.
-          locales={[deLocale]}
-          locale={i18n.language || 'en'}
+          locales={[deLocale, koLocale]}
+          locale={i18n.language?.split('-')[0] || 'en'}
           slotLabelFormat={fcTimeFormat}
           eventTimeFormat={fcTimeFormat}
           // Column headers — see formatDayHeader above for the per-view

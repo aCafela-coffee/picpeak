@@ -1,3 +1,4 @@
+import { selectScreenLanguage, normalizeScreenLanguage } from '../../../i18n/screenLanguage';
 import React from 'react';
 import { Globe, Mail, User } from 'lucide-react';
 import { Card, Input, Loading } from '../../../components/common';
@@ -5,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { SettingsSaveBar } from '../../../components/admin/SettingsSaveBar';
 import type { GeneralSettings } from '../hooks/useSettingsState';
 import { MAX_FILES_PER_UPLOAD_LIMIT } from '../hooks/useSettingsState';
-import { SUPPORTED_LANGUAGES } from "../../../components/common/LanguageSelector.tsx";
+import { SUPPORTED_LANGUAGES, SUPPORTED_UI_LANGUAGES } from "../../../components/common/LanguageSelector.tsx";
 import { MfaSettingsCard } from '../components/MfaSettingsCard';
 import { isAbsoluteHttpUrl } from '../../../utils/url';
 
@@ -335,11 +336,11 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
             </label>
             <select
               id="admin-language"
-              value={i18n.language}
-              onChange={(e) => { void i18n.changeLanguage(e.target.value); }}
+              value={normalizeScreenLanguage(i18n.language) || 'en'}
+              onChange={(e) => { void selectScreenLanguage(i18n, e.target.value); }}
               className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
             >
-              {SUPPORTED_LANGUAGES.map(lang => (
+              {SUPPORTED_UI_LANGUAGES.map(lang => (
                 <option key={lang.code} value={lang.code}>{lang.name}</option>
               ))}
             </select>

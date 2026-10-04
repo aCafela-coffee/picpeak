@@ -62,7 +62,7 @@ function renderTab() {
   return { setGeneralSettings };
 }
 
-afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+afterEach(() => { cleanup(); localStorage.clear(); vi.restoreAllMocks(); });
 
 describe('GeneralTab — the two language scopes', () => {
   it('applies the admin language immediately and keeps it out of the save payload', () => {
@@ -75,6 +75,19 @@ describe('GeneralTab — the two language scopes', () => {
     expect(changeLanguage).toHaveBeenCalledWith('de');
     // The instance settings must be untouched — this is a personal preference.
     expect(setGeneralSettings).not.toHaveBeenCalled();
+  });
+
+  it('offers Korean only for the browser preference and never saves it to settings', () => {
+    const changeLanguage = vi.spyOn(i18n, 'changeLanguage').mockResolvedValue(undefined as never);
+    const { setGeneralSettings } = renderTab();
+    const admin = screen.getByLabelText(/your admin language/i);
+    const gallery = screen.getByLabelText(/gallery & guest language/i);
+    expect(Array.from((admin as HTMLSelectElement).options).map(o => o.value)).toContain('ko');
+    expect(Array.from((gallery as HTMLSelectElement).options).map(o => o.value)).not.toContain('ko');
+    fireEvent.change(admin, { target: { value: 'ko' } });
+    expect(changeLanguage).toHaveBeenCalledWith('ko');
+    expect(setGeneralSettings).not.toHaveBeenCalled();
+    expect(localStorage.getItem('picpeak.screenLanguage')).toBe('ko');
   });
 
   it('keeps the gallery/guest default on the saved form state', () => {

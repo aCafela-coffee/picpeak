@@ -1,3 +1,4 @@
+import { applyServerLanguage } from '../../i18n/screenLanguage';
 /**
  * Quote accept/decline page. Mounted at /quote/:token (outside any auth
  * gate) for the customer's email button, and inside the customer portal at
@@ -104,7 +105,7 @@ export const QuoteResponseView: React.FC<{ adapter: QuoteDocumentAdapter }> = ({
     // Switch interface language to the quote's language if it differs
     // from the browser default — matches what the customer expects.
     if (data?.quote.language && data.quote.language !== i18n.language) {
-      i18n.changeLanguage(data.quote.language).catch(() => {});
+      applyServerLanguage(i18n, data.quote.language).catch(() => {});
     }
   }, [data, i18n]);
 

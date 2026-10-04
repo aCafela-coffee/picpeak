@@ -1,3 +1,4 @@
+import { CompactLanguageSelector } from '../common/LanguageSelector';
 import React from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -412,6 +413,7 @@ export const GalleryLayout: React.FC<GalleryLayoutProps> = ({
               <div className="flex items-center gap-2 sm:gap-3 flex-shrink-0">
                 {/* Extra header items (upload button, etc.) */}
                 {headerExtra}
+                <CompactLanguageSelector />
                 
                 {/* Download all button - hidden on mobile when sidebar is shown */}
                 {showDownloadAll && onDownloadAll && (
@@ -492,6 +494,7 @@ export const GalleryLayout: React.FC<GalleryLayoutProps> = ({
               </div>
               <div className="flex items-center gap-2 flex-shrink-0">
                 {headerExtra}
+                <CompactLanguageSelector />
                 {showDownloadAll && onDownloadAll && (
                   <Button
                     variant="primary"
@@ -537,6 +540,7 @@ export const GalleryLayout: React.FC<GalleryLayoutProps> = ({
               <div className="flex items-center gap-2">
                 {menuButton}
                 {headerExtra}
+                <CompactLanguageSelector />
               </div>
               <div className="flex items-center gap-2 flex-shrink-0">
                 {showDownloadAll && onDownloadAll && (
@@ -586,6 +590,7 @@ export const GalleryLayout: React.FC<GalleryLayoutProps> = ({
               <div className="flex items-center gap-3">
                 {menuButton}
                 {headerExtra}
+                <CompactLanguageSelector />
               </div>
 
               {/* Right side - Action buttons */}

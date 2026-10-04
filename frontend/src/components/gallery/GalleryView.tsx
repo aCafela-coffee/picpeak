@@ -1,3 +1,4 @@
+import { screenDateLocale } from '../../i18n/dateLocale';
 import { useGalleryFiltering, resolveMediaType } from './hooks/useGalleryFiltering';
 import { useGalleryUpload } from './hooks/useGalleryUpload';
 import { useGallerySelection } from './hooks/useGallerySelection';
@@ -1065,7 +1066,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({ slug, event, requiresP
           {data.reveal_at && (
             <p className="text-sm text-muted-theme mb-6">
               {t('gallery.revealScheduledFor', 'Reveal scheduled for {{date}}', {
-                date: new Date(data.reveal_at).toLocaleString(),
+                date: new Date(data.reveal_at).toLocaleString(screenDateLocale()),
               })}
             </p>
           )}

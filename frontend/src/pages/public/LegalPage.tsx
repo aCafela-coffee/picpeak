@@ -1,3 +1,4 @@
+import { applyServerLanguage } from '../../i18n/screenLanguage';
 import React, { useEffect } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -57,7 +58,7 @@ export const LegalPage: React.FC = () => {
   // Set i18n language when settings are loaded
   useEffect(() => {
     if (settingsData?.default_language) {
-      i18n.changeLanguage(settingsData.default_language);
+      applyServerLanguage(i18n, settingsData.default_language);
     }
   }, [settingsData, i18n]);
 

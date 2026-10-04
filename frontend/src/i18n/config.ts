@@ -1,4 +1,5 @@
 import i18n from 'i18next';
+import { getScreenLanguage } from './screenLanguage';
 import { initReactI18next } from 'react-i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 import HttpBackend from 'i18next-http-backend';
@@ -18,6 +19,7 @@ i18n
   .use(initReactI18next)
   .init({
     fallbackLng: 'en',
+    lng: getScreenLanguage(),
     debug: false,
 
     // i18next defaults this to `true`, which makes an empty-string translation

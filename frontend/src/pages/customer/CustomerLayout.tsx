@@ -1,3 +1,4 @@
+import { CompactLanguageSelector } from '../../components/common/LanguageSelector';
 /**
  * Customer surface shell (#354).
  *
@@ -256,7 +257,7 @@ export const CustomerLayout: React.FC = () => {
       {/* Main column */}
       <div className="flex-1 flex flex-col min-w-0 h-screen">
         <header
-          className="lg:hidden h-14 px-4 flex items-center justify-between border-b flex-shrink-0"
+          className="h-14 px-4 flex items-center justify-between border-b flex-shrink-0"
           style={{
             backgroundColor: 'var(--color-surface, #ffffff)',
             borderColor: 'var(--color-surface-border, #e5e5e5)',
@@ -265,13 +266,13 @@ export const CustomerLayout: React.FC = () => {
           <button
             type="button"
             onClick={() => setSidebarOpen(true)}
-            className="p-2 -ml-2 rounded hover-surface text-theme"
+            className="lg:hidden p-2 -ml-2 rounded hover-surface text-theme"
             aria-label={t('common.menu', 'Menu')}
           >
             <Menu className="w-6 h-6" />
           </button>
           <span className="text-sm font-semibold text-theme truncate">{companyName}</span>
-          <span className="w-9" aria-hidden="true" />
+          <CompactLanguageSelector />
         </header>
 
         <main id="customer-main" className="flex-1 overflow-y-auto">

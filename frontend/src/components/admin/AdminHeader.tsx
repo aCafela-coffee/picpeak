@@ -1,3 +1,4 @@
+import { selectScreenLanguage, normalizeScreenLanguage } from '../../i18n/screenLanguage';
 import React, { useState, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Menu, User, LogOut, Settings, Search, Bell, Lock, CheckCircle, Trash2, Sun, Moon, Globe, ChevronDown, Eye, Download, Heart, Calendar, Image, Archive, AlertCircle, Clock, Database, FileText, Folder, Key, Mail, Tag, ToggleRight, UserCog, Webhook } from 'lucide-react';
@@ -24,7 +25,7 @@ import { useOnClickOutside } from '../../hooks/useOnClickOutside';
 import { usePublicSettings } from '../../hooks/usePublicSettings';
 import { useModal } from '../../hooks';
 import { PasswordChangeModal } from './PasswordChangeModal';
-import { SUPPORTED_LANGUAGES } from '../common';
+import { SUPPORTED_UI_LANGUAGES } from '../common';
 import { notificationsService } from '../../services/notifications.service';
 import { toast } from 'react-toastify';
 import { buildResourceUrl } from '../../utils/url';
@@ -55,7 +56,7 @@ export const AdminHeader: React.FC<AdminHeaderProps> = ({ onMenuClick, onOpenSea
   const queryClient = useQueryClient();
 
   const { data: brandingSettings, isLoading: brandingLoading } = usePublicSettings();
-  const currentLanguage = SUPPORTED_LANGUAGES.find(lang => lang.code === i18n.language) || SUPPORTED_LANGUAGES[0];
+  const currentLanguage = SUPPORTED_UI_LANGUAGES.find(lang => lang.code === normalizeScreenLanguage(i18n.language)) || SUPPORTED_UI_LANGUAGES[0];
 
   const companyName = brandingSettings?.branding_company_name?.trim() || 'PicPeak';
   // Dark-mode logo variant. Symmetric fallback: if only one logo is set,
@@ -167,7 +168,7 @@ export const AdminHeader: React.FC<AdminHeaderProps> = ({ onMenuClick, onOpenSea
     userMenuLangSectionModal.close();
   };
   const handleUserMenuLangSelect = (languageCode: string) => {
-    i18n.changeLanguage(languageCode);
+    void selectScreenLanguage(i18n, languageCode);
     closeUserMenu();
   };
 
@@ -467,12 +468,12 @@ export const AdminHeader: React.FC<AdminHeaderProps> = ({ onMenuClick, onOpenSea
                     </button>
                     {userMenuLangSectionModal.isOpen && (
                       <div className="bg-shell py-1">
-                        {SUPPORTED_LANGUAGES.map((language) => (
+                        {SUPPORTED_UI_LANGUAGES.map((language) => (
                           <button
                             key={language.code}
                             onClick={() => handleUserMenuLangSelect(language.code)}
                             className={`w-full pl-11 pr-4 py-2 text-left text-sm flex items-center gap-3 hover:bg-hover ${
-                              language.code === i18n.language
+                              language.code === normalizeScreenLanguage(i18n.language)
                                 ? 'text-accent bg-accent-dark/15'
                                 : 'text-body'
                             }`}

@@ -1,0 +1,9 @@
+{
+  "sourceRepository": "https://github.com/PicPeak/picpeak.git",
+  "sourceCommit": "76492c11836fdf0e79e8cecfbc18e004e0cde9cc",
+  "image": "ghcr.io/picpeak/picpeak/aio@sha256:dde09c55e29bc40065f33d94a18f2cc90a604e5c02c4b62bd1dcd1a504226588",
+  "platformManifestDigests": {
+    "arm64": "sha256:107029dda07617cbdbc0689730a02757a60867f72743810e6ca7c9dc6a755d44",
+    "amd64": "sha256:2fb083e4d19d63268e73bb46332376e6b9533371cdd66e2ae91bf7869202125f"
+  }
+}

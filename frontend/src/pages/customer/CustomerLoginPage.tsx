@@ -1,3 +1,4 @@
+import { LanguageSelector } from '../../components/common/LanguageSelector';
 /**
  * Customer login page (#354).
  *
@@ -139,6 +140,7 @@ export const CustomerLoginPage: React.FC = () => {
       style={{ backgroundColor: 'var(--color-background, #fafafa)' }}
     >
       <div className="w-full max-w-md">
+        <div className="flex justify-end mb-4"><LanguageSelector /></div>
         {/* Logo / header — matches AdminLoginPage. The frame and size
             are admin-controllable via Branding → "Login pages logo"
             settings; both toggles apply to /admin/login and

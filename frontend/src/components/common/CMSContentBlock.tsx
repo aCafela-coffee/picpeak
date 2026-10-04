@@ -1,3 +1,4 @@
+import { documentLanguage } from '../../i18n/screenLanguage';
 import React, { useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -36,7 +37,7 @@ export const CMSContentBlock: React.FC<CMSContentBlockProps> = ({ slug, fallback
 
   const { data: settings } = usePublicSettings();
 
-  const lang = settings?.default_language || i18n.language || 'en';
+  const lang = settings?.default_language || documentLanguage(i18n.language);
 
   const { data: page, isLoading, error } = useQuery({
     queryKey: ['cms-public-page', slug, lang],

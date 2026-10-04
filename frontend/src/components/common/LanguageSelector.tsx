@@ -1,8 +1,13 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Globe } from 'lucide-react';
+import { selectScreenLanguage, normalizeScreenLanguage } from '../../i18n/screenLanguage';
 
 // SVG Flag Components
+const KRFlag: React.FC<{ className?: string }> = ({ className = "w-5 h-5" }) => (
+  <span className={`${className} inline-flex items-center justify-center`} aria-hidden="true">🇰🇷</span>
+);
+
 const GBFlag: React.FC<{ className?: string }> = ({ className = "w-5 h-5" }) => (
   <svg className={className} viewBox="0 0 640 480" xmlns="http://www.w3.org/2000/svg">
     <path fill="#012169" d="M0 0h640v480H0z"/>
@@ -78,6 +83,7 @@ const SLFlag: React.FC<{ className?: string }> = ({ className = "w-5 h-5" }) => 
   </svg>
 );
 
+// Persisted languages: keep the official list for emails, documents and settings.
 export const SUPPORTED_LANGUAGES = [
   { code: 'en', name: 'English', Flag: GBFlag },
   { code: 'de', name: 'Deutsch', Flag: DEFlag },
@@ -89,14 +95,36 @@ export const SUPPORTED_LANGUAGES = [
   { code: 'sl', name: 'Slovenščina', Flag: SLFlag },
 ];
 
+// Screen-only languages must never be used to populate a server field.
+export const SUPPORTED_UI_LANGUAGES = [
+  ...SUPPORTED_LANGUAGES,
+  { code: 'ko', name: '한국어', Flag: KRFlag },
+];
+
+export const CompactLanguageSelector: React.FC = () => {
+  const { t, i18n } = useTranslation();
+  return (
+    <select
+      aria-label={t('common.language')}
+      value={normalizeScreenLanguage(i18n.language) || 'en'}
+      onChange={(event) => { void selectScreenLanguage(i18n, event.target.value); }}
+      className="max-w-24 shrink-0 rounded border border-line-strong bg-panel text-body text-xs px-1 py-2"
+    >
+      {SUPPORTED_UI_LANGUAGES.map((language) => (
+        <option key={language.code} value={language.code}>{language.name}</option>
+      ))}
+    </select>
+  );
+};
+
 export const LanguageSelector: React.FC = () => {
   const { i18n } = useTranslation();
   const [isOpen, setIsOpen] = React.useState(false);
 
-  const currentLanguage = SUPPORTED_LANGUAGES.find(lang => lang.code === i18n.language) || SUPPORTED_LANGUAGES[0];
+  const currentLanguage = SUPPORTED_UI_LANGUAGES.find(lang => lang.code === normalizeScreenLanguage(i18n.language)) || SUPPORTED_UI_LANGUAGES[0];
 
   const handleLanguageChange = (languageCode: string) => {
-    i18n.changeLanguage(languageCode);
+    void selectScreenLanguage(i18n, languageCode);
     setIsOpen(false);
   };
 
@@ -109,7 +137,8 @@ export const LanguageSelector: React.FC = () => {
         // is enough recognition on its own and stops this control from
         // pushing into the company-name title on narrow mobile widths
         // (#523). Full name stays on sm+ where there's room.
-        aria-label={currentLanguage.name}
+        aria-label={`${i18n.t('common.language')}: ${currentLanguage.name}`}
+        aria-expanded={isOpen}
         title={currentLanguage.name}
       >
         <Globe className="w-4 h-4" />
@@ -119,12 +148,12 @@ export const LanguageSelector: React.FC = () => {
 
       {isOpen && (
         <div className="absolute right-0 mt-2 w-48 bg-panel rounded-lg shadow-lg border border-line py-1 z-50">
-          {SUPPORTED_LANGUAGES.map((language) => (
+          {SUPPORTED_UI_LANGUAGES.map((language) => (
             <button
               key={language.code}
               onClick={() => handleLanguageChange(language.code)}
               className={`w-full text-left px-4 py-2 text-sm hover:bg-hover flex items-center gap-3 ${
-                language.code === i18n.language
+                language.code === normalizeScreenLanguage(i18n.language)
                   ? 'text-accent bg-accent-dark/15'
                   : 'text-body'
               }`}

@@ -1,3 +1,4 @@
+import { applyServerLanguage } from '../i18n/screenLanguage';
 /**
  * Customer-side React auth context (#354).
  *
@@ -80,7 +81,7 @@ function clearCustomerPortalQueryCache(queryClient: QueryClient) {
 function applyCustomerLocale(lang?: string | null) {
   if (!lang) return;
   if (lang === i18n.language) return;
-  i18n.changeLanguage(lang).catch(() => {});
+  applyServerLanguage(i18n, lang).catch(() => {});
 }
 
 export type CustomerFeatureFlags = CustomerFeatures;

@@ -1,3 +1,5 @@
+import { useTranslation } from 'react-i18next';
+import { screenDateLocale } from '../../../../i18n/dateLocale';
 import React from 'react';
 import { motion } from 'framer-motion';
 import { ChevronDown } from 'lucide-react';
@@ -21,8 +23,9 @@ export const StoryHero: React.FC<StoryHeroProps> = ({
   photo,
   slug,
 }) => {
+  useTranslation(); // Subscribe when the screen language changes.
   const formattedDate = date
-    ? new Date(date).toLocaleDateString('en-US', {
+    ? new Date(date).toLocaleDateString(screenDateLocale('en-US'), {
         year: 'numeric',
         month: 'long',
         day: 'numeric'
