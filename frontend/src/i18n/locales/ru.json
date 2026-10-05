@@ -125,7 +125,7 @@
     "resetChanges": "Сбросить изменения",
     "dismiss": "Закрыть",
     "discard": "Отменить",
-    "poweredBy": "Работает на"
+    "poweredBy": "Работает на <brand>PicPeak</brand>"
   },
   "upload": {
     "photoCategory": "Категория фото",

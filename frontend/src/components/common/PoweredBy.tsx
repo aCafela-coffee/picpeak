@@ -1,5 +1,5 @@
 import React from 'react';
-import { useTranslation } from 'react-i18next';
+import { Trans, useTranslation } from 'react-i18next';
 import { usePublicSettings } from '../../hooks/usePublicSettings';
 
 interface PoweredByProps {
@@ -28,9 +28,7 @@ export const PoweredBy: React.FC<PoweredByProps> = ({ className, style, inline =
   if (!settings || settings.branding_hide_powered_by) return null;
 
   const label = (
-    <>
-      {t('common.poweredBy')} <span className="font-semibold">PicPeak</span>
-    </>
+    <Trans t={t} i18nKey="common.poweredBy" components={{ brand: <span className="font-semibold" /> }} />
   );
 
   if (inline) {
