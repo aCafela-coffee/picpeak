@@ -104,6 +104,9 @@ module.exports = async function checkKoreanScreens(base, platform, setGalleryThe
           for (let node = el; node; node = node.parentElement) opacity *= Number(getComputedStyle(node).opacity);
           return opacity;
         })).toBe(1);
+        if (theme === 'galleryStory') {
+          await expect(gallery.getByText(ko.gallery.photosCount_other.replace('{{count}}', '1'), { exact: true }).first()).toBeVisible();
+        }
         await capture(gallery, theme, viewport.width);
       }
       if (setGalleryTheme) setGalleryTheme(null);

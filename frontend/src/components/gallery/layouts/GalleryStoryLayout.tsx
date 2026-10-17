@@ -210,7 +210,7 @@ export const GalleryStoryLayout: React.FC<GalleryStoryLayoutProps> = ({
     return Object.entries(photosByCategory).map(([categoryName, categoryPhotos], index) => ({
       id: `scene-${index}`,
       title: categoryName,
-      subtitle: `${categoryPhotos.length} ${t('gallery.photos', 'photos')}`,
+      subtitle: t('gallery.photosCount', { count: categoryPhotos.length }),
       // Alternate between grid and carousel
       type: index % 2 === 0 ? 'grid' : 'carousel' as 'grid' | 'carousel',
       photos: categoryPhotos
@@ -221,13 +221,13 @@ export const GalleryStoryLayout: React.FC<GalleryStoryLayoutProps> = ({
   // scope, so fall back to the event-wide count rather than announcing 0 Photos
   // directly above folder tiles that hold them.
   const totalPhotos = photos.length || eventPhotoCount || 0;
-  // "12 Photos" stays as it was; with a video in scope the hero line becomes
-  // the split ("9 photos · 3 videos"), like the admin grid (issue 1430, item 3).
+  // Keep the count inside the translation so each language controls word
+  // order and plural units. Videos use the split label, like the admin grid.
   const videoTotal = photos.filter(isVideoItem).length;
   const hasVideos = videoTotal > 0;
   const stats = hasVideos
     ? mediaSplitLabel(t, splitMediaCount(totalPhotos, videoTotal))
-    : `${totalPhotos} ${t('gallery.photos', 'Photos')}`;
+    : t('gallery.photosCount', { count: totalPhotos });
 
   // Likes need an identity the server accepts (issue 1716, Codex review):
   // guest identity mode asks the context, which prompts on first use; simple
