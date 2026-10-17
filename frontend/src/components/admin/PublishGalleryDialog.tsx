@@ -1,16 +1,22 @@
 import React, { useState } from 'react';
-import { X, Send, Lock, Eye, EyeOff } from 'lucide-react';
+import { Send, Lock, Eye, EyeOff } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { Button, Card, Input } from '../common';
+import { Button, Input, Modal } from '../common';
+import { GalleryRecipientsList } from './GalleryRecipientsList';
 
 interface PublishGalleryDialogProps {
   eventName: string;
   requirePassword: boolean;
-  customerEmail?: string | null;
+  /** Gets the standard gallery email — null when there is none, or it is also an assigned account. */
+  inlineEmail?: string | null;
   /** WhatsApp recipient — publish notifies this too, so it counts as "someone gets told". */
   customerPhone?: string | null;
-  /** Assigned customer accounts — notified via the account "your galleries" email when there's no inline email. */
-  assignedCustomerCount?: number;
+  /** Assigned customer accounts — each gets its portal email ("your galleries"). */
+  accountNames?: string[];
+  /** Portal-email accounts when their names are not visible. */
+  accountCount?: number;
+  /** Accounts this admin may not mail (customers.events). */
+  skippedAccountCount?: number;
   isPublishing: boolean;
   onConfirm: (password?: string, notifyCustomer?: boolean) => void;
   onClose: () => void;
@@ -31,9 +37,11 @@ interface PublishGalleryDialogProps {
 export const PublishGalleryDialog: React.FC<PublishGalleryDialogProps> = ({
   eventName,
   requirePassword,
-  customerEmail,
+  inlineEmail,
   customerPhone,
-  assignedCustomerCount = 0,
+  accountNames = [],
+  accountCount = accountNames.length,
+  skippedAccountCount = 0,
   isPublishing,
   onConfirm,
   onClose,
@@ -44,20 +52,21 @@ export const PublishGalleryDialog: React.FC<PublishGalleryDialogProps> = ({
   // for that last one. Leaving the phone out hid the opt-out on phone-only
   // galleries AND told the admin nothing would be sent, while the WhatsApp
   // went out anyway.
-  const willNotify = !!customerEmail || !!customerPhone || assignedCustomerCount > 0;
+  const willEmail = !!inlineEmail || accountCount > 0;
+  const willNotify = willEmail || !!customerPhone;
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
   // Defaults to notifying — that is what publish has always done, and the
   // quiet path is the exception (#1235).
   const [notifyCustomer, setNotifyCustomer] = useState(true);
-  // The password is only collected (and required) on the inline-email path,
-  // because the gallery_created email carries it. With no inline email the field
-  // is hidden and the existing hash is kept — so don't gate submit on it, or a
-  // password-protected gallery without an email could never be published.
-  // Unchecking "notify" hides it for the same reason: nothing is being sent,
-  // so there is no plaintext to carry and no reason to demand it.
-  const needsPassword = requirePassword && !!customerEmail && notifyCustomer;
+  // The password is only collected (and required) when the standard gallery
+  // email goes out, because only that email carries it. The portal email to
+  // assigned accounts never does — the portal opens the gallery without it.
+  // Otherwise the field is hidden and the existing hash is kept, so a gallery
+  // announced only to accounts can always be published. Unchecking "notify"
+  // hides it for the same reason: nothing is being sent.
+  const needsPassword = requirePassword && !!inlineEmail && notifyCustomer;
 
   const handleSubmit = () => {
     if (needsPassword) {
@@ -71,21 +80,45 @@ export const PublishGalleryDialog: React.FC<PublishGalleryDialogProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <Card className="max-w-md w-full">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-xl font-semibold text-heading">
-            {t('events.publishDialog.title', 'Publish gallery')}
-          </h2>
-          <button
+    <Modal
+      open
+      onClose={onClose}
+      closeOnBackdrop={false}
+      size="sm"
+      title={t('events.publishDialog.title', 'Publish gallery')}
+      footer={
+      // Stack both buttons vertically (always). The German primary label
+      // "Veröffentlichen & Kunden benachrichtigen" is ~40 chars including
+      // the icon — at max-w-md, no side-by-side row layout fits it on one
+      // line, and the base .btn class has @apply whitespace-nowrap (see
+      // index.css:149) which overrides a whitespace-normal className via
+      // CSS cascade order, so the text won't wrap either. Side-by-side
+      // would silently push the button past the modal frame (#670).
+      // col-reverse keeps the DOM order semantically secondary-then-primary
+      // while putting the primary action visually on top — standard
+      // confirmation-dialog pattern.
+        <div className="w-full flex flex-col-reverse gap-3">
+          <Button
+            variant="outline"
             onClick={onClose}
-            className="text-neutral-400 hover:text-body"
-            aria-label={t('common.close', 'Close')}
+            disabled={isPublishing}
           >
-            <X className="w-5 h-5" />
-          </button>
+            {t('common.cancel', 'Cancel')}
+          </Button>
+          <Button
+            variant="primary"
+            onClick={handleSubmit}
+            disabled={isPublishing}
+            isLoading={isPublishing}
+            leftIcon={willNotify && notifyCustomer ? <Send className="w-4 h-4" /> : undefined}
+          >
+            {willNotify && notifyCustomer
+              ? t('events.publishAndNotify')
+              : t('events.publishDialog.justPublish', 'Publish')}
+          </Button>
         </div>
-
+      }
+    >
         <p className="text-soft mb-4">
           {/* Follows the checkbox. Left static it contradicted itself — the
               text promised an email to the customer while the box beneath it
@@ -96,19 +129,10 @@ export const PublishGalleryDialog: React.FC<PublishGalleryDialogProps> = ({
                 defaultValue:
                   'Publishing "{{eventName}}" makes the gallery accessible. No email will be sent — you can send it later from this page.',
               })
-            : customerEmail
-            ? t('events.publishDialog.descriptionWithEmail', {
-                eventName,
-                customerEmail,
-                defaultValue:
-                  'Publishing "{{eventName}}" makes the gallery accessible and sends the notification email to {{customerEmail}}.',
-              })
-            : assignedCustomerCount > 0
-              ? t('events.publishDialog.descriptionAssignedAccount', {
+            : willEmail
+              ? t('events.publishDialog.descriptionNotify', {
                   eventName,
-                  count: assignedCustomerCount,
-                  defaultValue:
-                    'Publishing "{{eventName}}" makes the gallery accessible. The assigned customer account(s) will be notified by email (in their language) that it is available.',
+                  defaultValue: 'Publishing "{{eventName}}" makes the gallery accessible and notifies:',
                 })
               : customerPhone
                 ? t('events.publishDialog.descriptionWhatsapp', {
@@ -116,12 +140,23 @@ export const PublishGalleryDialog: React.FC<PublishGalleryDialogProps> = ({
                     defaultValue:
                       'Publishing "{{eventName}}" makes the gallery accessible. If WhatsApp is configured, the customer is notified there.',
                   })
-              : t('events.publishDialog.descriptionNoEmail', {
-                  eventName,
-                  defaultValue:
-                    'Publishing "{{eventName}}" makes the gallery accessible. No customer email is set, so no notification will be sent.',
-                })}
+                : t('events.publishDialog.descriptionNoEmail', {
+                    eventName,
+                    defaultValue:
+                      'Publishing "{{eventName}}" makes the gallery accessible. No customer email is set, so no notification will be sent.',
+                  })}
         </p>
+
+        {(willEmail || skippedAccountCount > 0) && notifyCustomer && (
+          <GalleryRecipientsList
+            inlineEmail={inlineEmail ?? null}
+            accountNames={accountNames}
+            accountCount={accountCount}
+            skippedAccountCount={skippedAccountCount}
+            whatsappPhone={customerPhone}
+            className="mb-4"
+          />
+        )}
 
         {willNotify && (
           <label className="flex items-start gap-3 mb-4 cursor-pointer">
@@ -178,38 +213,6 @@ export const PublishGalleryDialog: React.FC<PublishGalleryDialogProps> = ({
             />
           </div>
         )}
-
-        {/* Stack both buttons vertically (always). The German primary label
-            "Veröffentlichen & Kunden benachrichtigen" is ~40 chars including
-            the icon — at max-w-md, no side-by-side row layout fits it on one
-            line, and the base .btn class has @apply whitespace-nowrap (see
-            index.css:149) which overrides a whitespace-normal className via
-            CSS cascade order, so the text won't wrap either. Side-by-side
-            would silently push the button past the modal frame (#670).
-            col-reverse keeps the DOM order semantically secondary-then-primary
-            while putting the primary action visually on top — standard
-            confirmation-dialog pattern. */}
-        <div className="flex flex-col-reverse gap-3">
-          <Button
-            variant="outline"
-            onClick={onClose}
-            disabled={isPublishing}
-          >
-            {t('common.cancel', 'Cancel')}
-          </Button>
-          <Button
-            variant="primary"
-            onClick={handleSubmit}
-            disabled={isPublishing}
-            isLoading={isPublishing}
-            leftIcon={willNotify && notifyCustomer ? <Send className="w-4 h-4" /> : undefined}
-          >
-            {willNotify && notifyCustomer
-              ? t('events.publishAndNotify')
-              : t('events.publishDialog.justPublish', 'Publish')}
-          </Button>
-        </div>
-      </Card>
-    </div>
+    </Modal>
   );
 };

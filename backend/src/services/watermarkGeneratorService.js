@@ -14,6 +14,7 @@ const watermarkService = require('./watermarkService');
 const { resolvePhotoStorageKey, resolvePhotoFilePath } = require('./photoResolver');
 const { withLocalCopy, isRawFilename } = require('./imageProcessor');
 const logger = require('../utils/logger');
+const applicationWork = require('./activeApplicationWork');
 
 class WatermarkGeneratorService {
   constructor() {
@@ -37,7 +38,12 @@ class WatermarkGeneratorService {
    * @param {number} photoId - The photo ID
    * @returns {Object} Result with success status and watermark path
    */
-  async generateForPhoto(photoId) {
+  generateForPhoto(photoId) {
+    return applicationWork.track('photo watermark',
+      () => this.generateForPhotoInternal(photoId));
+  }
+
+  async generateForPhotoInternal(photoId) {
     try {
       // Get photo with event info
       const photo = await db('photos')
@@ -87,21 +93,33 @@ class WatermarkGeneratorService {
         if (!fresh || !fresh.enabled) {
           return { success: false, watermarkPath: null, error: 'Watermarking is disabled' };
         }
+        // The gallery's own watermark text, read in the slot for the same
+        // reason: the admin may have changed it while this job queued.
+        const gallery = await db('events').where('id', photo.event_id).first('watermark_text');
+        const forGallery = watermarkService.forEvent(fresh, gallery);
         return storageKey
           ? withLocalCopy(storageKey, (lp) =>
-            watermarkService.generateAndSaveWatermark(photo, lp, fresh)
+            watermarkService.generateAndSaveWatermark(photo, lp, forGallery)
           )
-          : watermarkService.generateAndSaveWatermark(photo, resolvePhotoFilePath(event, photo), fresh);
+          : watermarkService.generateAndSaveWatermark(photo, resolvePhotoFilePath(event, photo), forGallery);
       });
 
       if (result.success) {
         // Update database with watermark path
-        await db('photos')
-          .where({ id: photoId })
-          .update({
-            watermark_path: result.watermarkPath,
-            watermark_generated_at: db.fn.now()
-          });
+        const attempt = require('./mediaAttemptContext').current();
+        if (!attempt) return this.recordWatermark(photo, result);
+        const { getStorage } = require('./storage');
+        await attempt.assertCurrent().catch(async (error) => {
+          await getStorage().delete(result.watermarkPath).catch(() => {});
+          throw error;
+        });
+        const written = await require('./mediaAttemptService').guard(attempt).update({
+          watermark_path: result.watermarkPath,
+          watermark_generated_at: db.fn.now()
+        });
+        // A lost claim removes its own file; a kept one, its predecessor's.
+        if (!written) await getStorage().delete(result.watermarkPath).catch(() => {});
+        else await require('./mediaAttemptService').dropSuperseded(getStorage(), photo.watermark_path, result.watermarkPath);
       }
 
       return result;
@@ -109,6 +127,61 @@ class WatermarkGeneratorService {
       logger.error(`Error generating watermark for photo ${photoId}:`, error);
       return { success: false, error: error.message };
     }
+  }
+
+  /**
+   * Record a watermark cut outside a media attempt, fenced on the file it was
+   * cut from: a job that read the photo before a replacement must not hand
+   * the new picture the old one's watermark. Its file is then nobody's.
+   */
+  async recordWatermark(photo, result) {
+    // An external file edited in place keeps its name: its version is what
+    // tells the old picture's watermark from the new one's.
+    const fence = { id: photo.id, filename: photo.filename };
+    if (photo.source_origin === 'external' || photo.source_origin === 'reference') {
+      for (const column of ['size_bytes', 'source_mtime_ms']) {
+        if (photo[column] !== undefined) fence[column] = photo[column];
+      }
+    }
+    // Set only over the path it read, so the file it displaces is known and
+    // dropped below: two cuts of one photo with different gallery texts have
+    // different keys, and the one overwritten must not stay behind unnamed.
+    let written = 0;
+    let displaced = null;
+    let current = null;
+    for (let tries = 0; tries < 5 && !written; tries += 1) {
+      current = await db('photos').where(fence).first('watermark_path');
+      if (!current) break;
+      displaced = current.watermark_path || null;
+      const update = displaced
+        ? db('photos').where(fence).where('watermark_path', displaced)
+        : db('photos').where(fence).whereNull('watermark_path');
+      written = await update.update({
+        watermark_path: result.watermarkPath,
+        watermark_generated_at: db.fn.now()
+      });
+    }
+    const unreferenced = async (key) => !(await db('photos').where({ watermark_path: key }).first('id'));
+    if (!written) {
+      if (await unreferenced(result.watermarkPath)) await watermarkService.deleteWatermarkFile(result.watermarkPath);
+      return {
+        success: false,
+        watermarkPath: null,
+        error: current ? 'Watermark kept changing while it was recorded' : 'Photo was replaced while its watermark was generated'
+      };
+    }
+    if (displaced && displaced !== result.watermarkPath && displaced !== photo.watermark_path
+        && await unreferenced(displaced)) {
+      await watermarkService.deleteWatermarkFile(displaced);
+    }
+    // Keys are per source file now; the previous name (the pre-source-key
+    // `<id>_watermarked.jpg`, or an attempt's) is dropped once nothing names
+    // it: a media attempt may have recorded it again since `photo` was read.
+    if (photo.watermark_path && photo.watermark_path !== result.watermarkPath
+        && await unreferenced(photo.watermark_path)) {
+      await watermarkService.deleteWatermarkFile(photo.watermark_path);
+    }
+    return result;
   }
 
   /**
@@ -192,6 +265,16 @@ class WatermarkGeneratorService {
   }
 
   /**
+   * Re-cut one gallery's stored watermarks after its watermark text changed.
+   * The old files are not served in the meantime (their key carries the old
+   * text, see watermarkService.storedWatermarkCurrent) and each is dropped
+   * once its replacement is recorded.
+   */
+  regenerateForEvent(eventId) {
+    return applicationWork.track('gallery watermark regeneration', () => this.generateForEvent(eventId));
+  }
+
+  /**
    * Process watermark for a single photo (internal helper)
    */
   async processPhotoWatermark(photo, settings) {
@@ -207,23 +290,18 @@ class WatermarkGeneratorService {
         if (!fresh || !fresh.enabled) {
           return { success: false, watermarkPath: null, error: 'Watermarking is disabled' };
         }
+        // The gallery's text as of now, not as of the batch query: the admin
+        // may have changed it while this job queued.
+        const gallery = await db('events').where('id', photo.event_id).first('watermark_text');
+        const forGallery = watermarkService.forEvent(settings, gallery);
         return storageKey
           ? withLocalCopy(storageKey, (lp) =>
-            watermarkService.generateAndSaveWatermark(photo, lp, settings)
+            watermarkService.generateAndSaveWatermark(photo, lp, forGallery)
           )
-          : watermarkService.generateAndSaveWatermark(photo, resolvePhotoFilePath(event, photo), settings);
+          : watermarkService.generateAndSaveWatermark(photo, resolvePhotoFilePath(event, photo), forGallery);
       });
 
-      if (result.success) {
-        await db('photos')
-          .where({ id: photo.id })
-          .update({
-            watermark_path: result.watermarkPath,
-            watermark_generated_at: db.fn.now()
-          });
-      }
-
-      return { ...result, photoId: photo.id };
+      return { ...(result.success ? await this.recordWatermark(photo, result) : result), photoId: photo.id };
     } catch (error) {
       return { success: false, photoId: photo.id, error: error.message };
     }
@@ -234,7 +312,12 @@ class WatermarkGeneratorService {
    * @param {Function} onProgress - Optional callback for progress updates
    * @returns {Object} Result with success count and errors
    */
-  async regenerateAll(onProgress = null) {
+  regenerateAll(onProgress = null) {
+    return applicationWork.track('watermark regeneration',
+      () => this.regenerateAllInternal(onProgress));
+  }
+
+  async regenerateAllInternal(onProgress = null) {
     const jobId = Date.now().toString();
     const results = { jobId, total: 0, success: 0, failed: 0, errors: [], status: 'running' };
 
@@ -342,7 +425,12 @@ class WatermarkGeneratorService {
   /**
    * Clear all watermarks (when watermarking is disabled)
    */
-  async clearAllWatermarks() {
+  clearAllWatermarks() {
+    return applicationWork.track('watermark removal',
+      () => this.clearAllWatermarksInternal());
+  }
+
+  async clearAllWatermarksInternal() {
     try {
       // Get all photos with watermarks
       const photos = await db('photos')
@@ -366,33 +454,6 @@ class WatermarkGeneratorService {
       return { success: true, cleared: photos.length };
     } catch (error) {
       logger.error('Error clearing watermarks:', error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  /**
-   * Delete watermark for a specific photo
-   */
-  async deleteForPhoto(photoId) {
-    try {
-      const photo = await db('photos')
-        .where({ id: photoId })
-        .select('watermark_path')
-        .first();
-
-      if (photo && photo.watermark_path) {
-        await watermarkService.deleteWatermarkFile(photo.watermark_path);
-        await db('photos')
-          .where({ id: photoId })
-          .update({
-            watermark_path: null,
-            watermark_generated_at: null
-          });
-      }
-
-      return { success: true };
-    } catch (error) {
-      logger.error(`Error deleting watermark for photo ${photoId}:`, error);
       return { success: false, error: error.message };
     }
   }

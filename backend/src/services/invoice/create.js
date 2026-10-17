@@ -3,6 +3,7 @@
 
 const crypto = require('crypto');
 const { db, logActivity } = require('../../database/db');
+const { adminActivityActor } = require('../../utils/activityActor');
 const { getAppSetting } = require('../../utils/appSettings');
 const { cleanNetMinor } = require('../../utils/invoiceRounding');
 const { AppError } = require('../../utils/errors');
@@ -10,7 +11,7 @@ const businessProfileService = require('../businessProfileService');
 const { ensureInt, ensureNumber } = require('../../utils/numericHelpers');
 const { extendedLineColumns } = require('../../utils/lineItemTotals');
 const { hasColumnCached } = require('../../utils/schemaCache');
-const { computeDueDate, computeScheduledSendAt, ensureCustomerCanBill, getHierarchyHelpers, nextInvoiceNumber, resolveDealUuid, resolveNetDays, snapToNextBillingCycle } = require('./helpers');
+const { computeDueDate, computeScheduledSendAt, ensureCustomerCanBill, ensureEventMatchesCustomer, getHierarchyHelpers, nextInvoiceNumber, resolveDealUuid, resolveNetDays, snapToNextBillingCycle } = require('./helpers');
 const { appendToMonthlyDraft } = require('./drafts');
 const { auditedInsert } = require('../accountingHistory');
 
@@ -23,21 +24,7 @@ async function createInvoice(payload, adminId, trx = db) {
   const customer = await trx('customer_accounts').where({ id: payload.customerAccountId }).first();
   ensureCustomerCanBill(customer);
 
-  // PR #603 review follow-up #1 — when an invoice is attached to an event,
-  // make sure that event actually belongs to the chosen customer. Without
-  // this, a typo'd/copy-pasted eventId silently links the invoice to an
-  // unrelated event, producing misleading reporting links. Only enforced
-  // when the event HAS customer assignments (an event with none — e.g. a
-  // legacy import — is allowed through, since we can't prove a mismatch).
-  if (payload.eventId && await trx.schema.hasTable('event_customer_assignments')) {
-    const assignments = await trx('event_customer_assignments')
-      .where({ event_id: payload.eventId })
-      .select('customer_account_id');
-    if (assignments.length > 0 &&
-        !assignments.some(a => a.customer_account_id === payload.customerAccountId)) {
-      throw new AppError('The selected event is not assigned to this customer', 422, 'EVENT_CUSTOMER_MISMATCH');
-    }
-  }
+  await ensureEventMatchesCustomer(payload.eventId, payload.customerAccountId, trx);
 
   // Accumulator intercept (migration 128). For customers in
   // billing_cadence='monthly' OR 'manual' mode every createInvoice call
@@ -312,7 +299,7 @@ async function createInvoice(payload, adminId, trx = db) {
       { actor: adminId, source: 'invoice.create' });
   }
 
-  try { await logActivity('invoice_created', { invoiceId, invoiceNumber }, payload.eventId || null, `admin:${adminId}`, trx); } catch (_) { /* non-fatal */ }
+  try { await logActivity('invoice_created', { invoiceId, invoiceNumber }, payload.eventId || null, adminActivityActor(adminId), trx); } catch (_) { /* non-fatal */ }
   return { invoiceIds: [invoiceId] };
 }
 
@@ -576,7 +563,7 @@ async function spawnInstallmentInvoices({ trx, eventId, quoteId, customer, curre
       // logging via the global db here deadlocks the single-connection SQLite
       // pool (this runs unattended from the booking flow's prepare_invoice).
       await logActivity('invoice_scheduled', { invoiceId, invoiceNumber, eventId, quoteId, scheduledSendAt },
-        eventId, `admin:${adminId}`, trx);
+        eventId, adminActivityActor(adminId), trx);
     } catch (_) { /* non-fatal */ }
     invoiceIds.push(invoiceId);
   }

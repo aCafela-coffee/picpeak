@@ -1,9 +1,14 @@
 const { db, logActivity } = require('../database/db');
 const logger = require('../utils/logger');
 const { formatBoolean } = require('../utils/dbCompat');
+const { isUniqueViolation } = require('../utils/dbErrors');
 const { REACTION_EMOJIS } = require('../constants/reactions');
 const { isValidColorLabel, SHARED_COLOR_LABEL_IDENTITY } = require('../constants/colorLabels');
+const { isValidDecision } = require('../constants/photoDecisions');
 const { resolveEventFeedbackDefaults, DEFAULT_KEYBIND_MODE, KEYBIND_MODES } = require('./feedbackDefaults');
+const { applyPhotoVisibilityFilter, joinLivePhotos, livePhotos, wherePhotoLive, wherePhotoProcessed, wherePhotoProcessedById } = require('../utils/photoVisibility');
+const selectionSubmissions = require('./selectionSubmissions');
+const { serializeAnnotation, withParsedAnnotation } = require('../utils/photoAnnotation');
 
 // The camera-original name, for the feedback exports (#1224). Both exports
 // used to carry only `photos.filename` — the sanitized stored name
@@ -44,6 +49,9 @@ const FEEDBACK_SETTINGS_COLUMNS = [
   'allow_favorites',
   'allow_reactions',
   'allow_color_labels',
+  'allow_decisions',
+  'allow_selection_submit',
+  'allow_annotations',
   'keybind_mode',
   'require_name_email',
   'moderate_comments',
@@ -56,12 +64,13 @@ const FEEDBACK_SETTINGS_COLUMNS = [
 
 /**
  * Feedback types that store exactly ONE value per guest per photo, and the
- * column each keeps it in. Both share the toggle-off / switch semantics in
+ * column each keeps it in. All share the toggle-off / switch semantics in
  * submitFeedback below.
  */
 const SINGLE_VALUE_COLUMNS = {
   reaction: 'reaction',
   color_label: 'color_label',
+  decision: 'decision',
 };
 
 /**
@@ -75,6 +84,13 @@ const SINGLE_VALUE_COLUMNS = {
 // Set once the settings table has been seen. Module scope on purpose: the
 // answer is a property of the schema, not of a request.
 let settingsTableKnownToExist = false;
+// Same idea for the decision counters (issue 744, migration 270). Migration
+// 186's duplicate-photo dedupe recomputes stats on a schema that predates
+// them, so they are only read and written once they are known to exist.
+let decisionColumnsKnownToExist = false;
+// photos.comment_count predates every migration that calls the recount, but a
+// migration test builds a bare photos table; asked once, like the above.
+let commentCountColumnKnownToExist = false;
 
 function isSharedColorLabel(identityMode, feedbackType) {
   return identityMode === 'shared' && feedbackType === 'color_label';
@@ -134,6 +150,9 @@ class FeedbackService {
           event_id: eventId,
           feedback_enabled: false,
           ...globals,
+          // Drawing on a comment (issue 1733) has no global default: it is a
+          // modifier of comments, off until the gallery switches it on.
+          allow_annotations: false,
           require_name_email: false,
           moderate_comments: true,
           show_feedback_to_guests: true,
@@ -223,8 +242,15 @@ class FeedbackService {
    * duplicate-check uses (guest_id when present, fall back to
    * guest_identifier). Used for the per-guest favorite/like caps (#655).
    */
-  async countGuestFeedback(eventId, feedbackType, guestId, guestIdentifier) {
-    const query = db('photo_feedback')
+  async countGuestFeedback(eventId, feedbackType, guestId, guestIdentifier, executor = db) {
+    const query = executor('photo_feedback')
+      // Nor do likes on photos in the trash: the guest cannot see or undo them.
+      .modify(wherePhotoLive, 'photo_feedback.photo_id')
+      // Nor on photos back in processing (an admin retry): the gallery list
+      // leaves them out and the photo's feedback route answers 404, so the
+      // guest could neither see nor undo the pick. Once complete it counts
+      // again, which may put the guest over the cap until they remove one.
+      .modify(wherePhotoProcessedById, 'photo_feedback.photo_id')
       // Hidden rows do not count against the guest's cap (#1150). They are
       // absent everywhere else — the heart is empty, the tallies skip them,
       // and submitFeedback now treats one as room for a fresh row. Counting
@@ -264,6 +290,13 @@ class FeedbackService {
     let outcome;
 
     await db.transaction(async (trx) => {
+      // The event before the photo on PostgreSQL (issue 2108): a new tag row
+      // takes a key-share lock on it through its foreign key, and a rename,
+      // a capped trash restore or an archive delete holds it FOR UPDATE
+      // before the photo. Taken after the photo lock below, that is a cycle.
+      if (trx.client.config.client === 'pg') {
+        await trx('events').where({ id: eventId }).forKeyShare().first('id');
+      }
       await trx('photos').where({ id: photoId }).forUpdate().first();
 
       // Visible rows only, like every other single-value path (#1150): a
@@ -430,11 +463,14 @@ class FeedbackService {
   }
 
   async submitFeedback(photoId, eventId, feedbackData, guestIdentifier) {
+    const { feedback_type, guest_id } = feedbackData;
+    const lockable = Boolean(selectionSubmissions.kindLocking(feedback_type));
+    let cap = null;
     try {
-      const { feedback_type, rating, comment_text, reaction, color_label, guest_name, guest_email, ip_address, user_agent, guest_id } = feedbackData;
+      const { reaction, color_label, decision, ip_address, user_agent } = feedbackData;
 
       // Validate feedback type
-      if (!['rating', 'like', 'comment', 'favorite', 'reaction', 'color_label'].includes(feedback_type)) {
+      if (!['rating', 'like', 'comment', 'favorite', 'reaction', 'color_label', 'decision'].includes(feedback_type)) {
         throw new Error('Invalid feedback type');
       }
 
@@ -449,6 +485,10 @@ class FeedbackService {
         throw new Error('Invalid color label');
       }
 
+      // And for approve / reject (issue 744).
+      if (feedback_type === 'decision' && !isValidDecision(decision)) {
+        throw new Error('Invalid decision');
+      }
       // The shared tag (#1197) leaves before any of the per-guest machinery
       // below runs: none of it applies to a row that belongs to the photo
       // rather than to a person.
@@ -467,6 +507,74 @@ class FeedbackService {
         throw new Error('Reserved guest identifier');
       }
 
+      // The per-guest cap (#655) is read out here: the write below runs in a
+      // transaction, and inside one a read through the global pool waits for
+      // the one connection SQLite has, which the transaction holds.
+      if (feedback_type === 'favorite' || feedback_type === 'like') {
+        const settings = await this.getEventFeedbackSettings(eventId);
+        cap = feedback_type === 'favorite'
+          ? settings.max_favorites_per_guest
+          : settings.max_likes_per_guest;
+      }
+    } catch (error) {
+      logger.error('Error submitting feedback:', error);
+      throw error;
+    }
+
+    if (!lockable) {
+      return this.writeGuestFeedback(photoId, eventId, feedbackData, guestIdentifier, db);
+    }
+
+    // Handed in (issue 1733, A1): once a guest finished their selection,
+    // their likes and favourites are frozen, adds and removals alike, until
+    // an admin reopens it; an approval freezes their approve / reject the
+    // same way. Checked here rather than in the route so no caller can
+    // write around it, and in one transaction with the write, under the lock
+    // the hand-over takes: a like that overlaps "Finish selection" lands
+    // before the count is taken or is refused, never after it.
+    const viewer = { guestId: guest_id, guestIdentifier };
+    const result = await selectionSubmissions.withViewerLock(eventId, viewer, async (trx) => {
+      // Before the lock check: a guest merge can hand this guest another
+      // guest's finished selection, and must not do so between the check and
+      // the write.
+      if (await selectionSubmissions.guestGone(trx, guest_id)) return { guest_missing: true };
+      const lock = await selectionSubmissions.lockFor(eventId, feedback_type, viewer, trx);
+      if (lock) {
+        return { locked: true, kind: lock.kind, submitted_at: lock.submitted_at };
+      }
+      return this.writeGuestFeedback(photoId, eventId, feedbackData, guestIdentifier, trx, cap);
+    });
+    // The photo's counters are rebuilt after the commit, as they were before
+    // the write had a transaction. Inside it the aggregate would not see
+    // another guest's like on the same photo that is still uncommitted (the
+    // lock is per guest), and the two would each store a count of one.
+    if (!result.locked && !result.guest_missing && !result.limit_reached) {
+      await this.updatePhotoFeedbackStats(photoId);
+    }
+    return result;
+  }
+
+  /**
+   * The per-guest write behind submitFeedback, which has validated the input
+   * and, for a type a submission locks, holds the viewer's lock: `executor`
+   * is then that transaction and every statement here must go through it.
+   * `cap` is the guest's limit for a like or favourite, read by the caller.
+   * Inside that transaction the photo's counters are left to the caller, who
+   * rebuilds them once it has committed.
+   */
+  async writeGuestFeedback(photoId, eventId, feedbackData, guestIdentifier, executor, cap = null) {
+    try {
+      const { feedback_type, rating, comment_text, reaction, color_label, decision, guest_name, guest_email, ip_address, user_agent, guest_id } = feedbackData;
+
+      const recount = () => (executor.isTransaction ? undefined : this.updatePhotoFeedbackStats(photoId));
+
+      // The reason on a decision row. `undefined` means the caller did not
+      // send one, which is what lets the same decision again toggle off; an
+      // empty string is an explicit "no reason" and is stored as NULL.
+      const decisionReason = feedback_type === 'decision' && comment_text !== undefined
+        ? (comment_text || null)
+        : undefined;
+
       // Rating 0 clears the guest's rating (#884). Only the explicit zero
       // sentinel (0, or "0" from callers that skip the route validator's
       // toInt) triggers the destructive path — malformed input (undefined,
@@ -477,7 +585,7 @@ class FeedbackService {
       // When a per-person guest_id is present, scope the check to that guest
       // so two guests on the same device can independently like a photo.
       if (feedback_type !== 'comment') {
-        const duplicateQuery = db('photo_feedback')
+        const duplicateQuery = executor('photo_feedback')
           .where({
             photo_id: photoId,
             event_id: eventId,
@@ -509,7 +617,7 @@ class FeedbackService {
             // the guest's replacement, and it is the admin's moderation
             // record — clearing a rating must not destroy it, or there is
             // nothing left to review or unhide.
-            const clearScope = db('photo_feedback').where({
+            const clearScope = executor('photo_feedback').where({
               photo_id: photoId,
               event_id: eventId,
               feedback_type: 'rating',
@@ -519,21 +627,55 @@ class FeedbackService {
             else clearScope.where('guest_identifier', guestIdentifier);
             await clearScope.delete();
 
-            await this.updatePhotoFeedbackStats(photoId);
+            await recount();
             return { removed: true };
           }
 
-          if (feedback_type === 'rating' && rating !== existing.rating) {
-            // Update existing rating
-            await db('photo_feedback')
-              .where('id', existing.id)
-              .update({
-                rating,
-                updated_at: new Date()
+          if (feedback_type === 'rating') {
+            // Converge to exactly one row before anything is compared, like
+            // the reaction / colour-label path below. The check-then-insert
+            // above can race into duplicates and `existing` is whichever of
+            // them the lookup found: comparing the submission against that
+            // row alone skipped the cleanup whenever it happened to hold the
+            // submitted value already, while a newer duplicate with another
+            // value went on winning in the readers and counting in the
+            // average. The survivor is the row the readers already show
+            // (lastMutatedFirst). Visible rows only (#1150): a hidden one is
+            // the admin's record.
+            const ownRatings = () => {
+              const q = executor('photo_feedback').where({
+                photo_id: photoId,
+                event_id: eventId,
+                feedback_type: 'rating',
+                is_hidden: false,
               });
+              if (guest_id) q.where('guest_id', guest_id);
+              else q.where('guest_identifier', guestIdentifier);
+              return q;
+            };
+            const rows = Array.from(await ownRatings().select('id', 'rating', 'created_at', 'updated_at'))
+              .sort(lastMutatedFirst);
+            const survivor = rows[0] || existing;
+            const collapsed = rows.length > 1
+              ? await ownRatings().whereNot('id', survivor.id).delete()
+              : 0;
 
-            await this.updatePhotoFeedbackStats(photoId);
-            return { id: existing.id, updated: true };
+            if (Number(survivor.rating) !== Number(rating)) {
+              // Update existing rating
+              await executor('photo_feedback')
+                .where('id', survivor.id)
+                .update({
+                  rating,
+                  updated_at: new Date().toISOString()
+                });
+
+              await recount();
+              return { id: survivor.id, updated: true };
+            }
+            // Same value: nothing to write, but a removed duplicate was in
+            // the average.
+            if (collapsed) await recount();
+            return { id: survivor.id, exists: true };
           }
 
           // Single-value types — one reaction (#839) and one colour label
@@ -547,13 +689,13 @@ class FeedbackService {
           // interaction collapse them instead of leaving a phantom count.
           const singleValueColumn = SINGLE_VALUE_COLUMNS[feedback_type];
           if (singleValueColumn) {
-            const submittedValue = feedback_type === 'reaction' ? reaction : color_label;
+            const submittedValue = { reaction, color_label, decision }[feedback_type];
             // Visible rows only, same reason as the rating clear above: the
             // toggle-off and the duplicate collapse below both DELETE over
             // this scope, and a hidden original is the admin's record rather
             // than a racy duplicate of the guest's own.
             const singleValueScope = () => {
-              const q = db('photo_feedback').where({
+              const q = executor('photo_feedback').where({
                 photo_id: photoId,
                 event_id: eventId,
                 feedback_type,
@@ -564,21 +706,29 @@ class FeedbackService {
               return q;
             };
 
-            if (existing[singleValueColumn] === submittedValue) {
+            // A decision re-sent WITH a reason edits the reason (issue 744)
+            // rather than toggling the decision off: the guest is still
+            // rejecting the photo, they are saying why.
+            const editsReason = existing[singleValueColumn] === submittedValue
+              && decisionReason !== undefined;
+            if (existing[singleValueColumn] === submittedValue && !editsReason) {
               await singleValueScope().delete();
-              await this.updatePhotoFeedbackStats(photoId);
+              await recount();
               return { removed: true };
             }
             // Converge to exactly one row: drop any racy duplicates, then
-            // switch the surviving row's value.
+            // switch the surviving row's value. A switched decision takes the
+            // reason sent with it, or none — the old one was about the other
+            // verdict.
             await singleValueScope().whereNot('id', existing.id).delete();
-            await db('photo_feedback')
+            await executor('photo_feedback')
               .where('id', existing.id)
               .update({
                 [singleValueColumn]: submittedValue,
+                ...(feedback_type === 'decision' ? { comment_text: decisionReason ?? null } : {}),
                 updated_at: new Date()
               });
-            await this.updatePhotoFeedbackStats(photoId);
+            await recount();
             return { id: existing.id, updated: true };
           }
 
@@ -588,7 +738,7 @@ class FeedbackService {
           if (feedback_type === 'like' || feedback_type === 'favorite') {
             // Older guest merges could leave several visible copies. One
             // click must clear the selection, while preserving hidden rows.
-            const selection = db('photo_feedback').where({
+            const selection = executor('photo_feedback').where({
               photo_id: photoId, event_id: eventId, feedback_type,
               is_hidden: formatBoolean(false),
             });
@@ -596,7 +746,7 @@ class FeedbackService {
             else selection.where('guest_identifier', guestIdentifier);
             await selection.delete();
 
-            await this.updatePhotoFeedbackStats(photoId);
+            await recount();
             return { removed: true };
           }
 
@@ -614,13 +764,9 @@ class FeedbackService {
       // always allowed. NULL or 0 stored in the column means "unlimited" —
       // the photographer hasn't opted in to a cap for this event.
       if (feedback_type === 'favorite' || feedback_type === 'like') {
-        const settings = await this.getEventFeedbackSettings(eventId);
-        const cap = feedback_type === 'favorite'
-          ? settings.max_favorites_per_guest
-          : settings.max_likes_per_guest;
         if (cap && cap > 0) {
           const currentCount = await this.countGuestFeedback(
-            eventId, feedback_type, guest_id, guestIdentifier,
+            eventId, feedback_type, guest_id, guestIdentifier, executor,
           );
           if (currentCount >= cap) {
             // Don't insert; surface a structured payload so the route layer
@@ -636,15 +782,25 @@ class FeedbackService {
         }
       }
 
+      const storedAnnotation = feedback_type === 'comment' && feedbackData.annotation
+        ? serializeAnnotation(feedbackData.annotation)
+        : null;
+
       // Insert new feedback
       const insertFeedback = (executor) => executor('photo_feedback').insert({
         photo_id: photoId,
         event_id: eventId,
         feedback_type,
         rating: feedback_type === 'rating' ? rating : null,
-        comment_text: feedback_type === 'comment' ? comment_text : null,
+        comment_text: feedback_type === 'comment'
+          ? comment_text
+          : (feedback_type === 'decision' ? (decisionReason ?? null) : null),
         reaction: feedback_type === 'reaction' ? reaction : null,
         color_label: feedback_type === 'color_label' ? color_label : null,
+        decision: feedback_type === 'decision' ? decision : null,
+        // A drawing belongs to a comment (issue 1733). Re-serialised from the
+        // validated structure here, whatever the caller handed over.
+        ...(storedAnnotation ? { annotation: storedAnnotation } : {}),
         guest_name,
         guest_email,
         guest_identifier: guestIdentifier,
@@ -661,7 +817,14 @@ class FeedbackService {
           : (feedback_type !== 'comment' || !feedbackData.moderate_comments),
         created_at: new Date(),
         updated_at: new Date()
-      }).returning('id');
+      });
+      // A rating is held to one visible row per guest and photo by a unique
+      // index (migration 309), so a racing insert loses quietly and falls
+      // into the update below instead of adding a second row (issue 2075).
+      const insertRow = (executor) => {
+        const q = insertFeedback(executor);
+        return (feedback_type === 'rating' ? q.onConflict().ignore() : q).returning('id');
+      };
 
       // A guest merge soft-deletes its source guests while holding their rows
       // locked. resolveGuest ran before that, so re-check the guest in the
@@ -670,24 +833,42 @@ class FeedbackService {
       // can sign in as any more. SQLite serialises the transaction outright.
       let result;
       if (guest_id) {
-        result = await db.transaction(async (trx) => {
+        result = await executor.transaction(async (trx) => {
           const guest = trx('gallery_guests').where({ id: guest_id }).first('is_deleted');
           if (trx.client.config.client === 'pg') guest.forShare();
           if ((await guest)?.is_deleted) return null;
-          return insertFeedback(trx);
+          return insertRow(trx);
         });
         if (!result) return { guest_missing: true };
       } else {
-        result = await insertFeedback(db);
+        result = await insertRow(executor);
+      }
+
+      let id = result[0]?.id || result[0];
+
+      if (!id && feedback_type === 'rating') {
+        // The insert lost the race to the guest's other request: their row
+        // exists now, so this submission changes its value instead.
+        const own = executor('photo_feedback').where({
+          photo_id: photoId, event_id: eventId, feedback_type: 'rating', is_hidden: false,
+        });
+        if (guest_id) own.where('guest_id', guest_id);
+        else own.where('guest_identifier', guestIdentifier);
+        const winner = await own.first('id', 'rating');
+        if (!winner) return { id: null, exists: true };
+        if (Number(winner.rating) === Number(rating)) return { id: winner.id, exists: true };
+        await executor('photo_feedback')
+          .where('id', winner.id)
+          .update({ rating, updated_at: new Date().toISOString() });
+        await recount();
+        return { id: winner.id, updated: true };
       }
       
-      const id = result[0]?.id || result[0];
-      
       // Update photo stats
-      await this.updatePhotoFeedbackStats(photoId);
+      await recount();
       
       // Log activity
-      await logActivity(`photo_${feedback_type}`, { photo_id: photoId }, eventId);
+      await logActivity(`photo_${feedback_type}`, { photo_id: photoId }, eventId, null, executor.isTransaction ? executor : null);
       
       return { id, created: true };
     } catch (error) {
@@ -738,11 +919,26 @@ class FeedbackService {
         query.where('guest_identifier', options.guest_identifier);
       }
       
+      // Newest first; the id breaks a same-second tie.
       const feedback = await query
-        .orderBy('created_at', 'desc')
-        .select('id', 'feedback_type', 'rating', 'comment_text', 'reaction', 'color_label', 'guest_name', 'created_at', 'is_approved', 'is_hidden');
-      
-      return feedback;
+        .orderBy([{ column: 'created_at', order: 'desc' }, { column: 'id', order: 'desc' }])
+        .select('id', 'feedback_type', 'rating', 'comment_text', 'reaction', 'color_label', 'decision', 'annotation', 'guest_name', 'created_at', 'updated_at', 'is_approved', 'is_hidden');
+
+      // Rating rows are re-ranked among themselves by last mutation, so the
+      // viewer's own rating (the first rating row the route finds) is the
+      // same row the list's my_rating picks (galleryQueryService) when
+      // duplicates exist and one of them was changed later. Every other
+      // type, comments above all, keeps the created_at order; updated_at is
+      // only the sort key and does not leave this method.
+      const rows = Array.from(feedback);
+      const ratings = rows.filter((row) => row.feedback_type === 'rating').sort(lastMutatedFirst);
+      let nextRating = 0;
+      return rows.map((row) => {
+        const { updated_at: _updatedAt, ...rest } = row.feedback_type === 'rating' ? ratings[nextRating++] : row;
+        // The drawing rides on its comment row (issue 1733), so every gate a
+        // caller applies to the row applies to it; parsed, never raw.
+        return withParsedAnnotation(rest);
+      });
     } catch (error) {
       logger.error('Error getting photo feedback:', error);
       throw error;
@@ -750,24 +946,38 @@ class FeedbackService {
   }
 
   /**
-   * Get feedback summary for an event
+   * Get feedback summary for an event.
+   *
+   * `viewerAccessLevel` scopes the totals to the photos that viewer may see
+   * (photoVisibility): the guest /feedback-summary passes req.accessLevel so
+   * feedback on client-hidden photos, or on photos not finished processing,
+   * does not show in its counts. Omitted,
+   * the totals cover every photo — the admin analytics and the archive.
    */
-  async getEventFeedbackSummary(eventId) {
+  async getEventFeedbackSummary(eventId, { viewerAccessLevel } = {}) {
     try {
-      const photos = await db('photos')
+      const photos = await livePhotos(db)
         .where('event_id', eventId)
-        .select('id', 'filename', 'visibility', 'feedback_count', 'like_count', 'average_rating', 'favorite_count', 'reaction_count', 'color_label_count')
+        .select('id', 'filename', 'visibility', 'moderation_status', 'processing_status', 'unavailable_reason', 'feedback_count', 'like_count', 'average_rating', 'favorite_count', 'reaction_count', 'color_label_count', 'approved_count', 'rejected_count')
         .orderBy('average_rating', 'desc')
         .orderBy('like_count', 'desc');
-      
+
       const sharedColors = (await this.getEventFeedbackSettings(eventId)).identity_mode === 'shared';
-      const totalStats = await db('photo_feedback')
-        .where('event_id', eventId)
+      let statsQuery = db('photo_feedback')
+        .where('photo_feedback.event_id', eventId)
         // Hidden rows do not count, the same rule the photo counters above
         // already apply — without this the two halves of THIS response
         // disagreed, and a hidden row preserved beside its replacement (#1150)
         // is counted twice.
-        .where('is_hidden', false)
+        .where('photo_feedback.is_hidden', false)
+        // Feedback on photos in the trash does not count, as above.
+        .modify(joinLivePhotos, 'photo_feedback.photo_id', 'photos.id');
+      if (viewerAccessLevel !== undefined) {
+        // A photo back in processing is not in the viewer's gallery list
+        // either; the admin totals keep its feedback, as they keep a hidden one.
+        statsQuery = wherePhotoProcessed(applyPhotoVisibilityFilter(statsQuery, viewerAccessLevel));
+      }
+      const totalStats = await statsQuery
         .select(
           db.raw('COUNT(DISTINCT CASE WHEN feedback_type = ? THEN guest_identifier END) as unique_raters', ['rating']),
           db.raw('COUNT(CASE WHEN feedback_type = ? THEN 1 END) as total_ratings', ['rating']),
@@ -775,6 +985,9 @@ class FeedbackService {
           db.raw('COUNT(CASE WHEN feedback_type = ? THEN 1 END) as total_comments', ['comment']),
           db.raw('COUNT(CASE WHEN feedback_type = ? THEN 1 END) as total_favorites', ['favorite']),
           db.raw('COUNT(CASE WHEN feedback_type = ? THEN 1 END) as total_reactions', ['reaction']),
+          // Approve / reject (issue 744), per guest like reactions.
+          db.raw('COUNT(CASE WHEN feedback_type = ? AND decision = ? THEN 1 END) as total_approved', ['decision', 'approved']),
+          db.raw('COUNT(CASE WHEN feedback_type = ? AND decision = ? THEN 1 END) as total_rejected', ['decision', 'rejected']),
           // Scoped to the live colour-label set (#1197), like every other
           // colour read. Unscoped, a dormant set left behind by a mode switch
           // inflated total_feedback in the admin analytics and the guest
@@ -872,6 +1085,7 @@ class FeedbackService {
       const mode = identityMode ?? (await this.getEventFeedbackSettings(eventId)).identity_mode;
       const query = scopeColorLabelsToMode(
         db('photo_feedback')
+          .modify(wherePhotoLive, 'photo_feedback.photo_id')
           .where({ event_id: eventId, feedback_type: 'color_label' })
           .where('is_hidden', false),
         mode,
@@ -923,6 +1137,24 @@ class FeedbackService {
           ['color_label', SHARED_COLOR_LABEL_IDENTITY],
         );
 
+      // Approve / reject (issue 744). Per guest, never shared, so no mode
+      // scoping — but only once migration 270 has added the columns (see
+      // decisionColumnsKnownToExist). Asked as metadata, like the settings
+      // table check, so a Postgres transaction is never aborted by it.
+      if (!decisionColumnsKnownToExist) {
+        decisionColumnsKnownToExist = await trx.schema.hasColumn('photos', 'rejected_count');
+      }
+      const decisionCounts = decisionColumnsKnownToExist
+        ? [
+          trx.raw('COUNT(CASE WHEN feedback_type = ? AND decision = ? THEN 1 END) as approved_count', ['decision', 'approved']),
+          trx.raw('COUNT(CASE WHEN feedback_type = ? AND decision = ? THEN 1 END) as rejected_count', ['decision', 'rejected']),
+        ]
+        : [];
+
+      if (!commentCountColumnKnownToExist) {
+        commentCountColumnKnownToExist = await trx.schema.hasColumn('photos', 'comment_count');
+      }
+
       // Get aggregated stats
       const stats = await trx('photo_feedback')
         .where('photo_id', photoId)
@@ -933,6 +1165,7 @@ class FeedbackService {
           trx.raw('COUNT(CASE WHEN feedback_type = ? THEN 1 END) as favorite_count', ['favorite']),
           trx.raw('COUNT(CASE WHEN feedback_type = ? THEN 1 END) as reaction_count', ['reaction']),
           colorLabelCount,
+          ...decisionCounts,
           trx.raw('AVG(CASE WHEN feedback_type = ? THEN rating END) as average_rating', ['rating']),
           // The shared tag is not a participant (#1197). It carries the
           // reserved identifier rather than a person's, so counting it here
@@ -953,11 +1186,18 @@ class FeedbackService {
         .where('id', photoId)
         .update({
           feedback_count: stats.feedback_count || 0,
+          // Approved, visible comments: the admin "Has comments" filter and
+          // the exports read this column (issue 2071).
+          ...(commentCountColumnKnownToExist ? { comment_count: Number(stats.comment_count) || 0 } : {}),
           like_count: stats.like_count || 0,
           average_rating: stats.average_rating || 0,
           favorite_count: stats.favorite_count || 0,
           reaction_count: stats.reaction_count || 0,
-          color_label_count: stats.color_label_count || 0
+          color_label_count: stats.color_label_count || 0,
+          ...(decisionColumnsKnownToExist ? {
+            approved_count: Number(stats.approved_count) || 0,
+            rejected_count: Number(stats.rejected_count) || 0,
+          } : {}),
         });
     } catch (error) {
       logger.error('Error updating photo feedback stats:', error);
@@ -991,10 +1231,6 @@ class FeedbackService {
       
       const feedback = target;
 
-      await db('photo_feedback')
-        .where('id', feedbackId)
-        .update(updates);
-
       // Unhiding can collide with a replacement (#1150). A hidden row reads as
       // absent, so the guest may well have re-added the same feedback in the
       // meantime; making the original visible again would leave TWO visible
@@ -1009,19 +1245,37 @@ class FeedbackService {
       // `guest_identifier IS NULL`, which is every identifier-less row on the
       // photo — other people's, deleted. Nothing to converge in that case, so
       // leave it alone.
+      //
+      // The replacement goes BEFORE the unhide, in one transaction: a rating
+      // is held to one visible row per guest by a unique index (migration
+      // 309), so unhiding first would fail on the replacement (issue 2075).
+      // A replacement that commits between the delete and the unhide still
+      // trips the index; one retry finds and removes it.
       const collapseIdentity = feedback.guest_id || feedback.guest_identifier;
-      if (updates.is_hidden === false && feedback.feedback_type !== 'comment' && collapseIdentity) {
-        const superseded = db('photo_feedback')
-          .where({
-            photo_id: feedback.photo_id,
-            event_id: feedback.event_id,
-            feedback_type: feedback.feedback_type,
-            is_hidden: false,
-          })
-          .whereNot('id', feedbackId);
-        if (feedback.guest_id) superseded.where('guest_id', feedback.guest_id);
-        else superseded.where('guest_identifier', feedback.guest_identifier);
-        await superseded.delete();
+      const unhide = () => db.transaction(async (trx) => {
+        if (updates.is_hidden === false && feedback.feedback_type !== 'comment' && collapseIdentity) {
+          const superseded = trx('photo_feedback')
+            .where({
+              photo_id: feedback.photo_id,
+              event_id: feedback.event_id,
+              feedback_type: feedback.feedback_type,
+              is_hidden: false,
+            })
+            .whereNot('id', feedbackId);
+          if (feedback.guest_id) superseded.where('guest_id', feedback.guest_id);
+          else superseded.where('guest_identifier', feedback.guest_identifier);
+          await superseded.delete();
+        }
+
+        await trx('photo_feedback')
+          .where('id', feedbackId)
+          .update(updates);
+      });
+      try {
+        await unhide();
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        await unhide();
       }
       
       // Update photo stats if visibility changed
@@ -1032,7 +1286,7 @@ class FeedbackService {
         feedback_id: feedbackId,
         action,
         admin_id: adminId
-      }, feedback.event_id);
+      }, feedback.event_id, { type: 'admin', id: adminId });
       
       return true;
     } catch (error) {
@@ -1066,7 +1320,7 @@ class FeedbackService {
         feedback_id: feedbackId,
         feedback_type: feedback.feedback_type,
         admin_id: adminId
-      }, feedback.event_id);
+      }, feedback.event_id, { type: 'admin', id: adminId });
       
       return true;
     } catch (error) {
@@ -1081,7 +1335,7 @@ class FeedbackService {
   async getPendingModeration(eventId = null, ownedEventIds = null) {
     try {
       let query = db('photo_feedback')
-        .join('photos', 'photo_feedback.photo_id', 'photos.id')
+        .modify(joinLivePhotos, 'photo_feedback.photo_id', 'photos.id')
         .join('events', 'photo_feedback.event_id', 'events.id')
         .where('photo_feedback.is_approved', false)
         .where('photo_feedback.is_hidden', false)
@@ -1103,7 +1357,7 @@ class FeedbackService {
         )
         .orderBy('photo_feedback.created_at', 'desc');
       
-      return pending;
+      return pending.map(withParsedAnnotation);
     } catch (error) {
       logger.error('Error getting pending moderation:', error);
       throw error;
@@ -1118,7 +1372,7 @@ class FeedbackService {
   async exportEventFeedback(eventId) {
     try {
       const feedback = await db('photo_feedback')
-        .join('photos', 'photo_feedback.photo_id', 'photos.id')
+        .modify(joinLivePhotos, 'photo_feedback.photo_id', 'photos.id')
         .where('photo_feedback.event_id', eventId)
         .select(
           'photos.filename',
@@ -1128,6 +1382,9 @@ class FeedbackService {
           'photo_feedback.comment_text',
           'photo_feedback.reaction',
           'photo_feedback.color_label',
+          // Approve / reject (issue 744). A decision row's reason is in
+          // comment_text, beside it.
+          'photo_feedback.decision',
           'photo_feedback.guest_name',
           'photo_feedback.guest_email',
           'photo_feedback.created_at',
@@ -1159,7 +1416,7 @@ class FeedbackService {
   async exportEventFeedbackPivoted(eventId) {
     try {
       const rows = await db('photo_feedback')
-        .join('photos', 'photo_feedback.photo_id', 'photos.id')
+        .modify(joinLivePhotos, 'photo_feedback.photo_id', 'photos.id')
         .where('photo_feedback.event_id', eventId)
         .where('photo_feedback.is_hidden', false)
         .select(
@@ -1170,6 +1427,7 @@ class FeedbackService {
           'photo_feedback.comment_text',
           'photo_feedback.reaction',
           'photo_feedback.color_label',
+          'photo_feedback.decision',
           'photo_feedback.guest_name',
           'photo_feedback.guest_email',
           'photo_feedback.guest_identifier',
@@ -1200,6 +1458,8 @@ class FeedbackService {
             comment: '',
             reaction: '',
             color_label: '',
+            decision: '',
+            decision_reason: '',
             latest_at: row.created_at,
           };
           byKey.set(key, entry);
@@ -1231,6 +1491,12 @@ class FeedbackService {
           break;
         case 'color_label':
           if (row.color_label) entry.color_label = row.color_label;
+          break;
+        case 'decision':
+          if (row.decision) {
+            entry.decision = row.decision;
+            entry.decision_reason = row.comment_text || '';
+          }
           break;
         default:
           // Unknown feedback type — ignore so a future type doesn't break the export.
@@ -1265,7 +1531,7 @@ class FeedbackService {
       
       // If no filters specified, return all photos
       if (!liked && !favorited) {
-        const allPhotos = await db('photos')
+        const allPhotos = await livePhotos(db)
           .where('event_id', eventId)
           .select('id');
         return allPhotos.map(p => p.id);
@@ -1333,18 +1599,49 @@ class FeedbackService {
         .select('photo_id');
       const photoIds = [...new Set(affected.map((r) => r.photo_id))];
 
-      await db('photo_feedback')
-        .where('guest_id', guestId)
-        .update({
-          guest_id: null,
-          guest_name: null,
-          guest_email: null,
-          updated_at: new Date(),
-        });
+      await db.transaction(async (trx) => {
+        // Clearing guest_id moves a visible rating under the identifier index
+        // (migration 309), where an anonymous rating from the same identifier
+        // on the same photo would collide (issue 2075). Keep whichever of the
+        // two changed last, the row the readers already show.
+        const ratings = Array.from(await trx('photo_feedback')
+          .where({ guest_id: guestId, feedback_type: 'rating', is_hidden: false })
+          .whereNotNull('guest_identifier')
+          .whereNot('guest_identifier', '')
+          .select('id', 'photo_id', 'guest_identifier', 'created_at', 'updated_at'));
+        const doomed = [];
+        for (let i = 0; i < ratings.length; i += 500) {
+          const chunk = ratings.slice(i, i + 500);
+          const rivals = Array.from(await trx('photo_feedback')
+            .whereIn('photo_id', chunk.map((r) => r.photo_id))
+            .whereIn('guest_identifier', [...new Set(chunk.map((r) => r.guest_identifier))])
+            .where({ feedback_type: 'rating', is_hidden: false })
+            .whereNull('guest_id')
+            .select('id', 'photo_id', 'guest_identifier', 'created_at', 'updated_at'));
+          for (const own of chunk) {
+            const pair = rivals.filter((r) => Number(r.photo_id) === Number(own.photo_id)
+              && r.guest_identifier === own.guest_identifier);
+            if (pair.length) doomed.push(...[own, ...pair].sort(lastMutatedFirst).slice(1).map((r) => r.id));
+          }
+        }
+        for (let i = 0; i < doomed.length; i += 500) {
+          await trx('photo_feedback').whereIn('id', doomed.slice(i, i + 500)).delete();
+        }
+
+        await trx('photo_feedback')
+          .where('guest_id', guestId)
+          .update({
+            guest_id: null,
+            guest_name: null,
+            guest_email: null,
+            updated_at: new Date(),
+          });
+      });
 
       for (const pid of photoIds) {
         await this.updatePhotoFeedbackStats(pid);
       }
+      await selectionSubmissions.anonymizeGuest(guestId);
 
       return { anonymized: affected.length, photos: photoIds.length };
     } catch (error) {
@@ -1415,6 +1712,8 @@ class FeedbackService {
         for (const photoId of photoIds) {
           await this.updatePhotoFeedbackStats(photoId, trx);
         }
+        // A finished selection or approval moves with the guest's picks.
+        await selectionSubmissions.mergeGuests(trx, survivor, sources);
         return { merged, photos: photoIds.length };
       };
       return await (executor ? merge(executor) : db.transaction(merge));
@@ -1425,4 +1724,29 @@ class FeedbackService {
   }
 }
 
+/**
+ * When a feedback row last changed, in ms. SQLite holds epoch ms where a
+ * Date was bound and SQL / ISO text otherwise (the column default); PostgreSQL
+ * returns Dates. A zone-less SQL timestamp is UTC, as CURRENT_TIMESTAMP writes it.
+ */
+function feedbackTime(value) {
+  if (value === null || value === undefined) return 0;
+  if (typeof value === 'number') return value;
+  const text = typeof value === 'string' && /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(value)
+    ? `${value.replace(' ', 'T')}Z` : value;
+  return new Date(text).getTime() || 0;
+}
+
+/**
+ * Sort comparator: the row mutated last first — updated_at, then created_at,
+ * then id. Done in JS rather than ORDER BY because of the mixed SQLite
+ * shapes above (every number sorts below every text there).
+ */
+function lastMutatedFirst(a, b) {
+  return (feedbackTime(b.updated_at) || feedbackTime(b.created_at)) - (feedbackTime(a.updated_at) || feedbackTime(a.created_at))
+    || feedbackTime(b.created_at) - feedbackTime(a.created_at)
+    || Number(b.id) - Number(a.id);
+}
+
 module.exports = new FeedbackService();
+module.exports.lastMutatedFirst = lastMutatedFirst;

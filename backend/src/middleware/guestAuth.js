@@ -51,12 +51,23 @@ async function resolveGuest(req, res, next) {
       return next();
     }
 
+    // A guest identity belongs to one gallery. The token is valid for the
+    // event it names, which is not necessarily the gallery this request was
+    // authorized for (verifyGalleryAccess runs first and sets req.event); in
+    // simple and shared mode nothing downstream compared the two, so another
+    // gallery's guest id, name and email landed on this gallery's feedback.
+    if (req.event?.id != null && Number(guest.event_id) !== Number(req.event.id)) {
+      req.guest = null;
+      return next();
+    }
+
     req.guest = {
       id: guest.id,
       eventId: guest.event_id,
       identifier: guest.identifier,
       name: guest.name,
       email: guest.email || null,
+      emailVerified: !!guest.email_verified_at,
       uploadOnly: decoded.scope === 'upload',
     };
 

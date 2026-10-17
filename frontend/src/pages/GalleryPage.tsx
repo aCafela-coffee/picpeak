@@ -8,9 +8,10 @@ import { useTranslation } from 'react-i18next';
 import { useLocalizedDate } from '../hooks/useLocalizedDate';
 import { usePublicSettings } from '../hooks/usePublicSettings';
 
-import { Card, CardContent, Input, Button, ReCaptcha, CMSContentBlock, PoweredBy } from '../components/common';
+import { Input, Button, ReCaptcha, CMSContentBlock, PoweredBy } from '../components/common';
 import { useGalleryAuth, useTheme } from '../contexts';
 import { useGalleryInfo } from '../hooks/useGallery';
+import { useFollowGalleryRename } from '../hooks/useFollowGalleryRename';
 import { GalleryView } from '../components/gallery';
 import { GallerySkeleton } from '../components/gallery/GallerySkeleton';
 import { PasswordChangeRequiredNotice } from '../components/gallery/PasswordChangeRequiredNotice';
@@ -21,6 +22,7 @@ import { buildResourceUrl } from '../utils/url';
 import { isGalleryPublic, normalizeRequirePassword } from '../utils/accessControl';
 import { detectInAppBrowser } from '../utils/inAppBrowser';
 import { isAdminSessionExpired, isPasswordChangeRequired } from '../utils/passwordChangeRequired';
+import { isShareToken } from '../utils/shareToken';
 
 export const GalleryPage: React.FC = () => {
   const { slug: rawSlug, token: rawToken } = useParams<{ slug: string; token?: string }>();
@@ -29,7 +31,7 @@ export const GalleryPage: React.FC = () => {
   // cookie while isAuthenticated is still false (fork survey A3 / #1563).
   const { isAuthenticated, isLoading: isRestoringSession, login, event } = useGalleryAuth();
   const { t, i18n } = useTranslation();
-  const { format } = useLocalizedDate();
+  const { formatExpiry } = useLocalizedDate();
   const { setTheme } = useTheme();
   const [password, setPassword] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
@@ -56,14 +58,14 @@ export const GalleryPage: React.FC = () => {
   const [linkCopied, setLinkCopied] = useState(false);
   const iabBlocked = iabDetection.app === 'instagram' && !iabOverride;
   const [resolvedSlug, setResolvedSlug] = useState<string | null>(() => {
-    if (rawSlug && !rawToken && /^[0-9a-fA-F]{32}$/.test(rawSlug)) {
+    if (rawSlug && !rawToken && isShareToken(rawSlug)) {
       return null;
     }
     return rawSlug || null;
   });
   const [resolvedToken, setResolvedToken] = useState<string | undefined>(rawToken);
   const [isResolvingIdentifier, setIsResolvingIdentifier] = useState<boolean>(() =>
-    Boolean(rawSlug && !rawToken && /^[0-9a-fA-F]{32}$/.test(rawSlug))
+    Boolean(rawSlug && !rawToken && isShareToken(rawSlug))
   );
   const [identifierError, setIdentifierError] = useState<string | null>(null);
   const [identifierNeedsPasswordChange, setIdentifierNeedsPasswordChange] = useState(false);
@@ -73,7 +75,7 @@ export const GalleryPage: React.FC = () => {
   React.useEffect(() => {
     let cancelled = false;
 
-    const looksLikeToken = Boolean(rawSlug && !rawToken && /^[0-9a-fA-F]{32}$/.test(rawSlug));
+    const looksLikeToken = Boolean(rawSlug && !rawToken && isShareToken(rawSlug));
 
     if (!rawSlug) {
       lastResolvedIdentifier.current = null;
@@ -129,7 +131,9 @@ export const GalleryPage: React.FC = () => {
     isLoading: isLoadingInfoQuery,
     error: infoError
   } = useGalleryInfo(canFetchGalleryInfo ? resolvedSlug ?? undefined : undefined, resolvedToken, canFetchGalleryInfo);
-  const isLoadingInfo = isLoadingInfoQuery || isResolvingIdentifier;
+  // An old slug of a renamed gallery answers 301 naming the new one.
+  const followingRename = useFollowGalleryRename(infoError, resolvedSlug);
+  const isLoadingInfo = isLoadingInfoQuery || isResolvingIdentifier || followingRename;
   const requiresPassword = normalizeRequirePassword(galleryInfo?.requires_password, true);
 
   React.useEffect(() => {
@@ -377,20 +381,20 @@ export const GalleryPage: React.FC = () => {
           )}
           
           <div className="flex-1 flex items-center justify-center">
-            <Card className="max-w-md w-full mx-4">
-              <CardContent className="text-center py-12">
-                <Clock className="w-16 h-16 text-amber-500 mx-auto mb-4" />
+            <div className="card-themed text-theme p-6 max-w-md w-full mx-4">
+              <div className="text-center py-12">
+                <Clock className="w-16 h-16 text-status hue-warning mx-auto mb-4" />
                 <h2 className="text-xl font-semibold mb-2">{t('gallery.expired')}</h2>
                 {galleryInfo.expires_at && (
-                  <p className="text-neutral-600 mb-4">
-                    {t('gallery.expiredOn', { date: format(parseISO(galleryInfo.expires_at), 'PP') })}
+                  <p className="text-muted-theme mb-4">
+                    {t('gallery.expiredOn', { date: formatExpiry(galleryInfo.expires_at) })}
                   </p>
                 )}
-                <p className="text-sm text-neutral-500">
+                <p className="text-sm text-muted-theme">
                   {t('gallery.contactOrganizer')}
                 </p>
-              </CardContent>
-            </Card>
+              </div>
+            </div>
           </div>
           
           {/* Legal Links */}
@@ -398,19 +402,19 @@ export const GalleryPage: React.FC = () => {
             <div className="flex items-center justify-center gap-4">
               <Link 
                 to="/impressum" 
-                className="text-xs text-neutral-500 hover:text-neutral-700 transition-colors"
+                className="text-xs text-muted-theme hover:text-theme transition-colors"
               >
                 {t('legal.impressum')}
               </Link>
-              <span className="text-xs text-neutral-400">|</span>
+              <span className="text-xs text-muted-theme">|</span>
               <Link 
                 to="/datenschutz" 
-                className="text-xs text-neutral-500 hover:text-neutral-700 transition-colors"
+                className="text-xs text-muted-theme hover:text-theme transition-colors"
               >
                 {t('legal.datenschutz')}
               </Link>
             </div>
-            <PoweredBy className="text-xs mt-2 text-neutral-500" />
+            <PoweredBy className="text-xs mt-2 text-muted-theme" />
           </div>
         </div>
       </div>
@@ -470,8 +474,8 @@ export const GalleryPage: React.FC = () => {
     return (
       <div className="min-h-screen flex items-center justify-center p-4"
         style={{ backgroundColor: 'var(--color-background, #fafafa)' }}>
-        <Card className="w-full max-w-md">
-          <CardContent className="p-6 text-center">
+        <div className="card-themed text-theme w-full max-w-md">
+          <div className="p-6 text-center">
             <AlertCircle className="w-10 h-10 mx-auto mb-3 text-muted-theme" />
             <p className="text-base mb-4">
               {loginError || t('gallery.failedToLoad', 'Failed to load gallery')}
@@ -484,8 +488,8 @@ export const GalleryPage: React.FC = () => {
             >
               {t('gallery.tryAgain', 'Try again')}
             </Button>
-          </CardContent>
-        </Card>
+          </div>
+        </div>
       </div>
     );
   }
@@ -508,21 +512,21 @@ export const GalleryPage: React.FC = () => {
                 className="h-12 sm:h-16 lg:h-20 w-auto object-contain mx-auto mb-3 sm:mb-4"
               />
             )}
-            <h1 className="text-2xl sm:text-3xl lg:text-4xl font-bold mb-2 px-2" style={{ color: 'var(--color-primary, #5C8762)' }}>
+            <h1 className="text-2xl sm:text-3xl lg:text-4xl font-bold mb-2 px-2" style={{ color: 'var(--color-accent-dark)' }}>
               {galleryInfo?.event_name}
             </h1>
           </div>
 
           {/* Expiration Warning */}
           {daysUntilExpiration !== null && daysUntilExpiration <= 7 && (
-            <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+            <div className="mb-4 p-3 status-chip hue-warning rounded-lg">
               <div className="flex items-start">
-                <AlertCircle className="w-4 h-4 sm:w-5 sm:h-5 text-amber-600 mt-0.5 mr-2 flex-shrink-0" />
+                <AlertCircle className="w-4 h-4 sm:w-5 sm:h-5 mt-0.5 mr-2 flex-shrink-0" />
                 <div>
-                  <p className="text-xs sm:text-sm font-medium text-amber-800">
+                  <p className="text-xs sm:text-sm font-medium">
                     {t('gallery.expiresIn', { count: daysUntilExpiration })}
                   </p>
-                  <p className="text-xs text-amber-700 mt-1">
+                  <p className="text-xs mt-1">
                     {t('gallery.downloadBefore')}
                   </p>
                 </div>
@@ -530,8 +534,8 @@ export const GalleryPage: React.FC = () => {
             </div>
           )}
 
-          <Card>
-            <CardContent className="p-4 sm:p-6">
+          <div className="card-themed text-theme">
+            <div className="p-4 sm:p-6">
               <h2 className="text-base sm:text-lg lg:text-xl font-semibold mb-4">{t('auth.enterPassword')}</h2>
 
               {/* Instagram in-app browser blocker (#654). Field reports show
@@ -544,10 +548,10 @@ export const GalleryPage: React.FC = () => {
               {iabBlocked && (
                 <div
                   role="alert"
-                  className="rounded-lg border border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-950/40 p-4 text-sm text-red-900 dark:text-red-100"
+                  className="rounded-lg status-chip hue-danger p-4 text-sm"
                 >
                   <div className="flex items-start">
-                    <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400 mt-0.5 mr-2 flex-shrink-0" />
+                    <AlertCircle className="w-5 h-5 mt-0.5 mr-2 flex-shrink-0" />
                     <div>
                       <p className="font-medium">
                         {t('auth.iab.instagram.blockedTitle', "Instagram's browser can't open this gallery")}
@@ -580,7 +584,7 @@ export const GalleryPage: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => setIabOverride(true)}
-                    className="mt-3 w-full text-center text-xs text-red-800 dark:text-red-200 underline"
+                    className="mt-3 w-full text-center text-xs underline"
                   >
                     {t('auth.iab.instagram.tryAnyway', 'Try entering the password here anyway')}
                   </button>
@@ -590,6 +594,7 @@ export const GalleryPage: React.FC = () => {
               {!iabBlocked && (
               <form onSubmit={handleLogin} className="space-y-4">
                 <Input
+                  themed
                   type="password"
                   label={t('auth.password')}
                   placeholder={t('auth.passwordPlaceholder')}
@@ -630,31 +635,31 @@ export const GalleryPage: React.FC = () => {
               )}
 
               {!iabBlocked && (
-                <p className="text-xs text-neutral-500 text-center mt-4 sm:mt-6">
+                <p className="text-xs text-muted-theme text-center mt-4 sm:mt-6">
                   {t('auth.passwordHint')}
                 </p>
               )}
-            </CardContent>
-          </Card>
+            </div>
+          </div>
 
           {/* Legal Links */}
           <div className="text-center mt-4 sm:mt-6">
             <div className="flex items-center justify-center gap-4">
               <Link 
                 to="/impressum" 
-                className="text-xs text-neutral-500 hover:text-neutral-700 transition-colors"
+                className="text-xs text-muted-theme hover:text-theme transition-colors"
               >
                 {t('legal.impressum')}
               </Link>
-              <span className="text-xs text-neutral-400">|</span>
+              <span className="text-xs text-muted-theme">|</span>
               <Link 
                 to="/datenschutz" 
-                className="text-xs text-neutral-500 hover:text-neutral-700 transition-colors"
+                className="text-xs text-muted-theme hover:text-theme transition-colors"
               >
                 {t('legal.datenschutz')}
               </Link>
             </div>
-            <PoweredBy className="text-xs mt-2 text-neutral-500" />
+            <PoweredBy className="text-xs mt-2 text-muted-theme" />
           </div>
         </div>
       </div>

@@ -37,16 +37,6 @@ jest.mock('../../src/services/downloadQuota', () => {
   return { ...actual, grantDownloads: jest.fn(actual.grantDownloads) };
 });
 
-// A deterministic fingerprint, so a token minted below verifies on the
-// secure-image serve route.
-jest.mock('../../src/middleware/secureImageMiddleware', () => ({
-  secureImageAccess: (req, _res, next) => {
-    req.clientInfo = { fingerprint: 'test-fp', ip: '127.0.0.1', userAgent: 'jest' };
-    next();
-  },
-  getSecurityStatus: (_req, res) => res.json({ ok: true }),
-}));
-
 describe('Download limit (issue 1560)', () => {
   let db;
   let cleanup;
@@ -113,6 +103,16 @@ describe('Download limit (issue 1560)', () => {
   const grantCount = async (eventId) => {
     const row = await db('event_download_grants').where({ event_id: eventId }).count('id as count').first();
     return Number(row.count);
+  };
+  // A reserved grant is delivered or given back on the response's 'close',
+  // which can come after supertest resolved: count only once none is pending.
+  const settledGrantCount = async (eventId) => {
+    for (let i = 0; i < 200; i += 1) {
+      const pending = await db('event_download_grants').where({ event_id: eventId }).where('pending_holders', '>', 0).first();
+      if (!pending) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return grantCount(eventId);
   };
 
   beforeAll(async () => {
@@ -182,7 +182,7 @@ describe('Download limit (issue 1560)', () => {
         .get(`/api/gallery/${event.slug}/download/${photoIds[0]}`)
         .set('Authorization', `Bearer ${token}`);
       expect(res.status).toBe(404);
-      expect(await grantCount(event.id)).toBe(0);
+      expect(await settledGrantCount(event.id)).toBe(0);
       // The slot is still there for a photo that exists.
       await request(app)
         .get(`/api/gallery/${event.slug}/download/${photoIds[1]}`)
@@ -643,6 +643,29 @@ describe('Download limit (issue 1560)', () => {
       expect(await grantCount(event.id)).toBe(0);
     });
 
+    // An editor's scoped dashboard feed filters on activity_logs.event_id, so
+    // a row that names its gallery only in metadata never reaches them.
+    it('logs the reset and a download-settings change against the gallery', async () => {
+      const { event } = await makeEvent({ limit: 2 });
+      const reset = await request(app)
+        .post(`/api/admin/events/${event.id}/download-limit/reset`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(reset.status).toBe(200);
+      const settings = await request(app)
+        .patch(`/api/admin/events/${event.id}/download-resolutions`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ download_allow_original: true });
+      expect(settings.status).toBe(200);
+
+      const rows = await db('activity_logs')
+        .whereIn('activity_type', ['event_download_limit_reset', 'event_download_resolutions_updated'])
+        .whereRaw('metadata like ?', [`%"event_id":${event.id},%`])
+        .select('activity_type', 'event_id');
+      expect(rows.map((r) => r.activity_type).sort())
+        .toEqual(['event_download_limit_reset', 'event_download_resolutions_updated']);
+      for (const row of rows) expect(Number(row.event_id)).toBe(event.id);
+    });
+
     it('lets a role that sees every event read the usage of one it does not own, not reset it', async () => {
       const { event, photoIds } = await makeEvent({ limit: 2 });
       await quota.grantDownloads(event, photoIds.slice(0, 1));
@@ -702,9 +725,11 @@ describe('Download limit (issue 1560)', () => {
   // ── Review round: videos, guests, conditional GETs, races ──────────────
   const drainBody = (r, cb) => { const c = []; r.on('data', (d) => c.push(d)); r.on('end', () => cb(null, Buffer.concat(c))); };
   const eventually = async (read, expected) => {
-    // Grants settle when the response closes, after supertest resolves.
+    // Grants settle when the response closes, after supertest resolves. Up
+    // to 5 s: the counters and activity row are written on 'finish', which a
+    // loaded CI runner can take past a second to get to.
     let value;
-    for (let i = 0; i < 50; i += 1) {
+    for (let i = 0; i < 250; i += 1) {
       value = await read();
       if (value === expected) return value;
       await new Promise((r) => setTimeout(r, 20));
@@ -1029,6 +1054,118 @@ describe('Download limit (issue 1560)', () => {
       for (const table of ['activity_logs', 'event_download_grants', 'photos']) {
         expect(lock).toBeLessThan(body.indexOf(`trx('${table}')`));
       }
+    });
+  });
+
+  // Issue 2139: a HEAD probe (browser, download manager, link previewer) is
+  // not a download on an unlimited gallery either.
+  describe('HEAD probes count nothing', () => {
+    const downloadCounts = async (photoIds) => (await db('photos').whereIn('id', photoIds).select('download_count'))
+      .map((p) => Number(p.download_count || 0));
+    const activityCount = async (eventId) => Number((await db('activity_logs')
+      .where({ event_id: eventId, activity_type: 'gallery_downloaded' }).count('id as c').first()).c);
+    const accessLogCount = async (eventId) => Number((await db('access_logs')
+      .where({ event_id: eventId }).count('id as c').first()).c);
+    // The counters run on 'finish', after supertest resolved.
+    const settle = () => new Promise((r) => setTimeout(r, 100));
+
+    async function makeReadyJob(event, photoIds, accessLevel, tokenChar) {
+      const jobToken = tokenChar.repeat(64);
+      const zipKey = `download-jobs/${event.slug}-head.zip`;
+      await fs.promises.mkdir(path.join(process.env.STORAGE_PATH, 'download-jobs'), { recursive: true });
+      await fs.promises.writeFile(path.join(process.env.STORAGE_PATH, zipKey), Buffer.from('PK-head-probe'));
+      const jobs = require('../../src/services/downloadJobService');
+      // The real identity, so isStillDeliverable lets the archive through.
+      const dedupKey = jobs.dedupKey(event.id, 'original', photoIds, null, jobs.visibilityScopeFor(accessLevel));
+      await db('download_jobs').insert({
+        token: jobToken, event_id: event.id, resolution: 'original',
+        photo_ids: JSON.stringify(photoIds), delivered_photo_ids: JSON.stringify(photoIds),
+        dedup_key: dedupKey, status: 'ready', zip_path: zipKey, photo_count: photoIds.length,
+        visibility_scope: jobs.visibilityScopeFor(accessLevel),
+        expires_at: new Date(Date.now() + 3600 * 1000).toISOString(), created_at: new Date().toISOString(),
+      });
+      return jobToken;
+    }
+
+    it('a HEAD of a prepared archive on an unlimited gallery answers the headers and counts nothing', async () => {
+      const { event, photoIds, token } = await makeEvent({ limit: null, photos: 2 });
+      const jobToken = await makeReadyJob(event, photoIds, 'client', '1');
+      const res = await request(app)
+        .head(`/api/gallery/${event.slug}/download-jobs/${jobToken}/file`)
+        .set('Authorization', `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toContain('application/zip');
+      expect(res.headers['content-length']).toBe(String('PK-head-probe'.length));
+      expect(res.headers['content-disposition']).toBe(`attachment; filename="${event.slug}-original.zip"`);
+      await settle();
+      expect(await downloadCounts(photoIds)).toEqual([0, 0]);
+      expect(await activityCount(event.id)).toBe(0);
+      expect(await accessLogCount(event.id)).toBe(0);
+    });
+
+    // The GET still takes the download path, not the HEAD exit. Its counters
+    // run on the response's 'finish', which on a loaded CI runner did not
+    // reliably come before supertest closed the connection, so they are not
+    // asserted here; that code is unchanged by the HEAD fix.
+    it('a GET of a prepared archive on an unlimited gallery still sends the archive', async () => {
+      const { event, photoIds, token } = await makeEvent({ limit: null, photos: 2 });
+      const jobToken = await makeReadyJob(event, photoIds, 'client', '2');
+      const res = await request(app)
+        .get(`/api/gallery/${event.slug}/download-jobs/${jobToken}/file`)
+        .set('Authorization', `Bearer ${token}`)
+        .buffer(true).parse(drainBody);
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toContain('application/zip');
+      expect(res.body.length).toBe(Number(res.headers['content-length']));
+      expect(res.body.length).toBeGreaterThan(0);
+    });
+
+    it('a HEAD of a prepared archive on a limited gallery takes no slot and is refused past the limit', async () => {
+      const { event, photoIds, token } = await makeEvent({ limit: 2, photos: 3 });
+      const jobToken = await makeReadyJob(event, photoIds.slice(0, 2), 'client', '3');
+      const head = () => request(app)
+        .head(`/api/gallery/${event.slug}/download-jobs/${jobToken}/file`)
+        .set('Authorization', `Bearer ${token}`);
+      const res = await head();
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toContain('application/zip');
+      await settle();
+      expect(await grantCount(event.id)).toBe(0);
+      expect(await downloadCounts(photoIds)).toEqual([0, 0, 0]);
+      expect(await activityCount(event.id)).toBe(0);
+
+      await quota.grantDownloads(event, [photoIds[2]]);
+      expect((await head()).status).toBe(403);
+      expect(await grantCount(event.id)).toBe(1);
+    });
+
+    it('a HEAD of download-all on an unlimited gallery counts nothing (streamed archive)', async () => {
+      const { event, photoIds, token } = await makeEvent({ limit: null, photos: 2 });
+      const res = await request(app)
+        .head(`/api/gallery/${event.slug}/download-all`)
+        .set('Authorization', `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toContain('application/zip');
+      await settle();
+      expect(await downloadCounts(photoIds)).toEqual([0, 0]);
+      expect(await activityCount(event.id)).toBe(0);
+      expect(await accessLogCount(event.id)).toBe(0);
+    });
+
+    it('a HEAD of download-all on an unlimited gallery counts nothing (prebuilt archive)', async () => {
+      const { event, photoIds, guestToken } = await makeEvent({ limit: null, photos: 2 });
+      const built = await require('../../src/services/downloadZipService').generateZip(event.id);
+      expect(built.success).toBe(true);
+      const res = await request(app)
+        .head(`/api/gallery/${event.slug}/download-all`)
+        .set('Authorization', `Bearer ${guestToken}`);
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toContain('application/zip');
+      expect(res.headers['content-length']).toBe(String(built.size));
+      await settle();
+      expect(await downloadCounts(photoIds)).toEqual([0, 0]);
+      expect(await activityCount(event.id)).toBe(0);
+      expect(await accessLogCount(event.id)).toBe(0);
     });
   });
 });

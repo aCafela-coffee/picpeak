@@ -1,4 +1,7 @@
-const ffmpeg = require('fluent-ffmpeg');
+const mediaProcesses = require('./mediaProcessService');
+// Only a "not now" or a lost claim passes through the fallbacks below; a
+// video the tools cannot handle still completes with the placeholder tile.
+const { isInterruption: isResourceError } = require('./mediaProcessPolicy');
 const path = require('path');
 const fs = require('fs').promises;
 const fsSync = require('fs');
@@ -6,6 +9,7 @@ const os = require('os');
 const crypto = require('crypto');
 const logger = require('../utils/logger');
 const { getStorage } = require('./storage');
+const attemptContext = require('./mediaAttemptContext');
 
 // Use system ffmpeg/ffprobe (apk-installed in the Docker image, brew/apt on
 // dev hosts). The npm `@ffmpeg-installer/ffmpeg` binary is glibc-built and
@@ -20,38 +24,30 @@ const { getStorage } = require('./storage');
  * @returns {Promise<Object>} - Video metadata
  */
 async function extractVideoMetadata(videoPath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(videoPath, (err, metadata) => {
-      if (err) {
-        logger.error('Error extracting video metadata', { error: err.message, videoPath });
-        return reject(err);
-      }
+  try {
+    const metadata = await mediaProcesses.probeVideo(videoPath);
+    const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+    const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
 
-      try {
-        const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-        const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
+    const result = {
+      // null (not 0) when ffprobe genuinely has no duration — a real
+      // 0-second clip and "unknown" must stay distinguishable, since
+      // downstream code treats `duration != null` as "trust this value".
+      duration: metadata.format.duration != null ? Math.floor(metadata.format.duration) : null,
+      width: videoStream?.width || null,
+      height: videoStream?.height || null,
+      videoCodec: videoStream?.codec_name || null,
+      audioCodec: audioStream?.codec_name || null,
+      size: metadata.format.size || 0,
+      bitrate: metadata.format.bit_rate || null,
+      format: metadata.format.format_name || null
+    };
 
-        const result = {
-          // null (not 0) when ffprobe genuinely has no duration — a real
-          // 0-second clip and "unknown" must stay distinguishable, since
-          // downstream code treats `duration != null` as "trust this value".
-          duration: metadata.format.duration != null ? Math.floor(metadata.format.duration) : null,
-          width: videoStream?.width || null,
-          height: videoStream?.height || null,
-          videoCodec: videoStream?.codec_name || null,
-          audioCodec: audioStream?.codec_name || null,
-          size: metadata.format.size || 0,
-          bitrate: metadata.format.bit_rate || null,
-          format: metadata.format.format_name || null
-        };
-
-        resolve(result);
-      } catch (parseErr) {
-        logger.error('Error parsing video metadata', { error: parseErr.message });
-        reject(parseErr);
-      }
-    });
-  });
+    return result;
+  } catch (error) {
+    logger.error('Error extracting video metadata', { error: error.message, videoPath });
+    throw error;
+  }
 }
 
 /**
@@ -75,23 +71,33 @@ async function generateVideoThumbnail(videoPath, thumbnailKey, options = {}) {
   const tmpPath = path.join(tmpDir, tmpFilename);
 
   try {
-    await new Promise((resolve, reject) => {
-      ffmpeg(videoPath)
-        .screenshots({
-          timestamps: [timeOffset],
-          filename: tmpFilename,
-          folder: tmpDir,
-          size: size
-        })
-        .on('end', () => resolve())
-        .on('error', (err) => reject(err));
+    if (!/^\d{1,4}x\d{1,4}$/.test(size) || size.split('x').some(value => Number(value) <= 0 || Number(value) > 4096)) throw new Error('Invalid video thumbnail size');
+    await mediaProcesses.withSnapshot(videoPath, 'thumbnail', async (snapshot, details) => {
+      try { await mediaProcesses.probeSnapshot(snapshot, details); }
+      catch (error) {
+        if (isResourceError(error)) throw error;
+        // Some legitimate phone exports can be decoded even when ffprobe
+        // cannot describe them. The native decoder remains hard-capped.
+        logger.warn('Video poster probe unavailable; using bounded decode', { error: error.message });
+      }
+      await mediaProcesses.run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+        ...mediaProcesses.inputOptions(details.format, details.policy.threads), '-ss', String(timeOffset), '-i', snapshot,
+        '-frames:v', '1', '-an', '-sn', '-dn', '-vf', `scale=${size.replace('x', ':')}`, '-pix_fmt', 'yuvj420p',
+        '-threads', '1', '-filter_threads', '1', tmpPath], {
+        memoryBytes: details.policy.nativeBytes, wallMs: details.policy.thumbnailMs,
+        cpuSeconds: Math.ceil(details.policy.thumbnailMs / 1000), fileBytes: 16 * 1024 * 1024,
+      });
     });
 
     if (!fsSync.existsSync(tmpPath)) {
       throw new Error('ffmpeg did not produce a thumbnail file');
     }
 
+    await attemptContext.current()?.assertCurrent();
     await storage.putFromFile(thumbnailKey, tmpPath, { contentType: 'image/jpeg' });
+    await attemptContext.current()?.assertCurrent();
+    // Tile placeholder (issue 1733), from the poster frame while it is on disk.
+    if (options.meta) options.meta.thumbHash = await require('./thumbHash').computeThumbHash(tmpPath);
     logger.info('Video thumbnail generated', { videoPath, thumbnailKey });
     return thumbnailKey;
   } finally {
@@ -109,6 +115,7 @@ async function isValidVideo(videoPath) {
     const metadata = await extractVideoMetadata(videoPath);
     return metadata.duration > 0 && metadata.width > 0 && metadata.height > 0;
   } catch (error) {
+    if (isResourceError(error)) throw error;
     logger.error('Video validation failed', { error: error.message, videoPath });
     return false;
   }
@@ -124,6 +131,7 @@ async function getVideoDuration(videoPath) {
     const metadata = await extractVideoMetadata(videoPath);
     return metadata.duration;
   } catch (error) {
+    if (isResourceError(error)) throw error;
     logger.error('Error getting video duration', { error: error.message });
     return 0;
   }
@@ -163,6 +171,7 @@ async function processUploadedVideo(videoPath, thumbnailKey, options = {}) {
   try {
     metadata = await extractVideoMetadata(videoPath);
   } catch (error) {
+    if (isResourceError(error)) throw error;
     logger.error('Video metadata extraction failed — continuing without duration/codec/dimensions', {
       error: error.message,
       videoPath
@@ -170,13 +179,23 @@ async function processUploadedVideo(videoPath, thumbnailKey, options = {}) {
   }
 
   let generatedThumbnailKey = null;
+  // Why the poster frame is missing, kept for the row: a video that completed
+  // with the placeholder used to be indistinguishable from one with a real
+  // poster frame, so the admin saw a grey tile and nothing to act on
+  // (issue 1430, item 6).
+  let thumbnailError = null;
+  const meta = {};
   try {
-    await generateVideoThumbnail(videoPath, thumbnailKey, options);
+    await generateVideoThumbnail(videoPath, thumbnailKey, { ...options, meta });
     const storage = getStorage();
     if (await storage.exists(thumbnailKey)) {
       generatedThumbnailKey = thumbnailKey;
+    } else {
+      thumbnailError = 'ffmpeg produced no poster frame';
     }
   } catch (error) {
+    if (isResourceError(error)) throw error;
+    thumbnailError = error.message;
     logger.error('Video thumbnail generation failed — continuing without a thumbnail', {
       error: error.message,
       videoPath
@@ -184,7 +203,7 @@ async function processUploadedVideo(videoPath, thumbnailKey, options = {}) {
   }
 
   // Never return "success" with no thumbnail at all: the gallery grid
-  // (GridGalleryLayout/JustifiedGalleryLayout) falls back to
+  // (GridGalleryLayout) falls back to
   // `photo.thumbnail_url || photo.url` when there's no thumbnail, which
   // makes AuthenticatedImage download the full ORIGINAL VIDEO and try to
   // render it as an <img> — a broken tile and a multi-GB fetch just from
@@ -194,6 +213,10 @@ async function processUploadedVideo(videoPath, thumbnailKey, options = {}) {
   // that placeholder too, not to "no thumbnail". thumbnailKey is always
   // `thumbnails/thumb_<name>.jpg` (see callers) — strip the prefix back to
   // a filename so generateVideoPlaceholder recomputes this exact same key.
+  // Tracked as a flag, not by comparing keys: the placeholder lands under the
+  // very same key as a real frame would (that is the point of the filename
+  // derivation below), so the key alone cannot tell the two apart.
+  let usedPlaceholder = false;
   if (!generatedThumbnailKey) {
     try {
       const {
@@ -212,8 +235,10 @@ async function processUploadedVideo(videoPath, thumbnailKey, options = {}) {
       });
       if (placeholderKey) {
         generatedThumbnailKey = placeholderKey;
+        usedPlaceholder = true;
       }
     } catch (error) {
+      if (isResourceError(error)) throw error;
       logger.error('Video placeholder generation also failed', { error: error.message, videoPath });
     }
   }
@@ -233,8 +258,27 @@ async function processUploadedVideo(videoPath, thumbnailKey, options = {}) {
   return {
     success: true,
     metadata,
-    thumbnailKey: generatedThumbnailKey
+    thumbnailKey: generatedThumbnailKey,
+    // True when thumbnailKey holds the SVG placeholder, not a frame of the video.
+    placeholder: usedPlaceholder,
+    thumbnailError: usedPlaceholder ? thumbnailError : null,
+    // Placeholder hash of the poster frame; none for the SVG placeholder.
+    thumbHash: usedPlaceholder ? null : (meta.thumbHash || null)
   };
+}
+
+/**
+ * The processing_error text for a video that completed with the placeholder
+ * tile. One place, so the upload worker, the synchronous upload path and the
+ * external import write the same note and the admin grid can show it.
+ */
+function posterFrameError(reason) {
+  // ffmpeg's message runs to several lines and names the file's path on
+  // disk; the first line without the path says what the admin can act on.
+  const detail = reason
+    ? String(reason).split('\n')[0].replace(/\/[^\s'"]+/g, '…').trim().slice(0, 200)
+    : '';
+  return detail ? `No poster frame: ${detail}` : 'No poster frame: ffmpeg could not read the video';
 }
 
 /**
@@ -268,6 +312,7 @@ module.exports = {
   isValidVideo,
   getVideoDuration,
   processUploadedVideo,
+  posterFrameError,
   getThumbnailAtTime,
   isVideoMimeType
 };

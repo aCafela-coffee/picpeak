@@ -1,12 +1,23 @@
 const express = require('express');
 const { db, logActivity } = require('../../database/db');
+const { livePhotos } = require('../../utils/photoVisibility');
 const router = express.Router();
+
+// A photoId that is not a plausible row id is refused here (issue 2078);
+// PostgreSQL answers a non-numeric or int4-overflowing id with a 500.
+router.param('photoId', (req, res, next, value) => {
+  if (parsePositiveInt32(value) === null) {
+    return res.status(400).json({ error: 'Invalid photo ID' });
+  }
+  next();
+});
 const { verifyGalleryAccess } = require('../../middleware/gallery');
 const { resolveGuest, scopeGuestToFeedback } = require('../../middleware/guestAuth');
 const { noStoreCache } = require('../../middleware/noStoreCache');
 const { generateGuestIdentifier } = require('../../middleware/feedbackRateLimit');
 const { errorResponse } = require('../../utils/routeHelpers');
 const { guestBlockedByReveal } = require('../../utils/revealMode');
+const { parseBooleanInput, parsePositiveInt32 } = require('../../utils/parsers');
 const downloadZipService = require('../../services/downloadZipService');
 const GALLERY_OPENED_DEBOUNCE_MS = 6 * 60 * 60 * 1000;
 const galleryOpenedNotifiedAt = new Map();
@@ -63,6 +74,28 @@ router.get('/:slug/photos', verifyGalleryAccess, resolveGuest, scopeGuestToFeedb
 });
 
 /**
+ * Live refresh (issue 1733, C5): the number of photos in this viewer's list
+ * and the highest id among them, so an open gallery can tell that photos
+ * arrived without refetching the list. Same middleware and the same query as
+ * the list (galleryListQuery), so a hidden, held or still-processing photo
+ * never moves the numbers. 404 while the gallery has the option off. Not
+ * logged as a view: it is a poll, not a visit.
+ */
+router.get('/:slug/photos/state', verifyGalleryAccess, resolveGuest, scopeGuestToFeedback, noStoreCache, async (req, res) => {
+  try {
+    if (!parseBooleanInput(req.event.live_refresh, false)) {
+      return res.status(404).json({ error: 'Live refresh is not enabled for this gallery' });
+    }
+    const guestIdentifier = await generateGuestIdentifier(req);
+    res.json(await require('../../services/galleryQueryService').getGalleryPhotoState({
+      event: req.event, query: req.query,
+      identity: { guestId: req.guest?.id, guestIdentifier },
+      accessLevel: req.accessLevel, hiddenForGuest: guestBlockedByReveal(req),
+    }));
+  } catch (error) { errorResponse(res, error, 500, 'Failed to fetch photo state'); }
+});
+
+/**
  * People in this gallery (#1074).
  *
  * Returns [] rather than 403 whenever the feature is unavailable — a guest
@@ -105,7 +138,7 @@ router.get('/:slug/people', verifyGalleryAccess, resolveGuest, noStoreCache, asy
     // Drives the "Finding people… 240/1200" progress line during a backfill.
     // Scoped to what this viewer may see — an unscoped total would leak the
     // number of hidden photos through the progress bar.
-    const status = await getScanStatus(req.event.id, { isClient });
+    const status = await getScanStatus(req.event.id, { isClient, forAdmin: false });
 
     res.json({
       people,
@@ -134,15 +167,18 @@ router.patch('/:slug/photos/:photoId/visibility', verifyGalleryAccess, async (re
       return res.status(400).json({ error: 'Invalid visibility value' });
     }
 
-    const photo = await db('photos')
+    // A photo under review (migration 269) is not the client's to publish,
+    // and does not exist for them.
+    const photo = await livePhotos(db)
       .where({ id: photoId, event_id: req.event.id })
+      .whereNull('moderation_status')
       .first();
 
     if (!photo) {
       return res.status(404).json({ error: 'Photo not found' });
     }
 
-    await db('photos')
+    await livePhotos(db)
       .where({ id: photoId, event_id: req.event.id })
       .update({ visibility });
 
@@ -165,7 +201,8 @@ router.patch('/:slug/photos/visibility/bulk', verifyGalleryAccess, async (req, r
 
     const { photoIds, visibility } = req.body;
 
-    if (!Array.isArray(photoIds) || photoIds.length === 0) {
+    if (!Array.isArray(photoIds) || photoIds.length === 0
+      || photoIds.some((id) => parsePositiveInt32(id) === null)) {
       return res.status(400).json({ error: 'Invalid photo IDs' });
     }
 
@@ -173,9 +210,10 @@ router.patch('/:slug/photos/visibility/bulk', verifyGalleryAccess, async (req, r
       return res.status(400).json({ error: 'Invalid visibility value' });
     }
 
-    const count = await db('photos')
+    const count = await livePhotos(db)
       .whereIn('id', photoIds)
       .where('event_id', req.event.id)
+      .whereNull('moderation_status')
       .update({ visibility });
 
     // Client bulk hide/show alters the guest download bundle — invalidate

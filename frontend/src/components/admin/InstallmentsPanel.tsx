@@ -27,8 +27,10 @@ import React, { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Trash2, Plus } from 'lucide-react';
 import { Button, Input, LocalizedDateInput } from '../common';
+import { DecimalInput } from '../common/DecimalInput';
 import type { PaymentTermInstallment } from '../../services/quotes.service';
 import { useInstallmentDefaults } from '../../hooks/useInstallmentDefaults';
+import { todayIsoDate } from '../../utils/localDate';
 
 export type InstallmentPlan = PaymentTermInstallment[];
 
@@ -47,10 +49,6 @@ export interface InstallmentsPanelProps {
 const ALL_TRIGGERS: PaymentTermInstallment['trigger'][] = [
   'quote_accepted', 'before_event', 'after_event', 'after_delivery', 'fixed_date',
 ];
-
-function todayIso(): string {
-  return new Date().toISOString().slice(0, 10);
-}
 
 function addDays(base: string, days: number): string {
   const d = new Date(base);
@@ -139,7 +137,7 @@ export const InstallmentsPanel: React.FC<InstallmentsPanelProps> = ({
   // when trigger is fixed_date; for dynamic triggers we display the
   // resolved date if we have eventDate, else show a placeholder.
   const previewDate = (row: PaymentTermInstallment): string | null => {
-    const baseline = todayIso();
+    const baseline = todayIsoDate();
     if (row.trigger === 'fixed_date' || row.trigger === 'quote_accepted') {
       return addDays(baseline, row.offset_days || 0);
     }
@@ -164,7 +162,7 @@ export const InstallmentsPanel: React.FC<InstallmentsPanelProps> = ({
         {enabled && (
           <button
             type="button"
-            className="text-xs text-primary-600 dark:text-primary-400 hover:underline"
+            className="text-xs text-accent hover:underline"
             onClick={() => setAdvanced((v) => !v)}
             disabled={disabled}
           >
@@ -195,13 +193,10 @@ export const InstallmentsPanel: React.FC<InstallmentsPanelProps> = ({
                   <label className="block text-xs text-muted mb-1">
                     {t('installments.percent', '%')}
                   </label>
-                  <Input
-                    type="number"
-                    min={0}
-                    max={100}
-                    step="0.01"
+                  <DecimalInput
+                    className="input"
                     value={row.percent}
-                    onChange={(e) => update(idx, { percent: Number(e.target.value) })}
+                    onChange={(n) => update(idx, { percent: Number.isFinite(n) ? n : 0 })}
                     disabled={disabled}
                   />
                 </div>
@@ -232,7 +227,7 @@ export const InstallmentsPanel: React.FC<InstallmentsPanelProps> = ({
                         value={previewDate(row) || ''}
                         onChange={(next) => {
                           if (!next) return;
-                          const offset = daysBetween(todayIso(), next);
+                          const offset = daysBetween(todayIsoDate(), next);
                           update(idx, { trigger: 'fixed_date', offset_days: offset });
                         }}
                         disabled={disabled}
@@ -280,7 +275,7 @@ export const InstallmentsPanel: React.FC<InstallmentsPanelProps> = ({
                     type="button"
                     onClick={() => remove(idx)}
                     disabled={disabled}
-                    className="p-2 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 text-red-600"
+                    className="p-2 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 text-danger-text"
                     aria-label={t('installments.removeRow', 'Remove row') as string}
                   >
                     <Trash2 className="w-4 h-4" />
@@ -301,7 +296,7 @@ export const InstallmentsPanel: React.FC<InstallmentsPanelProps> = ({
             >
               {t('installments.addRow', 'Add installment')}
             </Button>
-            <div className={`text-sm font-medium ${isValid ? 'text-green-700 dark:text-green-300' : 'text-red-700 dark:text-red-300'}`}>
+            <div className={`text-sm font-medium ${isValid ? 'text-success-text' : 'text-danger-text'}`}>
               {t('installments.total', 'Total')}: {totalPercent.toFixed(2)}%
               {!isValid && ` — ${t('installments.mustSumTo100', 'must sum to 100%')}`}
             </div>

@@ -12,6 +12,7 @@ const validator = require('validator');
 const { db, logActivity } = require('../database/db');
 const { formatBoolean } = require('../utils/dbCompat');
 const { adminAuth } = require('../middleware/auth');
+const { getAuthCookieDomain } = require('../utils/tokenUtils');
 const { requirePermission, userHasAnyPermission, isSuperAdminUser } = require('../middleware/permissions');
 const { ForbiddenError } = require('../utils/errors');
 const { clearMaintenanceCache } = require('../middleware/maintenance');
@@ -41,11 +42,12 @@ const router = express.Router();
 const SECRET_MASK = '••••••••';
 const { normaliseDownloadLimit } = require('../services/downloadQuota');
 const { GUEST_NAME_MODES } = require('../services/photoCredit');
-const { clearMaxFilesPerUploadCache, MAX_ALLOWED_FILES_PER_UPLOAD, clearMaxFileSizeCache, clearMaxVideoSizeCache, MAX_ALLOWED_FILE_SIZE_MB } = require('../services/uploadSettings');
+const { clearMaxFilesPerUploadCache, MAX_ALLOWED_FILES_PER_UPLOAD, clearMaxFileSizeCache, clearMaxVideoSizeCache, MAX_ALLOWED_FILE_SIZE_MB, clearAllowedTypesCache } = require('../services/uploadSettings');
 const watermarkService = require('../services/watermarkService');
 const watermarkGeneratorService = require('../services/watermarkGeneratorService');
 
 const { getStoragePath } = require('../config/storage');
+const { normalizeStatusColors, STATUS_KEYS } = require('../utils/statusColors');
 
 // Reserved first-run bootstrap keys — never writable through the generic
 // settings upserts in this file: setup_wizard_completed is a one-way marker
@@ -88,27 +90,45 @@ const isReservedSettingKey = (key) => RESERVED_SETTING_KEYS.includes(key)
   // (#705). They are computed from the environment, never stored, so a
   // round-trip of the GET payload must not create phantom setting rows.
   || key === 'general_site_url_env_pinned'
-  || key === 'general_site_url_effective';
+  || key === 'general_site_url_effective'
+  || key === 'analytics_dashboard_cookie_domain';
 const stripReservedSettingKeys = (settings) => {
   for (const key of Object.keys(settings)) {
     if (isReservedSettingKey(key)) delete settings[key];
   }
   return settings;
 };
-// Keys owned by the dedicated backup routes (PUT /admin/backup/config and
-// /admin/database-backup/config). Those routes apply their own permission
-// rules (super_admin for file-backup destinations and the manifest location)
-// and validate the values; a generic upsert would skip all of that. Writers
-// only — the generic reads still return these rows.
-const isBackupRouteOwnedKey = (key) => key.startsWith('backup_') || key.startsWith('database_backup_');
-// 400 (naming the keys) when a generic write carries backup-owned keys, rather
+// Keys owned by a dedicated, separately permission-checked writer. Those
+// routes apply their own permission rules and validate the values; a generic
+// upsert would skip all of that. Writers only — the generic reads still
+// return these rows.
+//   backup_* / database_backup_*  PUT /admin/backup/config and
+//                                 /admin/database-backup/config (super_admin
+//                                 for destinations and the manifest location)
+//   rate_limit_*                  PUT /admin/settings/security/rate-limit
+//                                 (settings.security; range-validated — a
+//                                 settings.edit holder could otherwise switch
+//                                 the limiter off through /general)
+//   max_image_requests_*          retired (issue 2152): nothing reads them
+//                                 any more, and they stay refused here so a
+//                                 generic write cannot bring them back
+//   ledger_*                      PATCH /admin/ledger/mappings/settings
+//                                 (accounting.manage)
+//   restore_*                     PUT /admin/restore/settings (backup.restore;
+//                                 restore_allow_force and
+//                                 restore_require_pre_backup gate restore-start)
+const DEDICATED_ROUTE_KEY_PREFIXES = [
+  'backup_', 'database_backup_', 'rate_limit_', 'max_image_requests_', 'ledger_', 'restore_',
+];
+const isDedicatedRouteOwnedKey = (key) => DEDICATED_ROUTE_KEY_PREFIXES.some((prefix) => key.startsWith(prefix));
+// 400 (naming the keys) when a generic write carries route-owned keys, rather
 // than dropping them silently; returns true if the request was rejected.
-const rejectBackupRouteOwnedKeys = (settings, res) => {
-  const keys = Object.keys(settings).filter(isBackupRouteOwnedKey);
+const rejectDedicatedRouteOwnedKeys = (settings, res) => {
+  const keys = Object.keys(settings).filter(isDedicatedRouteOwnedKey);
   if (keys.length === 0) return false;
   res.status(400).json({
-    error: 'Backup settings are saved through the backup configuration, not the general settings',
-    code: 'BACKUP_SETTINGS_ELSEWHERE',
+    error: 'These settings are saved through their own configuration endpoint, not the general settings',
+    code: 'SETTINGS_OWNED_ELSEWHERE',
     keys,
   });
   return true;
@@ -134,6 +154,9 @@ const TRACKER_CODE_KEYS = new Set([
   'analytics_umami_url',
   'analytics_rybbit_url',
   'analytics_custom_head_html',
+  // Decides whether visitors who sent Do Not Track are counted (issue 1921):
+  // the same kind of decision as where the events go.
+  'analytics_honor_do_not_track',
 ]);
 const parseStoredSetting = (row) => {
   if (!row) return undefined;
@@ -148,16 +171,19 @@ const effectiveMissingSetting = async (key) => {
     return umami === true || umami === 'true' ? 'umami' : 'none';
   }
   if (key === 'analytics_umami_enabled') return false;
+  if (key === 'analytics_honor_do_not_track') return true;
   return null;
 };
+// A rule names either the owning `perm`, or `superAdmin: true` when the key is
+// a super-admin decision that no delegable permission can grant.
 const PROTECTED_SETTING_KEY_PERMS = [
   { match: (k) => k === 'general_site_url', perm: 'settings.domains' },
   { match: (k) => k.startsWith('security_'), perm: 'settings.security' },
   { match: (k) => k.startsWith('accounting_'), perm: 'settings.banking' },
-  // The tracker provider/URL and the custom head HTML decide which JavaScript
-  // the app serves from its own origin (the tracker proxy re-serves the
-  // configured script same-origin), so they need more than settings.edit.
-  { match: (k) => TRACKER_CODE_KEYS.has(k), perm: 'settings.integrations' },
+  // Collector selection remains super-admin-only. These values previously
+  // selected executable code; even with data-only forwarding, choosing an
+  // external telemetry destination is not a delegable settings permission.
+  { match: (k) => TRACKER_CODE_KEYS.has(k), superAdmin: true },
 ];
 // Returns the list of {key, perm} the caller tried to CHANGE without the owning
 // permission. Callers 403 when it's non-empty rather than silently no-op'ing a
@@ -172,14 +198,17 @@ const collectUnauthorizedProtectedKeys = async (settings, adminId) => {
   for (const key of Object.keys(settings)) {
     const rule = PROTECTED_SETTING_KEY_PERMS.find((r) => r.match(key));
     if (!rule) continue;
-    if (await userHasAnyPermission(adminId, [rule.perm])) continue;
+    const allowed = rule.superAdmin
+      ? await isSuperAdminUser(adminId)
+      : await userHasAnyPermission(adminId, [rule.perm]);
+    if (allowed) continue;
     const row = await db('app_settings').where({ setting_key: key }).first();
     const stored = row ? parseStoredSetting(row) : await effectiveMissingSetting(key);
     if (String(stored ?? '') === String(settings[key] ?? '')) {
       delete settings[key]; // unchanged — let the rest of the save through
       continue;
     }
-    denied.push({ key, perm: rule.perm });
+    denied.push({ key, perm: rule.superAdmin ? 'super_admin' : rule.perm });
   }
   return denied;
 };
@@ -187,6 +216,10 @@ const collectUnauthorizedProtectedKeys = async (settings, adminId) => {
 // to write a protected key they don't hold; returns true if the request was
 // rejected so the route can stop.
 const rejectUnauthorizedProtectedKeys = async (settings, req, res) => {
+  // A blank legacy snippet selects no code. Drop it before the permission
+  // check so a stale stored row cannot 403 a settings.edit save; a non-empty
+  // value is still refused below, for everyone.
+  if (settings.analytics_custom_head_html === '') delete settings.analytics_custom_head_html;
   const denied = await collectUnauthorizedProtectedKeys(settings, req.admin.id);
   if (denied.length > 0) {
     res.status(403).json({
@@ -194,6 +227,24 @@ const rejectUnauthorizedProtectedKeys = async (settings, req, res) => {
       code: 'FORBIDDEN',
       keys: denied,
     });
+    return true;
+  }
+  // Shared by every generic writer: no executable analytics, even for root.
+  if (settings.analytics_tracker_provider === 'custom'
+    || (Object.hasOwn(settings, 'analytics_custom_head_html') && settings.analytics_custom_head_html !== '')) {
+    res.status(400).json({
+      error: 'Custom analytics scripts are no longer supported; choose Umami, Rybbit or none',
+      code: 'CUSTOM_ANALYTICS_DISABLED',
+    });
+    return true;
+  }
+  // Also shared by every generic writer, so the stored value has one shape
+  // whichever endpoint wrote it: a strict boolean (issue 1921). The client
+  // reads it through the public settings and the relay reads it directly;
+  // a string would let the two disagree about who is counted.
+  if (Object.hasOwn(settings, 'analytics_honor_do_not_track')
+    && typeof settings.analytics_honor_do_not_track !== 'boolean') {
+    res.status(400).json({ error: 'analytics_honor_do_not_track must be true or false', code: 'BAD_BOOLEAN' });
     return true;
   }
   return false;
@@ -378,6 +429,9 @@ router.get('/', adminAuth, requirePermission('settings.view'), async (req, res) 
         settingsObject[key] = value;
       }
     }
+    // Browser dashboards must not receive PicPeak's authentication cookies.
+    // Derived from the cookie writer; never trust a stored/generic input here.
+    settingsObject.analytics_dashboard_cookie_domain = getAuthCookieDomain();
     res.json(settingsObject);
   } catch (error) {
     errorResponse(res, error, 500, 'Failed to fetch settings');
@@ -644,6 +698,7 @@ router.get('/transfers',
         accept_all: policy.acceptAll,
         allowed_types: policy.allowedTypes,
         max_size_mb: policy.maxSizeMb,
+        max_files: policy.maxFiles,
       });
     } catch (error) {
       errorResponse(res, error, 500, 'Failed to load transfer settings');
@@ -656,7 +711,7 @@ router.put('/transfers',
   requireFlag('transfers'),
   async (req, res) => {
     try {
-      const { normalizeAllowedTypes } = require('../services/transferUploadPolicy');
+      const { normalizeAllowedTypes, normalizeMaxFiles, MAX_FILES_CEILING } = require('../services/transferUploadPolicy');
       const has = (k) => Object.prototype.hasOwnProperty.call(req.body, k);
 
       // Validate EVERY field before writing any of them. Interleaving the two
@@ -692,6 +747,19 @@ router.put('/transfers',
           return res.status(400).json({ error: 'Maximum file size must be between 1 and 100000 MB', code: 'BAD_SIZE' });
         }
         writes.push(['transfer_max_upload_size_mb', JSON.stringify(mb), 'number']);
+      }
+
+      // The default number of files per upload round (issue 1914); a file
+      // request can carry its own value.
+      if (has('max_files')) {
+        const files = normalizeMaxFiles(req.body.max_files);
+        if (!files) {
+          return res.status(400).json({
+            error: `Maximum files per upload must be a whole number between 1 and ${MAX_FILES_CEILING}`,
+            code: 'BAD_FILE_COUNT',
+          });
+        }
+        writes.push(['transfer_upload_max_files', JSON.stringify(files), 'number']);
       }
 
       const updated = [];
@@ -732,7 +800,7 @@ router.get('/downloads', adminAuth, requirePermission('settings.view'), async (r
 router.put('/downloads', adminAuth, requirePermission('settings.edit'), async (req, res) => {
   try {
     const {
-      invalidateDownloadGlobals, getDownloadGlobals, ORIGINAL,
+      invalidateDownloadGlobals, getDownloadGlobals, ORIGINAL, JOB_RETENTION_HOURS, parseJobRetentionHours,
     } = require('../utils/downloadResolutions');
     const has = (k) => Object.prototype.hasOwnProperty.call(req.body, k);
     const updates = [];
@@ -788,6 +856,17 @@ router.put('/downloads', adminAuth, requirePermission('settings.edit'), async (r
     }
     if (has('download_allow_original')) {
       push('download_allow_original', !!req.body.download_allow_original);
+    }
+    // How long a prepared archive is kept (issue 1733). Refused rather than
+    // clamped: a typo must not quietly become a week of archives on disk.
+    if (has('download_job_retention_hours')) {
+      const hours = parseJobRetentionHours(req.body.download_job_retention_hours);
+      if (hours === null) {
+        return res.status(400).json({
+          error: `download_job_retention_hours must be a whole number between ${JOB_RETENTION_HOURS.min} and ${JOB_RETENTION_HOURS.max}`,
+        });
+      }
+      push('download_job_retention_hours', hours);
     }
 
     for (const u of updates) {
@@ -1193,6 +1272,9 @@ router.put('/branding', adminAuth, requirePermission('settings.edit'), async (re
       logo_display_mode,
       hide_powered_by,
       force_color_mode,
+      // Status colours (Branding › Colours): one hue per meaning, applied
+      // admin-wide and on public pages. Partial object; missing = default.
+      status_colors,
       // Login-page-only branding (#354 follow-up). Both toggles apply
       // exclusively to /admin/login and /customer/login — the gallery
       // and admin chrome use their own logo_size / logo_max_height.
@@ -1217,6 +1299,15 @@ router.put('/branding', adminAuth, requirePermission('settings.edit'), async (re
       // Info banner (#932). Markdown only, same sanitiser path as promo.
       info_markdown
     } = req.body;
+
+    // Status colours: refuse a malformed set rather than store a cleaned one,
+    // which would wipe the saved hues and still report success.
+    if (status_colors !== undefined) {
+      const bad = !status_colors || typeof status_colors !== 'object' || Array.isArray(status_colors)
+        || Object.entries(status_colors).some(([key, value]) => !STATUS_KEYS.includes(key)
+          || (value != null && value !== '' && !normalizeStatusColors({ [key]: value })[key]));
+      if (bad) return res.status(400).json({ error: 'Status colours must be #rrggbb values for success, warning, danger, info or storno' });
+    }
 
     // Normalize force_color_mode: only 'dark' | 'light' | null are valid.
     const normalizedForceColorMode = force_color_mode === 'dark'
@@ -1269,6 +1360,7 @@ router.put('/branding', adminAuth, requirePermission('settings.edit'), async (re
       logo_display_mode,
       hide_powered_by,
       force_color_mode: normalizedForceColorMode,
+      ...(status_colors !== undefined && { status_colors: normalizeStatusColors(status_colors) }),
       // Login-only knobs (only persist when the request actually
       // included the key, so a partial PUT from another tab doesn't
       // accidentally clear them).
@@ -1658,7 +1750,7 @@ router.put('/theme', adminAuth, requirePermission('settings.edit'), async (req, 
 router.put('/general', adminAuth, requirePermission('settings.edit'), async (req, res) => {
   try {
     const settings = stripReservedSettingKeys({ ...req.body });
-    if (rejectBackupRouteOwnedKeys(settings, res)) return;
+    if (rejectDedicatedRouteOwnedKeys(settings, res)) return;
     let uploadLimitTouched = false;
 
     // Migration 174: drop any protected key (site URL / security / accounting)
@@ -1668,8 +1760,7 @@ router.put('/general', adminAuth, requirePermission('settings.edit'), async (req
     if (await rejectUnauthorizedProtectedKeys(settings, req, res)) return;
 
     // The public origin is no longer just an email link: it feeds the CORS
-    // allowlist (server.js) and the Access-Control-Allow-Origin header
-    // (secureImageMiddleware) since #705. A schemeless value like
+    // allowlist (server.js) since #705. A schemeless value like
     // "gallery.example.com" therefore produces both links that don't resolve
     // AND an allowlist entry no browser origin can ever match, so validate it
     // server-side rather than trusting the input type (#1104). require_tld is
@@ -1755,6 +1846,34 @@ router.put('/general', adminAuth, requirePermission('settings.edit'), async (req
       settings.general_max_video_size_mb = normalizedValue;
     }
 
+    // Photo trash retention in days (issue 1733); 0 deletes photos at once.
+    if (Object.prototype.hasOwnProperty.call(settings, 'general_photo_trash_retention_days')) {
+      const { MAX_RETENTION_DAYS } = require('../services/photoTrash');
+      const days = Number(settings.general_photo_trash_retention_days);
+      if (!Number.isInteger(days) || days < 0 || days > MAX_RETENTION_DAYS) {
+        return res.status(400).json({
+          error: `general_photo_trash_retention_days must be an integer between 0 and ${MAX_RETENTION_DAYS}`
+        });
+      }
+      settings.general_photo_trash_retention_days = days;
+    }
+
+    // Browser-playable video copies (issue 1430, item 8): a plain boolean.
+    if (Object.prototype.hasOwnProperty.call(settings, 'general_video_web_rendition')) {
+      const raw = settings.general_video_web_rendition;
+      settings.general_video_web_rendition = raw === true || raw === 'true' || raw === 1 || raw === '1';
+    }
+    // Adaptive video streaming (issue 1733): a plain boolean too.
+    if (Object.prototype.hasOwnProperty.call(settings, 'general_video_adaptive_streaming')) {
+      const raw = settings.general_video_adaptive_streaming;
+      settings.general_video_adaptive_streaming = raw === true || raw === 'true' || raw === 1 || raw === '1';
+    }
+    // Metadata-free copies of played videos (issue 2102): a boolean as well.
+    if (Object.prototype.hasOwnProperty.call(settings, 'general_video_strip_metadata')) {
+      const raw = settings.general_video_strip_metadata;
+      settings.general_video_strip_metadata = raw === true || raw === 'true' || raw === 1 || raw === '1';
+    }
+
     // Default download limit for new events (issue 1560). Empty, 0 or null
     // clears it (unlimited); anything else must be a positive integer.
     if (Object.prototype.hasOwnProperty.call(settings, 'event_default_download_limit')) {
@@ -1782,6 +1901,33 @@ router.put('/general', adminAuth, requirePermission('settings.edit'), async (req
     if (Object.prototype.hasOwnProperty.call(settings, 'event_default_show_credits_to_guests')) {
       const raw = settings.event_default_show_credits_to_guests;
       settings.event_default_show_credits_to_guests = raw === true || raw === 'true' || raw === 1 || raw === '1';
+    }
+
+    // Folders (issue 1786) and two-stage delivery (issue 1562).
+    for (const key of ['event_default_folder_structure', 'first_look_keyword_detection']) {
+      if (Object.prototype.hasOwnProperty.call(settings, key)) {
+        const raw = settings[key];
+        settings[key] = raw === true || raw === 'true' || raw === 1 || raw === '1';
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(settings, 'first_look_folder_keywords')) {
+      const raw = settings.first_look_folder_keywords;
+      const list = (Array.isArray(raw) ? raw : String(raw || '').split(','))
+        .map((k) => String(k).replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+      // Refused, not trimmed: a keyword dropped silently is a folder that
+      // quietly stops starting a first look.
+      if (list.length > 20 || list.some((k) => k.length > 60 || k.replace(/[^\p{L}\p{N}]/gu, '').length < 3)) {
+        return res.status(400).json({ error: 'first_look_folder_keywords: at most 20 keywords, each with at least 3 letters or digits and at most 60 characters' });
+      }
+      settings.first_look_folder_keywords = [...new Set(list)];
+    }
+    if (Object.prototype.hasOwnProperty.call(settings, 'event_default_delivery_days')) {
+      const days = Number(settings.event_default_delivery_days);
+      if (!Number.isInteger(days) || days < 1 || days > 365) {
+        return res.status(400).json({ error: 'event_default_delivery_days must be an integer between 1 and 365' });
+      }
+      settings.event_default_delivery_days = days;
     }
 
     if (publicSiteKeysTouched) {
@@ -1847,8 +1993,57 @@ router.put('/general', adminAuth, requirePermission('settings.edit'), async (req
       clearMaxFileSizeCache();
       clearMaxVideoSizeCache();
     }
+    // The allowed-types list is cached for a minute like the caps above, but
+    // nothing was dropping it. An admin who added a format to accept a batch
+    // of files got a full minute of "Invalid file type. Check allowed file
+    // types in system settings." on the setting they had just changed.
+    if (Object.prototype.hasOwnProperty.call(settings, 'general_allowed_file_types')) {
+      clearAllowedTypesCache();
+    }
     if (Object.prototype.hasOwnProperty.call(settings, 'general_short_gallery_urls')) {
       clearShareLinkSettingsCache();
+    }
+    // Switching the video copies on queues the back catalogue: every video
+    // never looked at, deferred while they were off, or whose last attempt
+    // failed. The queue probes each one and skips what already plays. Off leaves the rows as they are; the
+    // workers idle until it is on again.
+    if (Object.prototype.hasOwnProperty.call(settings, 'general_video_web_rendition')) {
+      const videoRendition = require('../services/videoRenditionService');
+      videoRendition.clearCache();
+      if (settings.general_video_web_rendition) {
+        try {
+          const queued = await videoRendition.backfillPending();
+          if (queued > 0) logger.info(`videoRendition: queued ${queued} existing video(s) after the setting was enabled`);
+        } catch (e) {
+          logger.warn('videoRendition: failed to queue existing videos:', e.message);
+        }
+      }
+    }
+    // Switching metadata stripping on queues the videos skipped because they
+    // played as they were, and those never looked at, for their remux, with
+    // or without the transcodes. Off keeps the remuxes already written: they
+    // go on playing, and only videos decided from now on are skipped again.
+    if (Object.prototype.hasOwnProperty.call(settings, 'general_video_strip_metadata')) {
+      const videoRendition = require('../services/videoRenditionService');
+      videoRendition.clearCache();
+      if (settings.general_video_strip_metadata) {
+        try {
+          const queued = await videoRendition.queueForMetadataStrip();
+          if (queued > 0) logger.info(`videoRendition: queued ${queued} existing video(s) for a metadata-free copy`);
+        } catch (e) {
+          logger.warn('videoRendition: failed to queue videos for a metadata-free copy:', e.message);
+        }
+      }
+    }
+    // Adaptive streaming: the queue marks the videos nobody has looked at by
+    // itself; switching it on also gives the failed ones another try.
+    if (Object.prototype.hasOwnProperty.call(settings, 'general_video_adaptive_streaming')) {
+      const videoHls = require('../services/videoHlsService');
+      videoHls.clearCache();
+      if (settings.general_video_adaptive_streaming) {
+        await videoHls.queuePending({ retryFailed: true })
+          .catch(e => logger.warn('videoHls: failed to queue existing videos:', e.message));
+      }
     }
     // The public origin is cached (it now sits in per-request CORS paths and
     // in a synchronous accessor); drop it immediately on write so a corrected
@@ -1889,7 +2084,7 @@ router.put('/general', adminAuth, requirePermission('settings.edit'), async (req
 router.put('/security', adminAuth, requirePermission('settings.security'), async (req, res) => {
   try {
     const settings = stripReservedSettingKeys({ ...req.body });
-    if (rejectBackupRouteOwnedKeys(settings, res)) return;
+    if (rejectDedicatedRouteOwnedKeys(settings, res)) return;
     // A settings.security holder still can't write domain/accounting keys here.
     if (await rejectUnauthorizedProtectedKeys(settings, req, res)) return;
 
@@ -1943,13 +2138,13 @@ router.put('/security', adminAuth, requirePermission('settings.security'), async
 router.put('/analytics', adminAuth, requirePermission('settings.edit'), async (req, res) => {
   try {
     const settings = stripReservedSettingKeys({ ...req.body });
-    if (rejectBackupRouteOwnedKeys(settings, res)) return;
+    if (rejectDedicatedRouteOwnedKeys(settings, res)) return;
     if (await rejectUnauthorizedProtectedKeys(settings, req, res)) return;
 
     // Validate the provider switch (#663 Phase 1). Reject unknown values
     // so the dashboard route's factory doesn't have to defensively guard.
     if (Object.prototype.hasOwnProperty.call(settings, 'analytics_tracker_provider')) {
-      const valid = ['none', 'umami', 'rybbit', 'custom'];
+      const valid = ['none', 'umami', 'rybbit'];
       if (!valid.includes(settings.analytics_tracker_provider)) {
         return res.status(400).json({
           error: `analytics_tracker_provider must be one of: ${valid.join(', ')}`,
@@ -1957,12 +2152,14 @@ router.put('/analytics', adminAuth, requirePermission('settings.edit'), async (r
       }
     }
 
-    // Sanitise the custom-mode HTML snippet on save (#663 Phase 1). Stored
-    // pre-sanitised so the publicSettings endpoint surfaces it as-is on
-    // every gallery request — never re-running sanitize-html on the hot path.
-    if (Object.prototype.hasOwnProperty.call(settings, 'analytics_custom_head_html')) {
-      const { sanitizeTrackerSnippet } = require('../services/trackers/customScriptSanitiser');
-      settings.analytics_custom_head_html = sanitizeTrackerSnippet(settings.analytics_custom_head_html);
+    // Custom snippets are rejected at the shared generic-writer boundary.
+    // The tab no longer posts the legacy snippet; saving a supported provider
+    // clears a stored one here instead. It is never served, so this needs no
+    // tracker-key permission and creates no row where none exists.
+    if (['none', 'umami', 'rybbit'].includes(req.body?.analytics_tracker_provider)) {
+      await db('app_settings')
+        .where({ setting_key: 'analytics_custom_head_html' })
+        .update({ setting_value: JSON.stringify('') });
     }
 
     // Update or insert each setting
@@ -2004,7 +2201,7 @@ router.put('/analytics', adminAuth, requirePermission('settings.edit'), async (r
 router.put('/seo', adminAuth, requirePermission('settings.edit'), async (req, res) => {
   try {
     const settings = stripReservedSettingKeys({ ...req.body });
-    if (rejectBackupRouteOwnedKeys(settings, res)) return;
+    if (rejectDedicatedRouteOwnedKeys(settings, res)) return;
     if (await rejectUnauthorizedProtectedKeys(settings, req, res)) return;
 
     // Validate seo_blocked_ai_agents is an array of strings

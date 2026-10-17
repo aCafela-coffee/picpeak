@@ -1,10 +1,31 @@
-const sharp = require('sharp');
+const sharp = require('./isolatedSharp');
+const { isResourceError } = require('./imageResourcePolicy');
 const { orientedDimensions } = require('./imageProcessor');
 const path = require('path');
+const crypto = require('crypto');
 const fs = require('fs').promises;
 const { db } = require('../database/db');
 const { getStorage } = require('./storage');
 const logger = require('../utils/logger');
+
+// Text goes into the SVG markup: `<` or `&` in it would make the SVG invalid
+// and the mark would silently not render (applyWatermark falls back to the
+// unmarked original).
+function escapeXml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+const textHash = (text) => crypto.createHash('sha256').update(text).digest('hex').slice(0, 8);
+// The gallery text a stored watermark was cut with, at the end of its key.
+const textTag = (settings) => (settings?.text ? `_t${textHash(settings.text)}` : '');
+const TEXT_TAG = /_t[0-9a-f]{8}$/;
+// A media attempt's id, which ends an attempt's file name (watermarkKey).
+const ATTEMPT_ID = /_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 class WatermarkService {
   constructor() {
@@ -49,6 +70,51 @@ class WatermarkService {
       logger.error('Error fetching watermark settings:', error);
       return null;
     }
+  }
+
+  /** The text a text watermark draws: the gallery's own, else the company name. */
+  watermarkLabel(settings) {
+    return String(settings?.text || '').trim() || String(settings?.companyName || '').trim();
+  }
+
+  /**
+   * The global settings with one gallery's watermark text applied. Every
+   * renderer of a gallery's photos goes through this, so the downloads, the
+   * ZIPs and the gallery view draw the same text.
+   */
+  forEvent(settings, event) {
+    if (!settings) return settings;
+    const { text: _globalText, ...base } = settings;
+    const text = String(event?.watermark_text || '').trim();
+    return text ? { ...base, text } : base;
+  }
+
+  async getWatermarkSettingsForEvent(event) {
+    return this.forEvent(await this.getWatermarkSettings(), event);
+  }
+
+  /**
+   * Version of the mark for cache busting (ETags, the `wm=` URL parameter).
+   * A gallery's text is part of it, so changing the text is a new URL and a
+   * browser does not keep showing the old mark.
+   */
+  versionTag(settings) {
+    const base = `${settings.opacity}${settings.position}${settings.size}`;
+    return settings.text ? `${base}t${textHash(settings.text)}` : base;
+  }
+
+  /**
+   * Whether a stored watermark file was cut with the text these settings
+   * draw. Its key carries the text (watermarkKey), so a file cut before the
+   * gallery's text changed, or by a job that read the old text, is never
+   * served under the new text's ETag; the photo route renders on the fly
+   * and queues a fresh cut instead.
+   */
+  storedWatermarkCurrent(watermarkPath, settings) {
+    const name = path.basename(String(watermarkPath || ''), path.extname(String(watermarkPath || '')))
+      .replace(ATTEMPT_ID, '');
+    const tag = textTag(settings);
+    return tag ? name.endsWith(tag) : !TEXT_TAG.test(name);
   }
 
   /**
@@ -97,7 +163,7 @@ class WatermarkService {
    * file — which matters because the mark is sized relative to the input's
    * own width, so it has to be applied at the OUTPUT size to come out right.
    */
-  async applyWatermark(imagePath, settings, { keepMetadata = false } = {}) {
+  async applyWatermark(imagePath, settings, { keepMetadata = false, failClosed = false } = {}) {
     const isBuffer = Buffer.isBuffer(imagePath);
     try {
       if (!settings || !settings.enabled) {
@@ -110,7 +176,15 @@ class WatermarkService {
       // than the watermark) and no reuse across requests, so skip the cache.
       // keepMetadata is part of the key: the gallery-view rendition and the
       // download of the same photo must never serve each other's bytes.
-      const cacheKey = isBuffer ? null : `${imagePath}_${JSON.stringify(settings)}_${keepMetadata ? 'meta' : 'stripped'}`;
+      // So is the file's version (size and modification time, statted here):
+      // a file on a reference share is edited in place under the same path,
+      // and every process must stop serving the old picture as soon as it
+      // reads the new one, not only the one whose import pass noticed.
+      let cacheKey = null;
+      if (!isBuffer) {
+        const st = await fs.stat(imagePath).catch(() => null);
+        if (st) cacheKey = `${imagePath}_${st.size}:${st.mtimeMs}_${JSON.stringify(settings)}_${keepMetadata ? 'meta' : 'stripped'}`;
+      }
       if (cacheKey) {
         const cached = this.cache.get(cacheKey);
         if (cached && Date.now() - cached.timestamp < this.cacheMaxAge) {
@@ -169,34 +243,57 @@ class WatermarkService {
           watermarkMetadata = { width: targetWidth, height: targetHeight };
         } catch (error) {
           logger.error('Error processing watermark logo:', error);
+          if (isResourceError(error)) throw error;
           watermarkBuffer = null;
         }
       }
 
+      // The gallery's own text (settings.text, see forEvent) wins over the
+      // global company name.
+      const label = this.watermarkLabel(settings);
+
+      // Nothing to draw (no usable logo, no text) is not a failed
+      // watermark: fail-closed callers must not turn it into an error.
+      if (!watermarkBuffer && !label) {
+        return isBuffer ? imagePath : await fs.readFile(imagePath);
+      }
+
       // If no logo or logo failed, create text watermark
       if (!watermarkBuffer) {
-        const fontSize = Math.max(16, Math.floor(metadata.width * 0.03));
         const padding = 10;
-        
+        // Estimated from the characters drawn, not from the escaped markup.
+        const textWidth = (size) => label.length * size * 0.6 + padding * 2;
+        // The mark has to fit inside the image or sharp refuses the
+        // composite: a long name on a 300px thumbnail is wider than the
+        // thumbnail at the 16px floor. Shrink the font to fit, down to 8px.
+        let fontSize = Math.max(16, Math.floor(metadata.width * 0.03));
+        if (textWidth(fontSize) > metadata.width) {
+          fontSize = Math.max(8, Math.floor((metadata.width - padding * 2) / (label.length * 0.6)));
+        }
+        const svgWidth = Math.ceil(textWidth(fontSize));
+        const svgHeight = fontSize + padding * 2;
+        // Still too large at the floor: render the whole mark smaller, through
+        // the viewBox, so it stays legible in proportion and never overflows.
+        const scale = Math.min(1, metadata.width / svgWidth, metadata.height / svgHeight);
+        const markWidth = Math.max(1, Math.floor(svgWidth * scale));
+        const markHeight = Math.max(1, Math.floor(svgHeight * scale));
+
         // Create SVG text watermark
         const svg = `
-          <svg width="${settings.companyName.length * fontSize * 0.6 + padding * 2}" height="${fontSize + padding * 2}">
+          <svg width="${markWidth}" height="${markHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}">
             <rect x="0" y="0" width="100%" height="100%" fill="black" opacity="0.5" rx="5"/>
             <text x="${padding}" y="${fontSize + padding/2}" 
               font-family="Arial, sans-serif" 
               font-size="${fontSize}" 
               fill="white" 
               opacity="${settings.opacity / 100}">
-              ${settings.companyName}
+              ${escapeXml(label)}
             </text>
           </svg>
         `;
         
         watermarkBuffer = Buffer.from(svg);
-        watermarkMetadata = {
-          width: settings.companyName.length * fontSize * 0.6 + padding * 2,
-          height: fontSize + padding * 2
-        };
+        watermarkMetadata = { width: markWidth, height: markHeight };
       }
 
       // Calculate position
@@ -258,6 +355,7 @@ class WatermarkService {
       return watermarkedBuffer;
     } catch (error) {
       logger.error('Error applying watermark:', error);
+      if (failClosed || isResourceError(error)) throw error;
       // Return the un-watermarked input on error. Buffer inputs are already
       // in memory — readFile() would treat the Buffer as a path and throw,
       // turning a cosmetic watermark failure into a failed download.
@@ -274,6 +372,17 @@ class WatermarkService {
       if (now - value.timestamp > this.cacheMaxAge) {
         this.cache.delete(key);
       }
+    }
+  }
+
+  /**
+   * Forget every cached result made from one source file, for a file whose
+   * bytes changed under the same path (a reference photo edited in place).
+   */
+  forgetSource(imagePath) {
+    const prefix = `${imagePath}_`;
+    for (const key of this.cache.keys()) {
+      if (key.startsWith(prefix)) this.cache.delete(key);
     }
   }
 
@@ -295,6 +404,23 @@ class WatermarkService {
   }
 
   /**
+   * Storage key of a photo's watermark. Named after the file it is cut from
+   * as well as the photo id: a replacement keeps the id, and a job still
+   * cutting the old file must not overwrite the new file's watermark. An
+   * external file edited in place keeps its name, so its version (size and
+   * mtime, see imageProcessor's sourceVersion) is part of the name too, and
+   * so is the gallery's watermark text (see storedWatermarkCurrent). The
+   * attempt id stays last: mediaAttemptService recognises an attempt's file
+   * by it ending the name.
+   */
+  watermarkKey(photo, attempt = null, settings = null) {
+    const version = require('./imageProcessor').sourceVersion(photo);
+    const source = crypto.createHash('sha256')
+      .update(String(photo.filename || '') + (version ? `\0${version}` : '')).digest('hex').slice(0, 12);
+    return `watermarks/${photo.id}_watermarked_${source}${textTag(settings)}${attempt ? `_${attempt.id}` : ''}${this.getFileExtension(photo.filename || '')}`;
+  }
+
+  /**
    * Generate watermarked version of a photo and persist it through the
    * storage backend. The source must be a local filesystem path because
    * sharp doesn't take streams; callers in S3 mode should materialize a
@@ -306,6 +432,7 @@ class WatermarkService {
    * @returns {Object} { success, watermarkPath, error }
    */
   async generateAndSaveWatermark(photo, originalPath, settings = null) {
+    let uploaded = null;
     try {
       if (!settings) {
         settings = await this.getWatermarkSettings();
@@ -324,12 +451,15 @@ class WatermarkService {
       const watermarkedBuffer = await this.applyWatermark(originalPath, settings);
 
       const ext = this.getFileExtension(photo.filename);
-      const outputFilename = `${photo.id}_watermarked${ext}`;
-      const relativePath = `watermarks/${outputFilename}`;
+      const attempt = require('./mediaAttemptContext').current();
+      const relativePath = this.watermarkKey(photo, attempt, settings);
 
+      await attempt?.assertCurrent();
       await getStorage().put(relativePath, watermarkedBuffer, {
         contentType: ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg',
       });
+      uploaded = relativePath;
+      await attempt?.assertCurrent();
 
       return {
         success: true,
@@ -337,6 +467,9 @@ class WatermarkService {
         error: null
       };
     } catch (error) {
+      // Refused after the upload (the attempt lost its claim): nothing will
+      // record the file, and its name is this attempt's alone.
+      if (uploaded) await getStorage().delete(uploaded).catch(() => {});
       logger.error(`Error generating watermark for photo ${photo.id}:`, error);
       return {
         success: false,

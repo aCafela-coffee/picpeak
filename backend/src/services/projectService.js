@@ -17,13 +17,38 @@ const { db, logActivity } = require('../database/db');
 const { AppError } = require('../utils/errors');
 const { hasColumnCached } = require('../utils/schemaCache');
 const { auditedUpdate } = require('./accountingHistory');
-const { redactBearerLinks, hasMaskedRecoveryLink, parseEmailData } = require('../utils/emailSecretRedaction');
+const { redactBearerLinks, hasMaskedRecoveryLink, parseEmailData, MASK } = require('../utils/emailSecretRedaction');
+const {
+  isEncryptedEmailData, isProtectedEmailType, maskSecretFields, PROTECTED_PENDING_STATUS,
+} = require('../utils/emailQueueEncryption');
+
+const PENDING_EMAIL_STATUSES = new Set(['pending', PROTECTED_PENDING_STATUS]);
+
+function pendingStatusFor(row) {
+  return isProtectedEmailType(row.email_type) && isEncryptedEmailData(parseEmailData(row.email_data))
+    ? PROTECTED_PENDING_STATUS : 'pending';
+}
 
 // A sent invitation or password-reset mail no longer holds its link (see
 // emailProcessor), so sending that row again would deliver a dead link.
-function assertResendable(row) {
+// Any other account-recovery row that is no longer encrypted (a sent admin
+// reset keeps only the masked password) cannot go back to pending either:
+// the storage guard refuses it, so answer like System Health does.
+async function assertResendable(row, { newMail = false } = {}) {
+  // No administrative emails (migration 300), decided once, at queue time.
+  // Retry / send-now act on THIS row, so only a row that was held back is
+  // refused (while the switch is still on); a row queued before the switch
+  // went on keeps its decision and goes out like the processor would send
+  // it. Resend queues a NEW mail, which is a new decision: it asks the
+  // switch as it is now, whatever happened to the old row.
+  if ((newMail || row.status === 'suppressed') && await require('./_adminEmailOptOut').isRowHeldBack(row)) {
+    throw new AppError('This customer takes no administrative emails, so this email isn\'t sent. Turn the switch off on the customer to send it.', 409, 'NO_ADMIN_EMAILS');
+  }
   if (hasMaskedRecoveryLink(parseEmailData(row.email_data))) {
     throw new AppError('This invitation or password-reset email cannot be sent again: its link is not kept after sending. Send a new invitation or password reset instead.', 409);
+  }
+  if (isProtectedEmailType(row.email_type) && !isEncryptedEmailData(parseEmailData(row.email_data))) {
+    throw new AppError('Create a new invitation or password reset; this recovery email cannot be retried.', 409);
   }
 }
 
@@ -720,6 +745,8 @@ async function getEmailPreview(emailId) {
   try {
     let variables = row.email_data;
     if (typeof variables === 'string') variables = JSON.parse(variables);
+    // A waiting row keeps its passwords sealed; the preview shows the mask.
+    variables = maskSecretFields(variables, MASK);
     const { renderQueuedEmail } = require('./emailProcessor');
     const rendered = await renderQueuedEmail(row.email_type, variables || {}, row.recipient_email);
     html = rendered && rendered.html ? rendered.html : null;
@@ -754,7 +781,7 @@ async function logEmailAction(activityType, emailId, row, adminId) {
 async function resendEmail(emailId, adminId = null) {
   const row = await db('email_queue').where({ id: emailId }).first();
   if (!row) throw new AppError('Email not found', 404);
-  assertResendable(row);
+  await assertResendable(row, { newMail: true });
   // Normalise email_data to match the canonical enqueue (emailProcessor.js
   // stores JSON.stringify(...) in the json column). PG returns jsonb as a
   // parsed object, SQLite as a string — re-stringify the object form so the
@@ -766,9 +793,13 @@ async function resendEmail(emailId, adminId = null) {
     email_type: row.email_type,
     email_data: emailData,
     event_id: row.event_id,
-    status: 'pending',
+    status: pendingStatusFor(row),
     retry_count: 0,
     created_at: new Date(),
+    // The queue time of the mail this copy repeats (migration 307): erasure
+    // attributes mail to an address holder by it, and the address may have
+    // changed hands since. A copy of a copy keeps the first mail's time.
+    original_created_at: row.original_created_at ?? row.created_at,
     // Explicit NULL: the column default is text on SQLite and never comes
     // due (issue 1670) — see queueEmail.
     scheduled_at: null,
@@ -781,7 +812,7 @@ async function resendEmail(emailId, adminId = null) {
 async function cancelEmail(emailId, adminId = null) {
   const row = await db('email_queue').where({ id: emailId }).first();
   if (!row) throw new AppError('Email not found', 404);
-  if (row.status !== 'pending') throw new AppError('Only pending emails can be cancelled', 409);
+  if (!PENDING_EMAIL_STATUSES.has(row.status)) throw new AppError('Only pending emails can be cancelled', 409);
   await db('email_queue').where({ id: emailId }).update({ status: 'cancelled' });
   await logEmailAction('project_email_cancelled', emailId, row, adminId);
   return { id: emailId, status: 'cancelled' };
@@ -790,9 +821,9 @@ async function cancelEmail(emailId, adminId = null) {
 async function retryEmail(emailId, adminId = null) {
   const row = await db('email_queue').where({ id: emailId }).first();
   if (!row) throw new AppError('Email not found', 404);
-  assertResendable(row);
+  await assertResendable(row);
   await db('email_queue').where({ id: emailId })
-    .update({ status: 'pending', retry_count: 0, error_message: null, scheduled_at: null });
+    .update({ status: pendingStatusFor(row), retry_count: 0, error_message: null, scheduled_at: null });
   await logEmailAction('project_email_retried', emailId, row, adminId);
   return { id: emailId, status: 'pending' };
 }
@@ -800,8 +831,8 @@ async function retryEmail(emailId, adminId = null) {
 async function sendEmailNow(emailId, adminId = null) {
   const row = await db('email_queue').where({ id: emailId }).first();
   if (!row) throw new AppError('Email not found', 404);
-  assertResendable(row);
-  await db('email_queue').where({ id: emailId }).update({ status: 'pending', scheduled_at: null });
+  await assertResendable(row);
+  await db('email_queue').where({ id: emailId }).update({ status: pendingStatusFor(row), scheduled_at: null });
   // Flush ONLY this email — passing onlyId scopes processEmailQueue to a single
   // row so a forced "send now" never force-retries OTHER dead-lettered emails
   // (those that already exceeded the retry cap) just because we bypass it here.

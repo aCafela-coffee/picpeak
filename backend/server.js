@@ -68,7 +68,10 @@ const helmet = require('helmet');
 const compression = require('compression');
 const cors = require('cors');
 const path = require('path');
-const { initializeDatabase, db } = require('./src/database/db');
+const { initializeDatabase, db, enableApplicationWorkOwnership } = require('./src/database/db');
+const applicationWork = require('./src/services/activeApplicationWork');
+const restoreCoordinator = require('./src/services/portableRestoreCoordinator');
+const { createApplicationWorkMiddleware, ownRouteHandlers } = require('./src/middleware/applicationWork');
 const {
   getFrontendBaseUrlSync,
   getAbsoluteFrontendUrl,
@@ -99,6 +102,13 @@ const {
   getAdminTokenFromRequest,
   getGalleryTokenFromRequest,
 } = require('./src/utils/tokenUtils');
+const {
+  LEGACY_TRUST_PROXY,
+  createProxyChainWarning,
+  isTrustProxyUnset,
+  parseTrustProxy,
+  resolveListenHost,
+} = require('./src/config/network');
 
 // Import routes
 const authRoutes = require('./src/routes/auth');
@@ -109,6 +119,7 @@ const setupRoutes = require('./src/routes/setup');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const LISTEN_HOST = resolveListenHost();
 
 // Trust proxy headers (required for Traefik/nginx).
 //
@@ -118,20 +129,27 @@ const PORT = process.env.PORT || 3000;
 // rate-limit keys) is the originating client IP behind any number
 // of trusted reverse proxies.
 //
-// Default: 'loopback, linklocal, uniquelocal' — covers localhost,
-// link-local (169.254.0.0/16), and unique-local IPv6 (fc00::/7).
-// Standard for nginx-in-front-of-Node deployments on the same host
-// and for Docker bridge networks. Operators with unusual topologies
-// (load balancer in a public subnet, multi-hop NAT) override via
-// TRUST_PROXY env, accepting any value Express accepts: a number,
-// 'loopback', 'linklocal', 'uniquelocal', a CIDR, a comma list, or
+// Default (TRUST_PROXY unset): 'loopback, linklocal, uniquelocal', the
+// legacy private-range trust. It stays the default so an install that only
+// pulls a new image keeps resolving the real client behind its proxy, but a
+// source address being private does not prove it is a proxy this deployment
+// controls. Recommended: set TRUST_PROXY to the exact hop count (the Compose
+// stack pins 1 for its frontend nginx; the installer writes 'loopback' for
+// a native reverse proxy). Any value Express accepts works: a number,
+// 'loopback', 'linklocal', 'uniquelocal', a CIDR, a comma list, 'false' /
+// '0' (trust nothing), or
 // 'true' (trust ALL proxies — only safe behind a fully-controlled
 // reverse-proxy chain).
 //
 // NEVER read req.headers['x-forwarded-for'] directly in audit paths
 // — see utils/clientIp.js for the rationale.
-const trustProxySetting = process.env.TRUST_PROXY || 'loopback, linklocal, uniquelocal';
-app.set('trust proxy', trustProxySetting === 'true' ? true : trustProxySetting);
+app.set('trust proxy', parseTrustProxy());
+if (process.env.NODE_ENV === 'production' && isTrustProxyUnset()) {
+  logger.warn(
+    `TRUST_PROXY is not set: trusting forwarding headers from every private-range address (${LEGACY_TRUST_PROXY}). `
+    + 'Set TRUST_PROXY to the exact number of reverse-proxy hops in front of PicPeak (or false when there is none).'
+  );
+}
 
 // Security middleware with custom CSP
 // In native HTTP installs, do NOT force HTTPS for subresources.
@@ -162,6 +180,9 @@ app.use(cookieParser());
 // First, so every later middleware, route and the error handler can put the
 // same id in their logs and responses.
 app.use(require('./src/middleware/requestId'));
+
+// One trusted hop but another proxy in front of nginx: warn once per process.
+app.use(createProxyChainWarning({ trustProxy: app.get('trust proxy'), logger }));
 
 app.use((req, res, next) => {
   if (req.headers.authorization) {
@@ -255,20 +276,30 @@ const corsOptions = {
 };
 
 // Only attach CORS to API endpoints, not static assets
+// This is a dedicated exact-path capability surface, never an admin-prefix or
+// caller-header exemption to ordinary admission. It also precedes
+// analytics, body parsing, static rendering and every application API.
+app.use(require('./src/routes/portableRestoreControl').createRestoreControlRouter({ cors: cors(corsOptions) }));
+app.use(require('./src/routes/portableRestoreShell').createRestoreShellRouter({ shouldServe: () => restoreCoordinator.isFenced() }));
+// A restore keeps this process alive and busy on purpose. While one runs the
+// health probes answer 200 from memory, outside the request fence and without
+// touching the database, so a health-based restarter does not kill it halfway.
+const healthHandlers = require('./src/services/healthCheck').createHealthHandlers({ db, restoreCoordinator, logger });
+app.get(['/health', '/api/health'], healthHandlers.duringRestore);
+// The fence is a flag in memory, refreshed by the coordinator's own watch;
+// an ordinary request never reads the control row.
+app.use(createApplicationWorkMiddleware({ enabled: () => restoreCoordinator.tracking() }));
 app.use('/api', cors(corsOptions));
 // Handle preflight explicitly for API paths
 app.options('/api/*', cors(corsOptions));
 
-// Same-origin proxy for the configured analytics tracker. Mounted HERE, ahead
-// of the body parsers, so the tracker's beacon payload reaches the proxy as a
-// raw buffer (express.json would consume it, and the CSRF Content-Type gate
-// below would 415 a navigator.sendBeacon `text/plain` POST). It carries no
-// PicPeak state and reads no PicPeak credentials — see the route file for the
-// SSRF/path-allowlist model.
+// Data-only analytics, mounted before the app-wide body parser to enforce its
+// own smaller JSON limit. It never serves vendor code, reads
+// PicPeak credentials, or forwards arbitrary upstream responses.
 app.use('/api/analytics/tracker', require('./src/routes/analyticsTrackerProxy'));
 
-// Health check endpoint. `pid` + `uptime` let monitors (and the local E2E
-// watchdog) detect a silent process restart between two checks.
+// Health check endpoint. Public, so it answers only `status` (see
+// src/services/healthCheck.js).
 //
 // Served at BOTH paths: /health is the canonical one, /api/health exists
 // because probes reasonably assume the API lives under /api and otherwise
@@ -279,27 +310,16 @@ app.use('/api/analytics/tracker', require('./src/routes/analyticsTrackerProxy'))
 // couple of seconds does not pay for — or pollute — the body parsers, the
 // request logger, the maintenance gate (/health is on its skip list anyway)
 // or the rate limiter's per-IP budget.
-app.get(['/health', '/api/health'], async (req, res) => {
-  try {
-    await db.raw('SELECT 1');
-    res.json({
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      pid: process.pid,
-      uptime: process.uptime()
-    });
-  } catch (error) {
-    logger.error('Health check failed:', error);
-    res.status(503).json({
-      status: 'error',
-      timestamp: new Date().toISOString(),
-      pid: process.pid,
-      uptime: process.uptime()
-    });
-  }
-});
+app.get(['/health', '/api/health'], healthHandlers.ordinary);
 
 // Initialize rate limiters (they will be created dynamically)
+
+// The stylesheet below is interpolated into a raw-text <style> element, where
+// the HTML parser ends the element at the first `</style` regardless of CSS
+// structure. Every segment — palette, base CSS, operator CSS — is settings
+// data, so the whole thing is escaped at the sink rather than trusting each
+// producer. `<` → `\3c ` is the same character to a CSS parser.
+const { escapeCssForStyleElement } = require('./src/utils/cssSanitizer');
 
 function composeInlineStyles(payload) {
   const { branding } = payload;
@@ -324,7 +344,7 @@ function composeInlineStyles(payload) {
     cssSegments.push(`/* Custom styles */\n${payload.css}`);
   }
 
-  return cssSegments.join('\n\n');
+  return escapeCssForStyleElement(cssSegments.join('\n\n'));
 }
 
 function escapeHtml(str) {
@@ -414,6 +434,18 @@ function buildSeoMetaTags(seoSettings) {
   return tags.join('\n  ');
 }
 
+// Inter for the landing page, served from the /fonts mount below — the same
+// files frontend/src/index.css declares for the SPA. The document used to
+// link fonts.googleapis.com for this, which leaked every visitor's IP to
+// Google even though the rest of the app had already moved to self-hosted
+// fonts for exactly that reason. 500 is not shipped; the browser falls back
+// to the nearest declared weight, as it already does in the SPA.
+const PUBLIC_SITE_FONT_FACES = `
+    @font-face { font-family: 'Inter'; font-style: normal; font-weight: 400; font-display: swap; src: url('/fonts/Inter/400.woff2') format('woff2'); }
+    @font-face { font-family: 'Inter'; font-style: normal; font-weight: 600; font-display: swap; src: url('/fonts/Inter/600.woff2') format('woff2'); }
+    @font-face { font-family: 'Inter'; font-style: normal; font-weight: 700; font-display: swap; src: url('/fonts/Inter/700.woff2') format('woff2'); }
+  `;
+
 function buildPublicSiteDocument(payload) {
   const inlineStyles = composeInlineStyles(payload);
   const header = renderBrandHeader(payload.branding);
@@ -429,9 +461,7 @@ function buildPublicSiteDocument(payload) {
   <title>${escapeHtml(payload.title)}</title>
   <meta name="description" content="Curated photo galleries and stories from unforgettable celebrations." />
   ${seoMeta}
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>${PUBLIC_SITE_FONT_FACES}</style>
   <style>${inlineStyles}</style>
 </head>
 <body>
@@ -451,12 +481,9 @@ async function handlePublicSiteRequest(req, res, next) {
     const payload = await getPublicSitePayload();
 
     if (!payload.enabled) {
+      // The root is crawlable (robotsTxtService), so say it here too.
+      res.setHeader('X-Robots-Tag', 'noindex');
       res.redirect(302, '/admin/login');
-      return;
-    }
-
-    if (payload.etag && req.headers['if-none-match'] === payload.etag) {
-      res.status(304).end();
       return;
     }
 
@@ -464,7 +491,7 @@ async function handlePublicSiteRequest(req, res, next) {
     try {
       const seoRows = await db('app_settings')
         .where('setting_type', 'seo')
-        .whereIn('setting_key', ['seo_meta_noindex', 'seo_meta_nofollow', 'seo_meta_noai'])
+        .whereIn('setting_key', ['seo_allow_indexing', 'seo_meta_noindex', 'seo_meta_nofollow', 'seo_meta_noai'])
         .select('setting_key', 'setting_value');
       const seoSettings = {};
       for (const row of seoRows) {
@@ -477,9 +504,28 @@ async function handlePublicSiteRequest(req, res, next) {
 
     const document = buildPublicSiteDocument(payload);
 
+    // The validator covers the whole document, not only the settings behind
+    // payload.etag: a template change (this PR swapped the Google Fonts
+    // link for self-hosted faces) or a SEO toggle must stop answering 304 to
+    // clients that cached the previous HTML, or they keep it until a
+    // settings change happens to move the payload hash.
+    //
+    // robots.txt lets crawlers fetch the root either way, so with indexing
+    // off the landing page has to refuse indexing itself. That is a header,
+    // not part of the document, so it goes into the validator as well and is
+    // sent on a 304 too: otherwise a crawler that cached the page while
+    // indexing was on keeps revalidating its indexable copy.
+    const noindex = payload.seoSettings?.seo_allow_indexing !== true;
+    if (noindex) res.setHeader('X-Robots-Tag', 'noindex');
+    const etag = `W/"${require('crypto').createHash('sha1').update(document).update(noindex ? 'noindex' : 'index').digest('hex')}"`;
+    if (req.headers['if-none-match'] === etag) {
+      res.status(304).end();
+      return;
+    }
+
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'public, max-age=30, must-revalidate');
-    res.setHeader('ETag', payload.etag);
+    res.setHeader('ETag', etag);
     res.setHeader('Vary', 'Accept-Encoding');
     res.setHeader('Content-Security-Policy', "default-src 'self'; frame-ancestors 'none'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; font-src 'self' https: data:; object-src 'none'; script-src 'self'; form-action 'self'");
 
@@ -536,6 +582,11 @@ app.use(createAuthRateLimitGate(rateLimitService.getAuthLimiter));
 // body is already parsed, so the scoped parser must run first.
 // fallbackLimitBytes mirrors the 2mb parser right below: a body that fits it
 // never triggers the identity check.
+// A chunk body is raw bytes; refuse a mislabelled one before a parser reads it.
+{
+  const { requireOctetStreamChunk, CHUNK_ROUTE_PREFIXES } = require('./src/middleware/chunkBodyType');
+  app.use(CHUNK_ROUTE_PREFIXES, requireOctetStreamChunk);
+}
 app.use(['/api/admin', '/api/v1'], createLargeJsonBody({ limit: '50mb', fallbackLimitBytes: 2 * 1024 * 1024 }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
@@ -630,7 +681,17 @@ app.use('/uploads/favicons', setCorsHeaders, secureStatic(path.join(storagePath,
 // (set by express.static from file mtime), browsers send If-Modified-Since
 // after expiry and pick up the new version automatically. See https://docs.picpeak.app/guides/custom-fonts
 // "Replacing an existing font" for the documented rollout strategy.
-const fontStaticOpts = { maxAge: '7d' };
+//
+// Only font formats leave these mounts (isPublicFontFile): the storage tree is
+// admin-writable and a restored backup can populate it, so anything else in
+// it must not be served from the app origin. nosniff keeps a browser from
+// promoting a font response to another type.
+const { isPublicFontFile } = require('./src/middleware/secureStatic');
+const fontStaticOpts = {
+  maxAge: '7d',
+  onlyServe: isPublicFontFile,
+  setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff'),
+};
 app.use(
   '/fonts',
   setCorsHeaders,
@@ -678,6 +739,12 @@ app.get('/og/gallery/:slug', handleGalleryOgRequest);
 // events.og_image_share_enabled (#474). Unauthenticated by design;
 // returns 404 unless the opt-in is on AND a hero_photo_id is set.
 app.get('/og/gallery/:slug/cover', handleGalleryOgCover);
+// Same for PicTransfer links: nginx rewrites crawler hits on
+// /transfer/:token and /transfer-upload/:token here so the preview shows
+// the transfer's name + the branding tagline instead of the SPA stub.
+const { handleTransferOgRequest } = require('./src/services/transferOgService');
+app.get('/og/transfer/:token', handleTransferOgRequest('send'));
+app.get('/og/transfer-upload/:token', handleTransferOgRequest('request'));
 
 // Branded URL shortener (#699). /s/<short_slug> is bot-UA aware:
 //   - Social crawler → server-render OG for the target event so the
@@ -685,10 +752,11 @@ app.get('/og/gallery/:slug/cover', handleGalleryOgCover);
 //     in the rendered HTML points back at /s/<slug>, not the underlying
 //     gallery URL — so a re-share of the same short URL keeps the cache
 //     warm even if the underlying gallery slug rotates.
-//   - Browser → 302 to the stored target_path. The target_path was
-//     captured at create time from the event's slug + share_token + the
-//     global "Use short gallery URLs" setting, so it doesn't silently
-//     change later.
+//   - Browser → 302 to the gallery. The target_path's shape (slug or
+//     token form) was captured at create time from the global "Use short
+//     gallery URLs" setting, so a toggle flip doesn't move it; the slug or
+//     token itself is read off the current event, so a rename doesn't
+//     break the link (resolveTargetPath).
 //   - Soft-deleted → 410 Gone so the admin can tell their delete worked
 //     vs. a typo'd unknown slug (which returns 404).
 const galleryShortUrlService = require('./src/services/galleryShortUrlService');
@@ -721,6 +789,7 @@ app.get('/s/:shortSlug', async (req, res) => {
         meta.url = `${base}/s/${row.short_slug}`;
         res.set('Cache-Control', 'public, max-age=300');
         res.set('Content-Type', 'text/html; charset=utf-8');
+        res.set('X-Robots-Tag', 'noindex');
         res.send(renderOgHtml(meta));
         // Hit accounting is fire-and-forget — don't block the bot.
         galleryShortUrlService.recordHit(row.id).catch(() => {});
@@ -732,9 +801,11 @@ app.get('/s/:shortSlug', async (req, res) => {
       return res.status(410).type('text/plain').send('Short URL points at a deleted event');
     }
 
-    // Browser path: redirect. Hit accounting is fire-and-forget.
+    // Browser path: redirect, carrying the query along (issue 1733: a
+    // `?photo=` link through the shortener). Hit accounting is fire-and-forget.
     galleryShortUrlService.recordHit(row.id).catch(() => {});
-    return res.redirect(302, row.target_path);
+    const targetPath = await galleryShortUrlService.resolveTargetPath(row);
+    return res.redirect(302, galleryShortUrlService.redirectTarget(targetPath, req.originalUrl));
   } catch (err) {
     logger.error('Short URL resolver failed', { slug: req.params.shortSlug, error: err.message });
     return res.status(500).type('text/plain').send('Internal server error');
@@ -825,6 +896,10 @@ app.use('/api/admin/system', require('./src/routes/adminSystem'));
 // per event. Mounted at /api/admin so the routes appear at
 // /api/admin/events/:eventId/short-urls and /api/admin/short-urls/:id.
 app.use('/api/admin', require('./src/routes/adminShortUrls'));
+// Gallery folders (issue 1786) and two-stage delivery (issue 1562): routes
+// under /api/admin/events/:eventId/folders|folder-requests|delivery.
+app.use('/api/admin', require('./src/routes/adminFolders'));
+app.use('/api/admin', require('./src/routes/adminDelivery'));
 app.use('/api/admin/feature-flags', require('./src/routes/adminFeatureFlags'));
 app.use('/api/admin/whatsapp', require('./src/routes/adminWhatsapp'));
 app.use('/api/admin/database-backup', require('./src/routes/adminDatabaseBackup'));
@@ -990,6 +1065,9 @@ try {
     // revalidate so a redeploy is picked up, while the hashed assets below
     // cache immutably.
     const sendSpa = (res) => {
+      // Only the landing page is ever indexable; the app shell never is
+      // (nginx parity: `location = /index.html`).
+      res.setHeader('X-Robots-Tag', 'noindex');
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.type('html').send(spaHtml);
     };
@@ -1042,6 +1120,13 @@ try {
     };
     app.get('/gallery/:slug/:token?', ogIntercept, (req, res) => sendSpa(res));
     app.get('/gallery/:slug/show/:token', ogIntercept, (req, res) => sendSpa(res));
+    // PicTransfer links (single-container deploys without nginx).
+    const transferOgIntercept = (kind) => {
+      const handler = handleTransferOgRequest(kind);
+      return (req, res, next) => (isSocialCrawler(req.get('user-agent')) ? handler(req, res) : next());
+    };
+    app.get('/transfer/:token', transferOgIntercept('send'), (req, res) => sendSpa(res));
+    app.get('/transfer-upload/:token', transferOgIntercept('request'), (req, res) => sendSpa(res));
 
     app.get(['/admin', '/admin/*', '/gallery/*'], (req, res) => {
       sendSpa(res);
@@ -1117,6 +1202,7 @@ async function stopServer() {
       await Promise.all([close, require('./src/services/serviceShutdown').stopServices()]);
     } finally {
       clearTimeout(timeout);
+      await restoreCoordinator.stop();
       // Always release the pool: a rejected service stop must not leave
       // ref'd sockets keeping the process alive until SIGKILL.
       await db.destroy();
@@ -1126,14 +1212,49 @@ async function stopServer() {
 }
 
 // Initialize services
-async function startServer() {
+// Request and query tracking exists so a coordinated restore can wait for
+// accepted work. It is installed only where such a restore can run.
+let restoreWorkTracked = false;
+function trackRestoreWork() {
+  if (restoreWorkTracked) return;
+  restoreWorkTracked = true;
+  enableApplicationWorkOwnership();
+  ownRouteHandlers(app);
+}
+
+// Only reached when a previous run left a restore fence behind.
+async function recoverPendingRestore() {
+  trackRestoreWork();
+  // As for the ordinary listener: bootstrap authority must not become the
+  // default authority of an incoming request.
+  httpServer = await applicationWork.runUncontrolled(() => require('./src/database/crmAccess').withoutCrmContext(
+    () => new Promise((resolve, reject) => {
+      const listener = app.listen(PORT, LISTEN_HOST, () => { listener.removeListener('error', reject); resolve(listener); });
+      listener.once('error', reject);
+    })));
+  logger.warn(`A portable restore was interrupted; serving the maintenance page on port ${PORT} until it is recovered`);
+  await restoreCoordinator.initialize();
+  await restoreCoordinator.waitForStartupAdmission();
+}
+
+function startServer() {
+  return require('./src/database/crmAccess').withTrustedCrmAccess('application bootstrap', startServerInternal);
+}
+
+async function startServerInternal() {
   try {
+    // A portable restore interrupted by a crash or reboot leaves the instance
+    // fenced. Only then does the listener open before the database is ready:
+    // it serves the maintenance page and the restore progress while the
+    // restore is recovered. For every other boot this is one file lookup.
+    if (await restoreCoordinator.pendingAtBoot()) await recoverPendingRestore();
+
     // Initialize database
     await initializeDatabase();
     await require('./src/utils/authSecurity').assertAuthSecuritySchema();
 
-    // Warm the public-origin cache so the SYNCHRONOUS resolver (CORS headers,
-    // secureImageMiddleware) can see the general_site_url setting. Best-effort:
+    // Warm the public-origin cache so the SYNCHRONOUS resolver (CORS headers)
+    // can see the general_site_url setting. Best-effort:
     // the async resolver reads through on its own, and a cold cache only means
     // falling back to the environment.
     await primeSiteUrlCache().catch(() => {});
@@ -1149,6 +1270,8 @@ async function startServer() {
     // Initialize auth security cleanup job
     const { initializeCleanupJob } = require('./src/utils/authSecurity');
     initializeCleanupJob();
+    require('./src/middleware/sessionTimeout').startSessionCleanup();
+    require('./src/services/chunkedUploadService').start();
     
     require('./src/utils/cleanupTempUploads').startTempUploadCleanup();
 
@@ -1172,6 +1295,9 @@ async function startServer() {
     // Customer documents retention (#1444): delete long-rejected files and
     // remove the bytes of deleted ones once the retention window elapses.
     require('./src/services/customerDocumentRetentionService').startCustomerDocumentRetention();
+    // Photo trash (issue 1733): hourly, deletes for good what is past its
+    // retention.
+    require('./src/services/photoTrash').startPhotoTrashPurge();
     // Malware scanner for customer documents (#1444): clamd over TCP, only
     // when CLAMAV_HOST is set. Without it uploads stay pending until an admin
     // reviews them. The hourly re-scan picks up rows left pending while the
@@ -1368,6 +1494,22 @@ async function startServer() {
     // sharp/ffmpeg/EXIF pipeline off the request thread.
     backgroundProcessor.start();
 
+    // Decide now how image work is isolated, so a host that cannot run the
+    // memory-limited image worker says so in the startup log, once.
+    require('./src/services/isolatedSharp').prepare()
+      .catch((err) => logger.warn('Image worker check failed at boot', { error: err.message }));
+
+    // The same for ffmpeg/ffprobe/exiftool: one startup line says which of
+    // the optional protections (process guard, kernel leases) this host runs
+    // and what to do about the ones it does not. Never a reason not to start.
+    require('./src/services/mediaCapabilities').probe();
+
+    // Public upload leases: heartbeat this process's live requests and reap
+    // the ones a dead process left behind, now and every 30 s.
+    const publicUploadQuota = require('./src/services/publicUploadQuota');
+    publicUploadQuota.startMaintenance();
+    publicUploadQuota.cleanupAbandoned().catch((err) => logger.warn('Public upload reaper failed at boot', { error: err.message }));
+
     // Face detection (#1074). Starts alongside the photo processor but stays
     // idle — every worker tick re-checks the `faces` feature flag, which is
     // off by default. It is safe to start unconditionally precisely because
@@ -1379,8 +1521,36 @@ async function startServer() {
     // lazy means they don't pay for a module graph they never use.
     require('./src/services/faceQueue').start();
 
-    httpServer = app.listen(PORT, () => {
-      logger.info(`Server running on port ${PORT}`);
+    // Scene tagging (issue 1733). Same shape: idle until the `autoTagging`
+    // feature flag is on, and it never contacts the sidecar before that.
+    require('./src/services/tagQueue').start();
+
+    // Browser-playable video copies (issue 1430). Same shape as the face
+    // queue: starts idle and re-reads the general_video_web_rendition
+    // setting every tick, so nothing runs until an admin switches it on.
+    require('./src/services/videoRenditionQueue').start();
+
+    // Adaptive streaming ladders (issue 1733). Idle in the same way until
+    // general_video_adaptive_streaming is switched on.
+    require('./src/services/videoHlsQueue').start();
+
+    // Renditions written before derived images were stripped of the source's
+    // EXIF (issue 2096) are regenerated once in the background, the public OG
+    // covers first. One replica runs it; it resumes after a restart.
+    require('./src/services/renditionRefresh').start();
+
+    // Coordinated portable restore is optional. Where this host cannot run it
+    // one startup line says why, the import answers 503 and nothing else
+    // changes; where it can, requests are tracked so a restore can drain them.
+    // Never a reason not to start, and never awaited.
+    restoreCoordinator.activate({
+      resumeServices: () => require('./src/services/serviceShutdown').resumeServices(),
+      forceClose: () => httpServer?.closeAllConnections(),
+    }).then((capability) => { if (capability.available) trackRestoreWork(); })
+      .catch((err) => logger.warn('Portable restore check failed at boot', { error: err.message }));
+
+    const listening = () => {
+      logger.info(`Server running on ${LISTEN_HOST || 'all interfaces'}:${PORT}`);
       logger.info(`Admin interface: ${process.env.ADMIN_URL || 'http://localhost:3000'}`);
       logger.info(`Frontend: ${process.env.FRONTEND_URL || 'http://localhost:3001'}`);
       // First-run banner. Print the TOKEN ITSELF only when the 0600 token file
@@ -1395,8 +1565,14 @@ async function startServer() {
           : `  One-time setup token:  ${setupToken}\n  (could not write the token file, so it is shown here)`;
         console.log(`\n${line}\n  PicPeak first-run setup — no admin account yet.\n  Open:                  ${url}\n${secretLine}\n${line}\n`);
       }
-    });
+    };
+    // Already listening when an interrupted restore had to be recovered first.
+    // Bootstrap/cron authority must not become the default authority of an
+    // incoming HTTP request. Its authentication/capability middleware owns it.
+    if (httpServer) listening();
+    else httpServer = await require('./src/database/crmAccess').withoutCrmContext(() => app.listen(PORT, LISTEN_HOST, listening));
   } catch (error) {
+    if (shutdownPromise) { await shutdownPromise; return; }
     logger.error('Failed to start server:', error);
     await stopServer();
     process.exitCode = 1;

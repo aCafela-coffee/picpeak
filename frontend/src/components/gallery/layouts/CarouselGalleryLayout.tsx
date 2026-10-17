@@ -1,15 +1,20 @@
 import { usePhotoSelection } from '../../../hooks/usePhotoSelection';
 import React, { useState, useEffect, useRef } from 'react';
-import { ChevronLeft, ChevronRight, Download, Maximize2, Play, Pause, Heart, MessageSquare } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { ChevronLeft, ChevronRight, Download, Maximize2, Play, Pause, Heart, MessageSquare, Sparkles } from 'lucide-react';
 import { useTheme } from '../../../contexts/ThemeContext';
 import { AuthenticatedImage, Button } from '../../common';
 import { ColorLabelBadge } from '../ColorLabelBadge';
+import { ClientVisibilityToggle, isHiddenFromGuests } from '../ClientVisibilityToggle';
+import { useGalleryTileBadges } from '../GalleryTileBadges';
 import type { BaseGalleryLayoutProps } from './BaseGalleryLayout';
 import { FeedbackIdentityModal } from '../../gallery/FeedbackIdentityModal';
 import { feedbackService } from '../../../services/feedback.service';
+import { feedbackLockKind } from '../../../utils/feedbackLock';
 import { useGuestIdentityOptional } from '../../../contexts/GuestIdentityContext';
 import { useDownloadQuota } from '../../../contexts/DownloadQuotaContext';
 import { downloadLimitReachedMessage } from '../../../utils/downloadLimit';
+import { usePhotoDownloadPending, preparingDownloadMessage } from '../../../hooks/usePhotoDownloadPending';
 
 export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
   photos,
@@ -19,8 +24,12 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
   onDownload,
   allowDownloads = true,
   feedbackEnabled = false,
-  feedbackOptions
+  feedbackOptions,
+  onFeedbackChange,
+  isClient = false,
+  onToggleVisibility,
 }) => {
+  const { t } = useTranslation();
   const { theme } = useTheme();
   const { currentPhoto, currentIndex, setCurrentIndex } = usePhotoSelection(photos);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -71,7 +80,18 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
   const guestIdentity = useGuestIdentityOptional();
   // Download limit (issue 1560); see PhotoCard for why aria-disabled.
   const downloadQuota = useDownloadQuota();
+  // First look (issue 1562) and the "All photos" folder hint (issue 1786)
+  // ride in the chip row next to the category: this layout's corners are
+  // all taken (see the colour-label note below).
+  const tileBadges = useGalleryTileBadges();
   const [likedIds, setLikedIds] = useState<Set<number>>(new Set());
+  // The like endpoint is a toggle (#590), and so is taking one back.
+  const toggleLiked = (photoId: number) => setLikedIds(prev => {
+    const next = new Set(prev);
+    if (next.has(photoId)) next.delete(photoId);
+    else next.add(photoId);
+    return next;
+  });
   // Seed from server is_liked on first non-empty payload (#590 follow-up).
   // Mount-only so refetches don't clobber in-session optimistic toggles.
   const likedSeededRef = useRef(false);
@@ -81,6 +101,8 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
     likedSeededRef.current = true;
   }, [photos]);
   const canQuickComment = Boolean(feedbackEnabled && feedbackOptions?.allowComments && onOpenPhotoWithFeedback);
+  // Issue 2043: spins while the photo on screen is being prepared.
+  const downloadPending = usePhotoDownloadPending(currentPhoto?.id);
 
   if (!currentPhoto) return null;
   const currentPhotoAtLimit = !downloadQuota.canDownload(currentPhoto);
@@ -95,7 +117,8 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
         <AuthenticatedImage
           src={currentPhoto.media_type === 'video' && currentPhoto.thumbnail_url ? currentPhoto.thumbnail_url : currentPhoto.url}
           alt={currentPhoto.filename}
-          className="w-full h-full object-contain"
+          // Dimmed when the client hid it from guests, as in Grid (issue 1992).
+          className={`w-full h-full object-contain${isClient && onToggleVisibility && isHiddenFromGuests(currentPhoto) ? ' opacity-40' : ''}`}
           isGallery={true}
         />
 
@@ -106,6 +129,7 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
         <ColorLabelBadge
           colorLabel={currentPhoto.my_color_label}
           otherColorLabels={currentPhoto.other_color_labels}
+          decision={currentPhoto.my_decision}
           position="bottom-4 left-4"
         />
 
@@ -131,12 +155,28 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
         {/* Top Controls */}
         <div className="absolute top-4 left-4 right-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
+            {/* The client's hide/show button (issue 1992): first in the chip
+                row, the top-left of the photo in view, as in Grid. */}
+            {isClient && onToggleVisibility && (
+              <ClientVisibilityToggle photo={currentPhoto} onToggle={onToggleVisibility} />
+            )}
             <span className="px-3 py-1 bg-black/50 text-white rounded-full text-sm">
               {currentIndex + 1} / {photos.length}
             </span>
             {currentPhoto.category_name && (
               <span className="px-3 py-1 bg-black/50 text-white rounded-full text-sm">
                 {currentPhoto.category_name}
+              </span>
+            )}
+            {tileBadges.folderNameOf && tileBadges.folderNameOf(currentPhoto) && (
+              <span className="px-3 py-1 bg-black/50 text-white rounded-full text-sm max-w-[10rem] truncate">
+                {tileBadges.folderNameOf(currentPhoto)}
+              </span>
+            )}
+            {currentPhoto.first_look && tileBadges.firstLookLabel && (
+              <span className="inline-flex items-center gap-1 px-3 py-1 bg-white/90 text-neutral-800 rounded-full text-sm">
+                <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+                {tileBadges.firstLookLabel}
               </span>
             )}
           </div>
@@ -157,7 +197,7 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
               size="sm"
               onClick={() => onPhotoClick(currentIndex)}
               className="text-white hover:bg-white/20"
-              title="View fullscreen"
+              title={t('gallery.tile.viewFullSize', 'View full size')}
             >
               <Maximize2 className="w-5 h-5" />
             </Button>
@@ -167,11 +207,15 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
                 variant="ghost"
                 size="sm"
                 onClick={(e) => onDownload(currentPhoto, e)}
+                isLoading={downloadPending}
+                focusableWhileLoading
                 className={`text-white hover:bg-white/20${currentPhotoAtLimit ? ' opacity-50 cursor-not-allowed' : ''}`}
                 aria-disabled={currentPhotoAtLimit || undefined}
-                title={currentPhotoAtLimit ? downloadLimitReachedMessage() : 'Download photo'}
+                title={currentPhotoAtLimit
+                  ? downloadLimitReachedMessage()
+                  : downloadPending ? preparingDownloadMessage() : t('gallery.tile.downloadPhoto', 'Download photo')}
               >
-                <Download className="w-5 h-5" />
+                {downloadPending ? null : <Download className="w-5 h-5" />}
               </Button>
             )}
             {feedbackEnabled && feedbackOptions?.allowLikes && (
@@ -196,10 +240,15 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
                       await feedbackService.submitFeedback(slug!, String(currentPhoto.id), {
                         feedback_type: 'like',
                       });
+                      // The "x selected" counter and the Liked filter read
+                      // /my-feedback, which this refreshes (issue 1733).
+                      onFeedbackChange?.(currentPhoto.id);
                     } catch (err) {
-                      // Same rule as PhotoCard: keep the optimistic state, a
-                      // refresh reconciles; but never swallow it silently.
-                      console.warn('Like submit failed, keeping optimistic UI', err);
+                      // Same rule as PhotoCard: a pick refused by a finished
+                      // selection goes back; otherwise keep the optimistic
+                      // state, a refresh reconciles.
+                      if (feedbackLockKind(err)) toggleLiked(currentPhoto.id);
+                      else console.warn('Like submit failed, keeping optimistic UI', err);
                     }
                     return;
                   }
@@ -221,12 +270,14 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
                       guest_name: savedIdentity?.name,
                       guest_email: savedIdentity?.email,
                     });
+                    onFeedbackChange?.(currentPhoto.id);
                   } catch (err) {
-                    console.warn('Like submit failed, keeping optimistic UI', err);
+                    if (feedbackLockKind(err)) toggleLiked(currentPhoto.id);
+                    else console.warn('Like submit failed, keeping optimistic UI', err);
                   }
                 }}
-                className={`bg-black/30 hover:bg-black/50 rounded-full border border-white/40 ${likedIds.has(currentPhoto.id) ? 'text-red-400' : 'text-white'}`}
-                title="Like photo"
+                className={`bg-black/30 hover:bg-black/50 rounded-full border border-white/40 ${likedIds.has(currentPhoto.id) ? 'text-danger' : 'text-white'}`}
+                title={t('gallery.tile.likePhoto', 'Like photo')}
                 aria-pressed={likedIds.has(currentPhoto.id)}
               >
                 <Heart className="w-5 h-5" />
@@ -238,8 +289,8 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
                 size="sm"
                 onClick={() => { onOpenPhotoWithFeedback?.(currentIndex); }}
                 className="text-white bg-black/30 hover:bg-black/50 rounded-full border border-white/40"
-                title="Comment"
-                aria-label="Comment on photo"
+                title={t('gallery.tile.comment', 'Comment')}
+                aria-label={t('gallery.tile.commentOnPhoto', 'Comment on photo')}
               >
                 <MessageSquare className="w-5 h-5" />
               </Button>
@@ -271,14 +322,17 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
                 onClick={() => setCurrentIndex(index)}
                 className={`relative flex-shrink-0 w-20 h-20 rounded overflow-hidden transition-all ${
                   index === currentIndex 
-                    ? 'ring-2 ring-primary-600 scale-110' 
+                    ? 'ring-2 ring-accent scale-110' 
                     : 'opacity-70 hover:opacity-100'
                 }`}
               >
                 <AuthenticatedImage
                   src={photo.thumbnail_url || photo.url}
                   alt={photo.filename}
-                  className="w-full h-full object-cover"
+                  // Hidden from guests: dimmed here too, not only on the stage
+                  // (issue 1992). On the image, so hover's opacity-100 on the
+                  // button does not undo it.
+                  className={`w-full h-full object-cover${isClient && onToggleVisibility && isHiddenFromGuests(photo) ? ' opacity-40' : ''}`}
                   loading="lazy"
                   isGallery={true}
                 />
@@ -289,6 +343,7 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
                 <ColorLabelBadge
                   colorLabel={photo.my_color_label}
                   otherColorLabels={photo.other_color_labels}
+                  decision={photo.my_decision}
                   size="sm"
                   position="top-1 left-1"
                 />
@@ -310,6 +365,7 @@ export const CarouselGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
               guest_name: name,
               guest_email: email,
             });
+            onFeedbackChange?.(pendingAction.photoId);
             setPendingAction(null);
           }
         }}

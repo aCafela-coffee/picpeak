@@ -1,12 +1,16 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertCircle, FolderTree, Upload } from 'lucide-react';
+import { AlertCircle, ClipboardCheck, Folders, FolderTree, Trash2, Upload } from 'lucide-react';
 import type { Event } from '../../../types';
-import { Button, Card, Loading } from '../../../components/common';
-import { AdminPhotoGrid, AdminPhotoViewer, PhotoFilters, PhotoUploadModal, PhotoFilterPanel, PhotoExportMenu, EventCategoryManager } from '../../../components/admin';
+import { Badge, Button, Card, Loading } from '../../../components/common';
+import { AdminPhotoGrid, AdminPhotoViewer, PhotoFilters, PhotoUploadModal, PhotoFilterPanel, PhotoExportMenu, EventCategoryManager, PhotoTrashModal, photoTrashQueryKey } from '../../../components/admin';
 import { PermissionGate } from '../../../components/admin/PermissionGate';
+import { usePermissions } from '../../../contexts/PermissionsContext';
 import { AdminPhoto, photosService, CREDIT_FILTER_NONE, type PhotoFilters as PhotoFilterParams, type FeedbackFilters, type FilterSummary } from '../../../services/photos.service';
+import { FolderBrowser, FolderRequestsPanel } from '../../../components/admin/folders';
+import { folderQueryKey, foldersService } from '../../../services/folders.service';
+import { toBoolean } from '../../../utils/parsers';
 import { ExternalSourceBar } from './ExternalSourceBar';
 
 interface PhotosTabProps {
@@ -16,6 +20,8 @@ interface PhotosTabProps {
   photosLoading: boolean;
   photosError: boolean;
   refetchPhotos: () => void;
+  // Folders are photo_categories rows too (is_folder); since issue 1786 they
+  // are managed in the folder bar and never offered as filter categories.
   categories: Array<{ id: number; name: string; slug: string; is_folder?: boolean }>;
   photoFilters: PhotoFilterParams;
   setPhotoFilters: React.Dispatch<React.SetStateAction<PhotoFilterParams>>;
@@ -27,6 +33,8 @@ interface PhotosTabProps {
   initialCategoriesOpen?: boolean;
   /** Settings → Photo source, where the folder is chosen. */
   onChangeFolder: () => void;
+  // From the event's own counts, like showMediaFilter (issue 1430, item 3).
+  hasVideos: boolean;
 }
 
 export const PhotosTab: React.FC<PhotosTabProps> = ({
@@ -45,6 +53,7 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
   showMediaFilter,
   initialCategoriesOpen = false,
   onChangeFolder,
+  hasVideos
 }) => {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -64,6 +73,72 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
     enabled: Number.isFinite(eventId),
   });
 
+  // Folders (issue 1786): the tree, open folder requests, and whether this
+  // admin may edit them.
+  const { data: folderTree } = useQuery({
+    queryKey: folderQueryKey(eventId),
+    queryFn: () => foldersService.list(eventId),
+    enabled: Number.isFinite(eventId),
+  });
+  const folders = useMemo(() => folderTree?.folders ?? [], [folderTree]);
+  const folderRequests = folderTree?.requests ?? [];
+  const canManageFolders = folderTree?.can_manage === true;
+  const folderFilter = photoFilters.folder_id;
+  const setFolderFilter = (folder_id: PhotoFilterParams['folder_id']) =>
+    setPhotoFilters((prev) => ({ ...prev, folder_id }));
+  // The bar shows once the event has folders or requests; before that an
+  // admin who may create folders opens it from the actions bar.
+  const [folderBarOpened, setFolderBarOpened] = useState(false);
+  const showFolderBar = folders.length > 0 || folderRequests.length > 0 || folderFilter !== undefined || folderBarOpened;
+  const pendingPhotoCount = folderRequests.reduce((sum, r) => sum + r.photo_count, 0);
+
+  // Review of team members' uploads (issue 743). The owner or a holder of
+  // photos.review approves or rejects; a team member sees that their uploads
+  // are waiting.
+  const canModerate = event.can_review_uploads === true;
+  const { data: moderation } = useQuery({
+    queryKey: ['admin-event-photos', id, 'moderation'],
+    queryFn: () => photosService.getModerationCounts(eventId),
+    enabled: Number.isFinite(eventId),
+  });
+
+  // The trash (issue 1733): what deleting says depends on its retention, and
+  // the button shows how many photos wait there. Same permission as its route.
+  const { hasPermission, isSuperAdmin } = usePermissions();
+  const canDelete = isSuperAdmin || hasPermission('photos.delete');
+  const [showTrash, setShowTrash] = useState(false);
+  const { data: trash } = useQuery({
+    queryKey: photoTrashQueryKey(eventId),
+    queryFn: () => photosService.getTrash(eventId),
+    enabled: Number.isFinite(eventId) && canDelete,
+  });
+  const trashCount = trash?.items.length ?? 0;
+
+  // Deleting, hiding/showing or reviewing photos from this tab changes the
+  // review bar's counts too, so every refresh also re-reads them.
+  const refreshAfterPhotoChange = () => {
+    refetchPhotos();
+    queryClient.invalidateQueries({ queryKey: ['admin-event', id] });
+    queryClient.invalidateQueries({ queryKey: ['admin-photo-credits', eventId] });
+    queryClient.invalidateQueries({ queryKey: ['admin-event-photos', id, 'moderation'] });
+    queryClient.invalidateQueries({ queryKey: photoTrashQueryKey(eventId) });
+    queryClient.invalidateQueries({ queryKey: ['external-import-status', eventId] });
+  };
+  const moderationFilter = photoFilters.moderation;
+  const setModerationFilter = (value: PhotoFilterParams['moderation']) =>
+    setPhotoFilters((prev) => ({ ...prev, moderation: value }));
+  const showReviewBar = (moderation?.pending ?? 0) > 0 || (moderation?.rejected ?? 0) > 0 || !!moderationFilter;
+
+  // The open folder was deleted or moved away elsewhere: fall back to all photos.
+  useEffect(() => {
+    if (typeof folderFilter === 'number' && folderTree && !folders.some((f) => f.id === folderFilter)) {
+      setPhotoFilters((prev) => ({ ...prev, folder_id: undefined }));
+    }
+  }, [folderFilter, folderTree, folders, setPhotoFilters]);
+
+  // Filter categories only: a folder is not something a photo is tagged with.
+  const filterCategories = useMemo(() => categories.filter((c) => !c.is_folder), [categories]);
+
   return (
     <div>
       {/* Photo Upload Modal */}
@@ -74,10 +149,78 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
         isOpen={showPhotoUpload}
         onClose={() => setShowPhotoUpload(false)}
         eventId={parseInt(id!)}
+        folderStructureDefault={toBoolean(event.folder_structure, false)}
+        defaultFolderId={typeof folderFilter === 'number' ? folderFilter : null}
       />
 
       {event.source_mode === 'reference' && event.external_path && (
-        <ExternalSourceBar event={event} onChangeFolder={onChangeFolder} />
+        <ExternalSourceBar
+          event={event}
+          onChangeFolder={onChangeFolder}
+          missingFilter={photoFilters.unavailable === true}
+          onToggleMissing={() => setPhotoFilters((prev) => ({ ...prev, unavailable: prev.unavailable ? undefined : true }))}
+        />
+      )}
+
+      {showReviewBar && (
+        <div
+          className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-warning-line bg-warning-soft px-4 py-3"
+          data-testid="photo-review-bar"
+        >
+          <p className="flex items-center gap-2 text-sm text-warning-text">
+            <ClipboardCheck className="w-4 h-4 flex-shrink-0" aria-hidden="true" />
+            {(moderation?.pending ?? 0) > 0
+              ? (canModerate
+                ? t('photos.review.pendingOwner', { count: moderation?.pending ?? 0 })
+                : t('photos.review.pendingMember', { count: moderation?.pending ?? 0 }))
+              : t('photos.review.nonePending', 'No uploads are waiting for review.')}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant={moderationFilter === 'pending' ? 'secondary' : 'outline'}
+              size="sm"
+              onClick={() => setModerationFilter(moderationFilter === 'pending' ? undefined : 'pending')}
+              aria-pressed={moderationFilter === 'pending'}
+            >
+              {t('photos.review.filterPending', { count: moderation?.pending ?? 0 })}
+            </Button>
+            {(moderation?.rejected ?? 0) > 0 && (
+              <Button
+                variant={moderationFilter === 'rejected' ? 'secondary' : 'outline'}
+                size="sm"
+                onClick={() => setModerationFilter(moderationFilter === 'rejected' ? undefined : 'rejected')}
+                aria-pressed={moderationFilter === 'rejected'}
+              >
+                {t('photos.review.filterRejected', { count: moderation?.rejected ?? 0 })}
+              </Button>
+            )}
+            {moderationFilter && (
+              <Button variant="ghost" size="sm" onClick={() => setModerationFilter(undefined)}>
+                {t('photos.review.showAll', 'All photos')}
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
+
+      <FolderRequestsPanel
+        eventId={eventId}
+        requests={folderRequests}
+        folders={folders}
+        canManage={canManageFolders}
+        onShowWaiting={() => setFolderFilter('pending')}
+      />
+
+      {showFolderBar && (
+        <FolderBrowser
+          eventId={eventId}
+          folders={folders}
+          canManage={canManageFolders}
+          maxDepth={folderTree?.max_depth ?? 3}
+          value={folderFilter}
+          onChange={setFolderFilter}
+          pendingPhotoCount={pendingPhotoCount}
+        />
       )}
 
       {/* Categories (formerly their own tab): organise into categories next
@@ -99,7 +242,7 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
 
       {/* Photo Filters */}
       <PhotoFilters
-        categories={categories}
+        categories={filterCategories}
         selectedCategory={photoFilters.category_id}
         searchTerm={photoFilters.search ?? ''}
         sortBy={photoFilters.sort ?? 'date'}
@@ -126,11 +269,12 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
         onChange={setFeedbackFilters}
         summary={filterSummary || null}
         isLoading={photosLoading}
+        hasVideos={hasVideos}
       />
 
       {/* Actions Bar */}
       <div className="mb-4 flex flex-wrap justify-between items-center gap-4">
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <PermissionGate permission="photos.upload">
             <Button
               variant="primary"
@@ -150,15 +294,55 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
           >
             {t('events.categories')}
           </Button>
+          {canManageFolders && !showFolderBar && (
+            <Button
+              variant="outline"
+              size="sm"
+              leftIcon={<Folders className="w-4 h-4" />}
+              onClick={() => setFolderBarOpened(true)}
+            >
+              {t('photos.folders.title', 'Folders')}
+            </Button>
+          )}
         </div>
-        <PermissionGate permission="photos.download">
-          <PhotoExportMenu
-            eventId={parseInt(id!)}
-            selectedPhotoIds={selectedPhotoIds}
-            filters={feedbackFilters}
-          />
-        </PermissionGate>
+        <div className="flex flex-wrap items-start gap-3">
+          {/* Only while deleting goes to the trash, or something is still in it. */}
+          {canDelete && ((trash?.retention_days ?? 0) > 0 || trashCount > 0) && (
+            <Button
+              variant="outline"
+              size="sm"
+              leftIcon={<Trash2 className="w-4 h-4" />}
+              onClick={() => setShowTrash(true)}
+              data-testid="photo-trash-open"
+            >
+              {t('admin.photos.trash.title')}
+              {trashCount > 0 && <Badge className="ml-2">{trashCount}</Badge>}
+            </Button>
+          )}
+          <PermissionGate permission="photos.download">
+            <PhotoExportMenu
+              eventId={parseInt(id!)}
+              selectedPhotoIds={selectedPhotoIds}
+              filters={feedbackFilters}
+            />
+          </PermissionGate>
+        </div>
       </div>
+
+      {canDelete && (
+        <PhotoTrashModal
+          eventId={eventId}
+          open={showTrash}
+          onClose={() => setShowTrash(false)}
+          // Photos come back with their labels, decisions and folders: the
+          // filter panel's sections and the folder counts depend on them.
+          onRestored={() => {
+            refreshAfterPhotoChange();
+            queryClient.invalidateQueries({ queryKey: ['admin-event-filter-summary', id] });
+            queryClient.invalidateQueries({ queryKey: folderQueryKey(eventId) });
+          }}
+        />
+      )}
 
       {/* Photo Grid */}
       {photosLoading ? (
@@ -170,7 +354,7 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
         // grid's "no media uploaded yet" empty state, which reads as "your
         // photos are gone" rather than "we couldn't load them" (QA follow-up).
         <Card padding="lg">
-          <div className="flex items-start gap-3 text-amber-700 dark:text-amber-400">
+          <div className="flex items-start gap-3 text-warning-text">
             <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
             <div>
               <p className="font-medium">{t('gallery.failedToLoad')}</p>
@@ -185,13 +369,15 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
           photos={photos}
           eventId={parseInt(id!)}
           onPhotoClick={(photo, index) => setSelectedPhoto({ photo, index })}
-          onPhotosDeleted={() => {
-            refetchPhotos();
-            queryClient.invalidateQueries({ queryKey: ['admin-event', id] });
-            queryClient.invalidateQueries({ queryKey: ['admin-photo-credits', eventId] });
-          }}
+          onPhotosDeleted={refreshAfterPhotoChange}
           onSelectionChange={setSelectedPhotoIds}
-          categories={categories}
+          categories={filterCategories}
+          folders={folders}
+          sortBy={photoFilters.sort ?? 'date'}
+          sortOrder={photoFilters.order ?? 'desc'}
+          onSortChange={(sort, order) => setPhotoFilters(prev => ({ ...prev, sort, order }))}
+          canModerate={canModerate}
+          trashRetentionDays={trash?.retention_days}
         />
       )}
 
@@ -203,12 +389,11 @@ export const PhotosTab: React.FC<PhotosTabProps> = ({
           eventId={parseInt(id!)}
           onClose={() => setSelectedPhoto(null)}
           onPhotoDeleted={() => {
-            refetchPhotos();
-            queryClient.invalidateQueries({ queryKey: ['admin-event', id] });
-            queryClient.invalidateQueries({ queryKey: ['admin-photo-credits', eventId] });
+            refreshAfterPhotoChange();
             setSelectedPhoto(null);
           }}
-          categories={categories}
+          categories={filterCategories}
+          trashRetentionDays={trash?.retention_days}
         />
       )}
 

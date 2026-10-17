@@ -10,6 +10,13 @@
  */
 
 const path = require('path');
+jest.mock('../../src/services/mediaAttemptService', () => ({
+  current: () => ({ id: '11111111-1111-4111-8111-111111111111', assertCurrent: async () => {} }),
+  outputName: name => name,
+  guard: (_attempt, db) => db('photos').where({ id: db.__photoId || 1 }),
+  dropSuperseded: jest.fn(async () => {}),
+}));
+jest.mock('../../src/services/publicUploadQuota', () => ({ processingComplete: jest.fn().mockResolvedValue(undefined) }));
 
 jest.mock('../../src/database/db', () => {
   const recorded = { whereCalls: [], updateCalls: [] };
@@ -99,13 +106,21 @@ jest.mock('../../src/services/videoProcessor', () => ({
   processUploadedVideo: jest.fn(),
   extractVideoMetadata: jest.fn(),
   isVideoMimeType: (mime) => typeof mime === 'string' && mime.startsWith('video/'),
+  posterFrameError: (reason) => `No poster frame: ${reason}`,
 }));
 
 jest.mock('../../src/services/storage', () => ({ getStorage: jest.fn() }));
 
+jest.mock('../../src/services/videoRenditionService', () => ({
+  queuesVideos: jest.fn(async () => false),
+}));
+
 jest.mock('../../src/services/photoResolver', () => ({
   resolvePhotoStorageKey: jest.fn(
     (event, photo) => `events/active/${event.slug}/${photo.filename}`
+  ),
+  resolvePhotoFilePath: jest.fn(
+    (event, photo) => `/mnt/media/${photo.external_relpath}`
   ),
 }));
 
@@ -129,7 +144,7 @@ jest.mock('../../src/utils/logger', () => ({
 }));
 
 // Stub sharp so we don't actually read any image off disk.
-jest.mock('sharp', () => {
+jest.mock('../../src/services/isolatedSharp', () => {
   const mock = jest.fn(() => ({
     metadata: jest.fn(async () => ({ width: 1920, height: 1080 })),
   }));
@@ -139,6 +154,7 @@ jest.mock('sharp', () => {
 const dbModule = require('../../src/database/db');
 const imageProcessor = require('../../src/services/imageProcessor');
 const videoProcessor = require('../../src/services/videoProcessor');
+const photoResolver = require('../../src/services/photoResolver');
 const watermarkService = require('../../src/services/watermarkGeneratorService');
 const webhookService = require('../../src/services/webhookService');
 
@@ -167,6 +183,7 @@ describe('photoProcessor.processPhoto', () => {
 
     const { processPhoto } = require('../../src/services/photoProcessor');
     await processPhoto(101);
+    expect(require('../../src/services/publicUploadQuota').processingComplete).toHaveBeenCalledWith(101);
 
     const finalUpdate = dbModule.__recorded().updateCalls.pop();
     expect(finalUpdate.data.processing_status).toBe('complete');
@@ -218,9 +235,83 @@ describe('photoProcessor.processPhoto', () => {
     expect(finalUpdate.data.duration).toBe(12.5);
     expect(finalUpdate.data.video_codec).toBe('h264');
     expect(finalUpdate.data.thumbnail_path).toBe('thumbnails/thumb_wedding-video-001.jpg');
+    // A real poster frame: no note on the row.
+    expect(finalUpdate.data.processing_error).toBeNull();
 
     // Watermark queue is image-only.
     expect(watermarkService.generateForPhoto).not.toHaveBeenCalled();
+  });
+
+  it('records why a video completed on the placeholder tile (issue 1430, item 6)', async () => {
+    dbModule.__setPhoto({
+      id: 205,
+      event_id: 9,
+      filename: 'phone-clip.mov',
+      mime_type: 'video/quicktime',
+      media_type: 'video',
+      size_bytes: 12345,
+    });
+    dbModule.__setEvent({ id: 9, slug: 'wedding', event_name: 'Wedding' });
+
+    // processUploadedVideo's own fallback: metadata read, poster frame not.
+    videoProcessor.processUploadedVideo.mockResolvedValueOnce({
+      success: true,
+      thumbnailKey: 'thumbnails/thumb_phone-clip.jpg',
+      placeholder: true,
+      thumbnailError: 'ffmpeg seek failed',
+      metadata: { duration: 8, videoCodec: 'hevc', audioCodec: 'aac', width: 1920, height: 1080 },
+    });
+
+    const { processPhoto } = require('../../src/services/photoProcessor');
+    await processPhoto(205);
+
+    const finalUpdate = dbModule.__recorded().updateCalls.pop();
+    // Still complete — the guest gallery lists only complete rows — but with
+    // the note the admin grid shows next to its Retry.
+    expect(finalUpdate.data.processing_status).toBe('complete');
+    expect(finalUpdate.data.processing_error).toBe('No poster frame: ffmpeg seek failed');
+    expect(finalUpdate.data.thumbnail_path).toBe('thumbnails/thumb_phone-clip.jpg');
+    expect(finalUpdate.data.video_codec).toBe('hevc');
+  });
+
+  it('retries an external video off the mount, under the key its import used', async () => {
+    // The import writes external rows complete without this worker; the only
+    // way one gets here is the grid's Retry. resolvePhotoStorageKey is null
+    // for it, which used to be handed straight to withLocalCopy.
+    dbModule.__setPhoto({
+      id: 204,
+      event_id: 9,
+      filename: 'clip.mp4',
+      external_relpath: 'shoot/clip.mp4',
+      source_origin: 'external',
+      mime_type: 'video/mp4',
+      media_type: 'video',
+      processing_status: 'processing',
+      processing_error: 'No poster frame: ffmpeg seek failed',
+    });
+    dbModule.__setEvent({ id: 9, slug: 'wedding', event_name: 'Wedding', source_mode: 'reference' });
+    photoResolver.resolvePhotoStorageKey.mockReturnValueOnce(null);
+
+    videoProcessor.processUploadedVideo.mockResolvedValueOnce({
+      success: true,
+      thumbnailKey: 'thumbnails/thumb_ext204_clip.jpg',
+      placeholder: false,
+      metadata: { duration: 3 },
+    });
+
+    const { processPhoto } = require('../../src/services/photoProcessor');
+    await processPhoto(204);
+
+    expect(imageProcessor.withLocalCopy).not.toHaveBeenCalled();
+    expect(videoProcessor.processUploadedVideo).toHaveBeenCalledWith(
+      '/mnt/media/shoot/clip.mp4',
+      'thumbnails/thumb_ext204_clip.jpg'
+    );
+    const finalUpdate = dbModule.__recorded().updateCalls.pop();
+    expect(finalUpdate.data.processing_status).toBe('complete');
+    // The retry produced a real frame: the note is cleared.
+    expect(finalUpdate.data.processing_error).toBeNull();
+    expect(finalUpdate.data.thumbnail_path).toBe('thumbnails/thumb_ext204_clip.jpg');
   });
 
   it('keeps a video complete with a placeholder thumbnail when ffmpeg fails', async () => {
@@ -259,6 +350,48 @@ describe('photoProcessor.processPhoto', () => {
     expect(imageProcessor.generateVideoPlaceholder).toHaveBeenCalledWith('drone-clip.mp4');
     expect(finalUpdate.data.duration).toBe(42);
     expect(finalUpdate.data.video_codec).toBe('hevc');
+    // The reason stays on the row (issue 1430, item 6).
+    expect(finalUpdate.data.processing_error).toBe('No poster frame: ffmpeg exited with code 1');
+  });
+
+  it('queues a completed video only while a video setting (copies, metadata stripping) is on (issues 1430, 2102)', async () => {
+    const { queuesVideos: isEnabled } = require('../../src/services/videoRenditionService');
+    const videoRow = {
+      id: 204, event_id: 9, filename: 'reel.mov', mime_type: 'video/quicktime', media_type: 'video', size_bytes: 1,
+    };
+    dbModule.__setEvent({ id: 9, slug: 'wedding', event_name: 'Wedding' });
+    videoProcessor.processUploadedVideo.mockResolvedValue({ thumbnailKey: 'thumbnails/thumb_reel.jpg', metadata: null });
+    const { processPhoto } = require('../../src/services/photoProcessor');
+
+    dbModule.__setPhoto(videoRow);
+    await processPhoto(204);
+    expect(dbModule.__recorded().updateCalls.pop().data).not.toHaveProperty('web_status');
+
+    isEnabled.mockResolvedValueOnce(true);
+    dbModule.__setPhoto(videoRow);
+    await processPhoto(204);
+    // Same UPDATE as the completion, so a crash in between cannot leave a
+    // complete video unqueued.
+    expect(dbModule.__recorded().updateCalls.pop().data).toMatchObject({ processing_status: 'complete', web_status: 'pending' });
+
+    // Never for a photo, whatever the setting says.
+    isEnabled.mockResolvedValueOnce(true);
+    dbModule.__setPhoto({ id: 205, event_id: 9, filename: 'still.jpg', mime_type: 'image/jpeg', media_type: 'image', size_bytes: 1 });
+    imageProcessor.generateThumbnail.mockResolvedValueOnce('thumbnails/thumb_still.jpg');
+    await processPhoto(205);
+    expect(dbModule.__recorded().updateCalls.pop().data).not.toHaveProperty('web_status');
+  });
+
+  it('keeps completed media complete when its quota work-hold release fails', async () => {
+    dbModule.__setPhoto({ id: 102, event_id: 5, filename: 'ordinary.jpg', original_filename: 'ordinary.jpg',
+      mime_type: 'image/jpeg', media_type: 'image', size_bytes: 12, captured_at: '2026-04-25T12:00:00Z' });
+    dbModule.__setEvent({ id: 5, slug: 'owned', event_name: 'Owned' });
+    imageProcessor.generateThumbnail.mockResolvedValueOnce('thumbnails/ordinary.jpg');
+    require('../../src/services/publicUploadQuota').processingComplete.mockRejectedValueOnce(new Error('owned accounting failure'));
+    const result = await require('../../src/services/photoProcessor').processPhoto(102);
+    expect(result.processing_status).toBe('complete');
+    expect(require('../../src/utils/logger').warn).toHaveBeenCalledWith('Public upload processing settled but quota hold remains',
+      expect.objectContaining({ photoId: 102 }));
   });
 
   it('throws when the photo row no longer exists', async () => {
@@ -266,6 +399,7 @@ describe('photoProcessor.processPhoto', () => {
     dbModule.__setEvent({ id: 1 });
     const { processPhoto } = require('../../src/services/photoProcessor');
     await expect(processPhoto(999)).rejects.toThrow(/Photo 999 not found/);
+    expect(require('../../src/services/publicUploadQuota').processingComplete).not.toHaveBeenCalled();
   });
 });
 

@@ -15,27 +15,36 @@
 // used as-is — we never replay the backup's DDL.
 
 const fs = require('fs');
-const fsp = require('fs').promises;
 const path = require('path');
-const os = require('os');
-const StreamZip = require('node-stream-zip');
-const { pipeline } = require('stream/promises');
-const { Transform, Writable } = require('stream');
-const { assertZipEntriesWithin } = require('../utils/safePath');
+const { TextDecoder } = require('util');
+const boundedArchive = require('./portableImportArchive');
 const { STORED_PATH_COLUMNS, relocateStoredPath } = require('../utils/storedPath');
 const { db } = require('../database/db');
 const knexConfig = require('../../knexfile');
-const { getStoragePath } = require('../config/storage');
 const { hasColumnCached } = require('../utils/schemaCache');
-const { setSessionsValidAfter } = require('../utils/sessionCutoff');
 const logger = require('../utils/logger');
-const { PICPEAK_FORMAT_VERSION, EXCLUDED_TABLES, listDataTables } = require('./picpeakExportService');
+const { PICPEAK_FORMAT_VERSION } = require('./picpeakExportService');
 const { normaliseSqliteEmailQueue } = require('../utils/queueTimestamps');
+const { canonicaliseSqliteExpiresAt } = require('../utils/expiresAtText');
+const { rowBatches } = require('./portableImportRows');
 const {
   dedupeExternalPhotos,
   createExternalRelpathIndex,
   dropExternalRelpathIndex,
 } = require('./externalPhotoDedupe');
+const {
+  ratingIndexesSupported,
+  dedupeRatings,
+  createRatingIndexes,
+  dropRatingIndexes,
+  backfillCommentCounts,
+} = require('./feedbackIntegrity');
+const {
+  hardenAccountRecoveryStorage,
+  installAccountRecoveryWriteGuards,
+  protectQueuedPasswords,
+  removeAccountRecoveryWriteGuards,
+} = require('./accountRecoveryStorageHardening');
 
 const isPostgres = () => knexConfig.client === 'pg';
 
@@ -45,140 +54,88 @@ function migrationOrder(name) {
   return m ? parseInt(m[1], 10) : -1;
 }
 
-// What an uploaded .picpeak may expand to. The upload itself is capped by
-// multer, but a small archive can inflate far beyond it, and extraction used to
-// write every entry to the temp dir unchecked. The sizes an archive declares
-// are only a first, cheap check: a crafted archive can understate them (local
-// headers override the directory, and a data-descriptor flag turns off
-// node-stream-zip's length check), so the bytes actually decompressed are
-// counted as well, while extracting and while reading the manifest. Defaults
-// are generous (a full backup includes every photo); the free space of the
-// extraction directory is what actually protects the disk.
-const DEFAULT_MAX_ENTRIES = 2000000;
-const DEFAULT_MAX_EXPANDED_BYTES = 1024 * 1024 * 1024 * 1024; // 1 TiB
-const DEFAULT_MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
-
-function positiveEnvNumber(name, fallback) {
-  const value = Number(process.env[name]);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
 function archiveLimitError(message, statusCode) {
   const err = new Error(message);
   err.statusCode = statusCode;
   return err;
 }
 
-async function freeBytes(dir) {
-  if (typeof fsp.statfs !== 'function') return Infinity;
-  const stats = await fsp.statfs(dir);
-  const available = Number(stats.bavail) * Number(stats.bsize);
-  return Number.isFinite(available) ? available : Infinity;
-}
-
-function expandedTooLarge(bytes, maxBytes, available) {
-  return available < maxBytes
-    ? archiveLimitError(
-      `The backup expands to more than ${bytes > available ? bytes : available} bytes, but only ${available} bytes are free for extracting it.`,
-      507,
-    )
-    : archiveLimitError(
-      `The backup expands to more than the limit of ${maxBytes} bytes (PICPEAK_IMPORT_MAX_EXPANDED_BYTES).`,
-      413,
-    );
-}
+// The exporter writes exactly these storage subtrees under files/
+// (picpeakExportService: DOC_DIRS, PHOTO_DIRS, and legacy documents, which
+// isPlaceablePath keeps under the DOC_DIRS). Everything else in an archive
+// was not produced by PicPeak and is refused before any live state changes:
+// the import copies files/ into STORAGE_PATH as-is, and some of that tree is
+// served publicly (fonts/, uploads/logos, uploads/favicons).
+const IMPORT_FILE_ROOTS = ['business-docs', 'uploads', 'transfers', 'events/active', 'events/archived',
+  'thumbnails', 'previews', 'heroes', 'videos', 'watermarks'];
+// The storage subtrees (inside the roots above) that the app serves as
+// static web content, without authentication:
+//   uploads/logos     backend/server.js `app.use('/uploads/logos', secureStatic(...))`
+//   uploads/favicons  backend/server.js `app.use('/uploads/favicons', secureStatic(...))`,
+//                     and the /favicon.ico handler, which streams from both
+// frontend/nginx.conf proxies `location ^~ /uploads` to those mounts and
+// serves no storage path itself. fonts/ is served too but is not an import
+// root; /photos and /thumbnails are no longer mounted. Everything else under
+// the roots — transfer attachments (uploads/transfers/<id>/...), signed
+// contracts, business documents, event media — is handed out by authorised
+// routes as an attachment under its stored name, never as a page.
+const IMPORT_PUBLICLY_SERVED_PREFIXES = ['uploads/logos', 'uploads/favicons'];
+// Active web content must never land in a served subtree through an archive.
+// SVG is deliberately not here: it is a supported logo format and
+// secureStatic serves it under a script-blocking CSP. Outside the served
+// subtrees the extension is just a name: a client may well have uploaded
+// `payload.js` or `page.html` to a transfer, and a genuine export carries it.
+const IMPORT_FORBIDDEN_EXTENSIONS = new Set(['.html', '.htm', '.xhtml', '.xht', '.shtml', '.js', '.mjs', '.cjs']);
 
 /**
- * Refuse, from what the archive declares, an archive with more entries
- * (files and directories alike: each one is created on disk) than the cap, or
- * whose declared size exceeds the byte cap or the free space of the directory
- * it is about to be extracted to. The declared sizes can understate, so
- * extractWithinLimits() enforces the same budget on the real bytes.
+ * Why a storage-relative file path from an archive's files/ tree may not be
+ * restored, or null when it may. `rel` is POSIX, without the files/ prefix.
  */
-async function assertArchiveWithinLimits(entries, extractDir) {
-  const maxEntries = positiveEnvNumber('PICPEAK_IMPORT_MAX_ENTRIES', DEFAULT_MAX_ENTRIES);
-  const maxBytes = positiveEnvNumber('PICPEAK_IMPORT_MAX_EXPANDED_BYTES', DEFAULT_MAX_EXPANDED_BYTES);
-  let count = 0;
-  let total = 0;
+function importFilePathProblem(rel) {
+  const parts = rel.split('/');
+  if (parts.some((p) => !p || p === '.' || p === '..')) return 'malformed path';
+  const root = IMPORT_FILE_ROOTS.find((r) => rel === r || rel.startsWith(`${r}/`));
+  if (!root || rel === root) return `not under an exported storage folder (${IMPORT_FILE_ROOTS.join(', ')})`;
+  // Compared case-insensitively: a case-insensitive filesystem would land
+  // `uploads/Logos/x.html` in the served directory all the same.
+  const lower = rel.toLowerCase();
+  const served = IMPORT_PUBLICLY_SERVED_PREFIXES.some((prefix) => lower.startsWith(`${prefix}/`));
+  if (served && IMPORT_FORBIDDEN_EXTENSIONS.has(path.posix.extname(lower))) return 'active web content';
+  return null;
+}
+
+/** Refuse an archive whose files/ entries the exporter could not have written. */
+function assertFilesEntriesAllowed(entries) {
   for (const entry of entries || []) {
-    if (!entry) continue;
-    count += 1;
-    if (!entry.isDirectory) total += Number(entry.size) || 0;
-  }
-  if (count > maxEntries) {
-    throw archiveLimitError(
-      `The backup contains ${count} entries, more than the limit of ${maxEntries} (PICPEAK_IMPORT_MAX_ENTRIES).`,
-      413,
-    );
-  }
-  const available = await freeBytes(extractDir);
-  if (total > Math.min(maxBytes, available)) throw expandedTooLarge(total, maxBytes, available);
-  return { entries: count, expandedBytes: total };
-}
-
-/** A pass-through stream that fails once more than `budget.remaining` bytes went through it. */
-function byteBudget(budget, onExceed) {
-  return new Transform({
-    transform(chunk, _encoding, callback) {
-      budget.remaining -= chunk.length;
-      if (budget.remaining < 0) return callback(onExceed());
-      return callback(null, chunk);
-    },
-  });
-}
-
-/**
- * Extract every entry into extractDir, counting the bytes actually
- * decompressed against the smaller of the byte cap and the free space, and
- * stopping at the first byte over. Entry names were checked for traversal by
- * assertZipEntriesWithin() before this runs.
- */
-async function extractWithinLimits(zip, entries, extractDir) {
-  const maxBytes = positiveEnvNumber('PICPEAK_IMPORT_MAX_EXPANDED_BYTES', DEFAULT_MAX_EXPANDED_BYTES);
-  const available = await freeBytes(extractDir);
-  const limit = Math.min(maxBytes, available);
-  const budget = { remaining: limit };
-  const root = path.resolve(extractDir);
-  for (const entry of entries) {
-    const target = path.resolve(root, entry.name);
-    if (entry.isDirectory) {
-      await fsp.mkdir(target, { recursive: true });
-      continue;
+    if (!entry || !entry.name || entry.isDirectory) continue;
+    const name = String(entry.name).replace(/\\/g, '/');
+    if (!name.startsWith('files/')) continue;
+    const problem = importFilePathProblem(name.slice('files/'.length));
+    if (problem) {
+      const err = archiveLimitError(`Archive contains a file PicPeak would not have exported (${problem}): ${name}`, 400);
+      err.code = 'UNSUPPORTED_ARCHIVE_FILE';
+      throw err;
     }
-    await fsp.mkdir(path.dirname(target), { recursive: true });
-    await pipeline(
-      await zip.stream(entry.name),
-      byteBudget(budget, () => expandedTooLarge(limit - budget.remaining, maxBytes, available)),
-      fs.createWriteStream(target),
-    );
   }
-  return { expandedBytes: limit - budget.remaining };
 }
 
-/** Read one entry into memory, refusing it past maxBytes of real content. */
-async function readEntryWithin(zip, name, maxBytes, onExceed) {
-  const chunks = [];
-  await pipeline(
-    await zip.stream(name),
-    byteBudget({ remaining: maxBytes }, onExceed),
-    new Writable({
-      write(chunk, _encoding, callback) { chunks.push(chunk); callback(); },
-    }),
-  );
-  return Buffer.concat(chunks);
+// Compatibility exports share the exact bounded archive boundary used by the
+// supervised worker. Preview enumeration is also bounded before entry storage.
+function assertArchiveWithinLimits(entries, extractDir, options = {}) {
+  return boundedArchive.assertArchiveWithinLimits(entries, extractDir,
+    { ...options, validateFileKey: importFilePathProblem });
 }
-
+function extractWithinLimits(zip, entries, extractDir, options = {}) {
+  return boundedArchive.extractWithinLimits(zip, entries, extractDir,
+    { ...options, validateFileKey: importFilePathProblem });
+}
 async function readManifestFromZip(picpeakPath) {
-  const zip = new StreamZip.async({ file: picpeakPath });
+  const zip = await boundedArchive.openBoundedArchive(picpeakPath, { validateFileKey: importFilePathProblem });
   try {
-    const maxManifestBytes = positiveEnvNumber('PICPEAK_IMPORT_MAX_MANIFEST_BYTES', DEFAULT_MAX_MANIFEST_BYTES);
     const tooLarge = () => archiveLimitError('The backup manifest is too large to be a PicPeak manifest.', 400);
-    const entry = await zip.entry('manifest.json');
-    if (entry && Number(entry.size) > maxManifestBytes) throw tooLarge();
-    return JSON.parse((await readEntryWithin(zip, 'manifest.json', maxManifestBytes, tooLarge)).toString('utf8'));
-  } finally {
-    await zip.close();
-  }
+    const bytes = await boundedArchive.readEntryWithin(zip, 'manifest.json', boundedArchive.limits().manifestBytes, tooLarge);
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } finally { await zip.close(); }
 }
 
 // Returns an array of human-readable blockers ([] = OK to restore).
@@ -215,15 +172,6 @@ async function validateManifest(manifest) {
     errors.push('This backup is from a newer database schema than this instance. Update this instance to at least the backup version before restoring.');
   }
   return errors;
-}
-
-function parseNdjson(filePath) {
-  if (!fs.existsSync(filePath)) return [];
-  return fs
-    .readFileSync(filePath, 'utf8')
-    .split('\n')
-    .filter((l) => l.trim().length > 0)
-    .map((l) => JSON.parse(l));
 }
 
 // Re-insert the operator's account inside the restore transaction so they keep
@@ -300,16 +248,47 @@ async function reinjectCurrentAdmin(trx, currentAdmin) {
   }
 }
 
+// The operator's passkeys (migration 295) are login credentials like the
+// password and the TOTP secret above, but live in their own table, which the
+// restore replaces with the archive's rows. Left alone, the operator would lose
+// their own keys, and any archived key attached to the account the operator
+// ends up on could sign in as them without the password or the second factor.
+// captureOperatorPasskeys() reads the rows before the wipe;
+// preserveOperatorPasskeys() makes them the only keys of the operator's row.
+const PASSKEY_TABLE = 'admin_webauthn_credentials';
+
+async function captureOperatorPasskeys(executor, adminId) {
+  if (!adminId || !(await executor.schema.hasTable(PASSKEY_TABLE))) return [];
+  return executor(PASSKEY_TABLE).where({ admin_user_id: adminId }).orderBy('id');
+}
+
+async function preserveOperatorPasskeys(trx, operatorId, passkeys) {
+  if (!operatorId || !(await trx.schema.hasTable(PASSKEY_TABLE))) return;
+  // Every archived key on the operator's row goes, whether the row came from
+  // the archive or is new: FK checks are suspended during the load, so the
+  // archive can carry keys for an id it holds no account for.
+  await trx(PASSKEY_TABLE).where({ admin_user_id: operatorId }).del();
+  if (!passkeys || !passkeys.length) return;
+  // credential_id is unique. An archived row claiming one of the operator's
+  // credential ids for another account loses to the operator's own.
+  await trx(PASSKEY_TABLE).whereIn('credential_id', passkeys.map((row) => row.credential_id)).del();
+  // Explicit ids, for the reason reinjectCurrentAdmin gives: batchInsert left
+  // the Postgres sequence unadvanced.
+  const maxRow = await trx(PASSKEY_TABLE).max({ m: 'id' }).first();
+  let nextId = Number(maxRow && maxRow.m) || 0;
+  await trx(PASSKEY_TABLE).insert(passkeys.map((row) => ({ ...row, id: ++nextId, admin_user_id: operatorId })));
+}
+
 // Capture the operator's role and its granted permission NAMES before the wipe,
 // so preserveOperatorRole() can re-establish the operator's authorization after
 // the RBAC tables are replaced. Permission NAMES (not ids) are captured because
 // the restored permissions table reassigns ids. Returns null if the operator
 // has no role.
-async function captureOperatorRole(roleId) {
+async function captureOperatorRole(roleId, executor = db) {
   if (!roleId) return null;
-  const role = await db('roles').where({ id: roleId }).first();
+  const role = await executor('roles').where({ id: roleId }).first();
   if (!role) return null;
-  const permissions = await db('role_permissions')
+  const permissions = await executor('role_permissions')
     .join('permissions', 'permissions.id', 'role_permissions.permission_id')
     .where('role_permissions.role_id', roleId)
     .pluck('permissions.name');
@@ -359,19 +338,20 @@ async function preserveOperatorRole(trx, operatorId, snapshot) {
 // pg_get_serial_sequence RAISES on a table lacking an `id` column (e.g. the
 // composite-key role_permissions), so an unguarded call would abort here.
 // No-op on SQLite, whose AUTOINCREMENT tracks the high-water mark itself.
-async function resyncSequences(tables) {
+async function resyncSequences(tables, { executor = db, strict = false } = {}) {
   if (!isPostgres()) return;
   for (const table of tables) {
     try {
-      if (!(await db.schema.hasColumn(table, 'id'))) continue;
-      const res = await db.raw('SELECT pg_get_serial_sequence(?, ?) AS seq', [table, 'id']);
+      if (!(await executor.schema.hasColumn(table, 'id'))) continue;
+      const res = await executor.raw('SELECT pg_get_serial_sequence(?, ?) AS seq', [table, 'id']);
       const seq = res && res.rows && res.rows[0] && res.rows[0].seq;
       if (!seq) continue; // `id` isn't a serial/identity column
-      await db.raw(
+      await executor.raw(
         'SELECT setval(?, (SELECT COALESCE(MAX(id), 1) FROM ??), (SELECT MAX(id) IS NOT NULL FROM ??))',
         [seq, table, table]
       );
     } catch (err) {
+      if (strict) throw err;
       logger.warn(`[picpeak-import] could not resync sequence for ${table}: ${err.message}`);
     }
   }
@@ -540,6 +520,7 @@ function relocateStoredPaths(table, rows, filesDir) {
 // archive lacks keeps its LOCAL rows across the restore, which is the #1586
 // leak shape this clear exists to close.
 const SEED_ONLY_TABLES = new Set([
+  'public_upload_lock',          // 276 — id=1 serialization singleton, no user data; old archives must not erase it
   'product_usage_state',        // migrations/core/201_product_usage.js — id=1 singleton; UsageService.status() dereferences it unguarded
   'ledger_accounts',             // migrations/core/129_create_ledger_accounts_and_vat_codes.js — Swiss/LI chart of accounts
   'vat_codes',                   // migrations/core/129_create_ledger_accounts_and_vat_codes.js — MWST codes, FK to ledger_accounts
@@ -554,8 +535,9 @@ const SEED_ONLY_TABLES = new Set([
 // session_replication_role=replica on the trx connection, reset before commit;
 // sqlite: defer_foreign_keys so checks run at commit). knex_migrations is never
 // in the data set, so the target's schema/migration state is left intact.
-async function replaceAllTables(tables, dataDir, currentAdmin, roleSnapshot, { crossEngine = false, allTables } = {}) {
-  await db.transaction(async (trx) => {
+async function replaceAllTables(tables, dataDir, currentAdmin, roleSnapshot, { crossEngine = false, allTables, executor } = {}) {
+  await require('./portableRestoreWorker').assertWorkerAuthority(executor);
+  const replace = async trx => {
     if (isPostgres()) {
       try {
         await trx.raw('SET session_replication_role = \'replica\'');
@@ -574,6 +556,11 @@ async function replaceAllTables(tables, dataDir, currentAdmin, roleSnapshot, { c
       await trx.raw('PRAGMA defer_foreign_keys = ON');
     }
 
+    // A portable archive can predate the recovery-token storage migration.
+    // Temporarily remove the write boundary so those legacy rows can be
+    // loaded, then harden them and restore the boundary before commit.
+    await removeAccountRecoveryWriteGuards(trx);
+
     // Suspending FK enforcement does not suspend UNIQUE indexes on either
     // engine (#1162). A backup taken before migration 186 carries the
     // duplicate photo rows that migration exists to remove, so batchInsert
@@ -586,6 +573,10 @@ async function replaceAllTables(tables, dataDir, currentAdmin, roleSnapshot, { c
       hadRelpathIndex = true;
       await dropExternalRelpathIndex(trx);
     }
+    // Same for the one-rating-per-guest indexes (issue 2075): a backup taken
+    // before migration 309 can carry the duplicate ratings it collapses.
+    const hadRatingIndexes = await ratingIndexesSupported(trx);
+    if (hadRatingIndexes) await dropRatingIndexes(trx);
 
     // Clear every table the CURRENT schema exports (`allTables`), not just
     // the tables this archive's manifest lists (`tables`, a subset of it).
@@ -608,12 +599,19 @@ async function replaceAllTables(tables, dataDir, currentAdmin, roleSnapshot, { c
     // the reinsert loop below replaces it with the archive's rows, and
     // skipping the clear would leave stale local rows colliding with the
     // reinserted ones on unique constraints (e.g. ledger_accounts.number).
+    const operatorPasskeys = await captureOperatorPasskeys(trx, currentAdmin && currentAdmin.id);
+
     const manifestTableSet = new Set(tables);
     const tablesToClear = new Set(allTables || tables);
     // Download limit grants (issue 1560) too: an archive made before they
     // existed would leave local grants on restored photos whose ids happen
     // to match, using up those galleries' quotas.
     if (await trx.schema.hasTable('event_download_grants')) tablesToClear.add('event_download_grants');
+    // Mail ledgers contain installation-specific runtime state, not lookup
+    // seeds. Clear local copies even when a pre-275 archive cannot list them.
+    for (const table of ['mail_intake_state', 'mail_intake_files']) {
+      if (await trx.schema.hasTable(table)) tablesToClear.add(table);
+    }
     for (const table of tablesToClear) {
       if (SEED_ONLY_TABLES.has(table) && !manifestTableSet.has(table)) continue;
       await trx(table).del();
@@ -633,28 +631,38 @@ async function replaceAllTables(tables, dataDir, currentAdmin, roleSnapshot, { c
       }
     }
 
+    // An archive made before migration 311 carries no rendition_version, and
+    // its photos would take the column default (1, "already stripped") while
+    // the renditions restored with them still carry the source's EXIF (issue
+    // 2096). Such rows come back as 0, so the background refresh cleans them.
+    const markLegacyRenditions = tables.includes('photos') && await trx.schema.hasColumn('photos', 'rendition_version');
+
     for (const table of tables) {
-      const rows = parseNdjson(path.join(dataDir, `${table}.ndjson`));
-      if (!rows.length) continue;
       const jsonCols = await jsonColumnsFor(trx, table);
-      let prepared = rows;
-      let toSerialise = jsonCols;
-      if (crossEngine) {
-        prepared = coerceForTargetEngine(prepared, await typedColumnsFor(trx, table));
-        // A sqlite-sourced archive already carries JSON columns as valid JSON
-        // TEXT, which is exactly what pg wants. Serialising again would store
-        // `{"a":1}` as the scalar string "{\"a\":1}" and would turn the JSON
-        // literal `null` into SQL NULL.
-        toSerialise = new Set();
+      const types = crossEngine ? await typedColumnsFor(trx, table) : null;
+      for await (const rows of rowBatches(path.join(dataDir, `${table}.ndjson`), { allowMissing: true })) {
+        let prepared = rows;
+        if (crossEngine) prepared = coerceForTargetEngine(prepared, types);
+        // SQLite JSON is already serialized; PG JSON values need serialization.
+        prepared = serialiseJsonColumns(prepared, crossEngine ? new Set() : jsonCols);
+        prepared = relocateStoredPaths(table, prepared, path.join(path.dirname(dataDir), 'files'));
+        assertContainedPaths(table, prepared);
+        if (table === 'photos' && markLegacyRenditions) {
+          prepared = prepared.map((row) => (row.rendition_version === undefined ? { ...row, rendition_version: 0 } : row));
+        }
+        await trx.batchInsert(table, prepared, prepared.length);
       }
-      prepared = serialiseJsonColumns(prepared, toSerialise);
-      prepared = relocateStoredPaths(table, prepared, path.join(path.dirname(dataDir), 'files'));
-      assertContainedPaths(table, prepared);
-      await trx.batchInsert(table, prepared, 100);
       // Archived queue rows come back as they were, text timestamps included,
       // and migration 256 will not run again on this target (issue 1670).
       if (table === 'email_queue') await normaliseSqliteEmailQueue(trx);
+      // Likewise events.expires_at text that julianday() cannot read, which
+      // migration 263 rewrote once on this target (issue 1733).
+      if (table === 'events') await canonicaliseSqliteExpiresAt(trx);
     }
+
+    // Rebuild only missing legacy accounting from the RESTORED rows in this
+    // same transaction. Modern archives keep their rate/audit reservations.
+    await require('../utils/mailIntakeLedger').backfillMailIntake(trx);
 
     // Restore the constraint the load ran without. Deduping first because the
     // incoming rows may be exactly the duplicates migration 186 removes; the
@@ -667,40 +675,37 @@ async function replaceAllTables(tables, dataDir, currentAdmin, roleSnapshot, { c
       }
       await createExternalRelpathIndex(trx);
     }
+    if (hadRatingIndexes) {
+      const removed = await dedupeRatings(trx);
+      if (removed) {
+        logger.info(`picpeakImport: removed ${removed} duplicate rating row(s) from the archive (issue 2075)`);
+      }
+      await createRatingIndexes(trx);
+    }
+    // An archive taken before migration 309 carries the comment_count zeros
+    // that migration backfills (issue 2071); a newer one's counts recount to
+    // the same values.
+    await backfillCommentCounts(trx);
 
     const operatorId = await reinjectCurrentAdmin(trx, currentAdmin);
     if (operatorId && roleSnapshot) {
       await preserveOperatorRole(trx, operatorId, roleSnapshot);
     }
+    await preserveOperatorPasskeys(trx, operatorId, operatorPasskeys);
+
+    await hardenAccountRecoveryStorage(trx);
+    await protectQueuedPasswords(trx);
+    await installAccountRecoveryWriteGuards(trx);
 
     // Reset the pg session flag BEFORE the connection returns to the pool.
     if (isPostgres()) await trx.raw('SET session_replication_role = \'origin\'');
-  });
+  };
+  if (executor) {
+    if (!executor.isTransaction) throw new Error('Portable replacement requires the held restore transaction');
+    await replace(executor);
+  } else await db.transaction(replace);
 }
 
-// Copy the archive's files/ tree into storage, overwriting existing files.
-async function restoreFiles(stagingDir) {
-  const src = path.join(stagingDir, 'files');
-  if (!fs.existsSync(src)) return 0;
-  const storageRoot = getStoragePath();
-  let count = 0;
-  async function walk(rel) {
-    const abs = path.join(src, rel);
-    for (const entry of await fsp.readdir(abs, { withFileTypes: true })) {
-      const childRel = path.join(rel, entry.name);
-      if (entry.isDirectory()) {
-        await walk(childRel);
-      } else if (entry.isFile()) {
-        const dest = path.join(storageRoot, childRel);
-        await fsp.mkdir(path.dirname(dest), { recursive: true });
-        await fsp.copyFile(path.join(src, childRel), dest);
-        count += 1;
-      }
-    }
-  }
-  await walk('');
-  return count;
-}
 
 // Does the restored data reference an external-media library? If so the caller
 // shows a banner telling the admin to (re)configure the external-media mount on
@@ -728,179 +733,33 @@ async function detectExternalMedia() {
  * @param {number} [opts.currentAdminId]  admin to preserve across the wipe
  * @returns {Promise<{restored:boolean, tables:number, filesRestored:number, usesExternalMedia:boolean, crossEngine:boolean, manifest:object}>}
  */
-async function importFromPicpeak({ picpeakPath, currentAdminId }) {
-  const manifest = await readManifestFromZip(picpeakPath);
-  const blockers = await validateManifest(manifest);
-  if (blockers.length) {
-    const err = new Error(blockers[0]);
-    err.statusCode = 400;
-    err.validation = blockers;
-    throw err;
-  }
+async function importFromPicpeak({ picpeakPath, currentAdminId, migrationStorageIndexPath }) {
+  // All mutable entry points, including the stopped-server engine CLI, use the
+  // same persistent fence and actual resource-limited Linux worker.
+  const options = migrationStorageIndexPath === undefined ? {} : { migrationStorageIndexPath };
+  return require('./portableRestoreCoordinator').restoreOffline({
+    archivePath: picpeakPath, currentAdminId, options,
+  });
+}
 
-  // Archives predating the manifest engine field get the target's engine —
-  // i.e. the exact same-engine behavior. After validateManifest, a mismatch
-  // can only be sqlite → pg.
-  const targetEngine = isPostgres() ? 'pg' : 'sqlite';
-  const sourceEngine = (manifest.database && manifest.database.engine) || targetEngine;
-  const crossEngine = sourceEngine !== targetEngine;
-  if (crossEngine) {
-    logger.info(`[picpeak-import] cross-engine restore: ${sourceEngine} backup onto ${targetEngine} instance`);
-  }
+async function importInMaintenanceWorker() {
+  return require('./portableImportMaintenance').importInMaintenanceWorker();
+}
 
-  const currentAdmin = currentAdminId
-    ? await db('admin_users').where({ id: currentAdminId }).first()
-    : null;
-  // Capture the operator's role + granted permission names BEFORE the wipe so
-  // their authorization can be re-established after the RBAC tables are replaced.
-  const roleSnapshot = currentAdmin ? await captureOperatorRole(currentAdmin.role_id) : null;
-
-  const staging = await fsp.mkdtemp(path.join(os.tmpdir(), 'picpeak-import-'));
-  try {
-    const zip = new StreamZip.async({ file: picpeakPath });
-    try {
-      // Reject ZIP-slip entries before extracting — a crafted .picpeak could
-      // otherwise write outside the staging dir via `../` entry names
-      // (same class as GHSA-jfhw-fj23-fx6x).
-      const entries = Object.values(await zip.entries());
-      assertZipEntriesWithin(entries, staging);
-      await assertArchiveWithinLimits(entries, staging);
-      await extractWithinLimits(zip, entries, staging);
-    } finally {
-      await zip.close();
-    }
-
-    const dataDir = path.join(staging, 'data');
-    // `tables` (loaded from the archive) is restricted to tables that (a) the
-    // uploaded manifest lists AND (b) actually exist as real tables in THIS
-    // database. listDataTables() already excludes knex_migrations/_lock
-    // (EXCLUDED_TABLES), so a crafted or corrupted .picpeak can never make
-    // the restore delete the migration bookkeeping — or any table that isn't
-    // a genuine data table here.
-    //
-    // `dbTables` itself (every real, non-excluded table in THIS database) is
-    // also passed to replaceAllTables as the CLEARING set (#1586): a table
-    // this instance has but the archive's manifest doesn't list still gets
-    // wiped, so a feature added after the archive was made doesn't leave
-    // local rows behind attached to reused ids from the restore.
-    const dbTables = new Set(await listDataTables());
-    const manifestTables = Object.keys(manifest.tables || {});
-    const tables = manifestTables.filter((tbl) => dbTables.has(tbl) && !EXCLUDED_TABLES.has(tbl));
-    const skipped = manifestTables.filter((tbl) => !tables.includes(tbl));
-    if (skipped.length) {
-      logger.warn(`[picpeak-import] ignoring ${skipped.length} backup table(s) not present in this DB (or protected): ${skipped.join(', ')}`);
-    }
-
-    await replaceAllTables(tables, dataDir, currentAdmin, roleSnapshot, { crossEngine, allTables: [...dbTables] });
-
-    // Post-commit fixups (must NOT run inside the restore transaction):
-    //  - resync Postgres identity sequences left behind by the explicit-id
-    //    batchInsert, so the next natural insert doesn't collide;
-    //  - stamp a global session cutoff so every JWT issued before this restore
-    //    (admin, customer, gallery) stops authenticating — ids may have shifted.
-    await resyncSequences(tables);
-    await setSessionsValidAfter(Math.floor(Date.now() / 1000));
-
-
-    const filesRestored = await restoreFiles(staging);
-
-    // External media paths (#1163). knex_migrations is excluded from the
-    // archive, so migration 187 does not re-run after a restore — a pre-#1163
-    // backup would otherwise drop base-relative rows onto an instance that
-    // resolves them from the media root, and every original in the restored
-    // library would be unreachable with nothing logged. The fold is a no-op
-    // when the restored app_settings already carries the marker.
-    //
-    // BEFORE the face requeue below, and for the same reason that requeue sits
-    // after restoreFiles: the worker is live throughout. Queued first, it can
-    // claim an external row while the row is still base-relative, resolve it
-    // against the wrong path with the root-only resolver, and mark the photo
-    // failed — a state only an explicit Re-scan clears, and one the fold does
-    // not undo. Probing a cold mount takes long enough for that to be likely
-    // rather than theoretical.
-    let externalPathsConverted = true;
-    let externalPathError = null;
-    try {
-      const { foldExternalRelpaths } = require('./externalRelpathFold');
-      const result = await foldExternalRelpaths(db, (msg) => logger.info(`picpeakImport: external paths — ${msg}`));
-      if (result.folded || result.repaired) {
-        logger.info(`picpeakImport: folded ${result.folded} external path(s), repaired ${result.repaired}`);
-      }
-    } catch (err) {
-      // NOT swallowed as a footnote. The fold is transactional, so a failure
-      // leaves every external path in the pre-#1163 format while the running
-      // resolver reads from the media root — meaning every original in the
-      // restored library is unreachable. Reporting that as a clean restore
-      // sends the admin away believing it worked.
-      externalPathsConverted = false;
-      externalPathError = err.message;
-      logger.error(`picpeakImport: external path conversion FAILED — originals will not resolve until this is retried: ${err.message}`);
-    }
-    // The standard contract template was checked against the database this
-    // import replaced (#1445).
-    require('./contract/defaultTemplate').forgetEnsured();
-    // A restored profile may still carry the retired PDF font path (#1445),
-    // which the renderer no longer reads; move it now that its file is back.
-    try {
-      await require('./pdf/uploadedFonts').migrateLegacyFont(logger);
-    } catch (err) {
-      logger.warn(`picpeakImport: moving the restored custom PDF font failed: ${err.message}`);
-    }
-    // Face data (#1074): queue ONLY once the files are on disk. The archive
-    // carries no face rows and the export blanked photos.face_status, but the
-    // event toggles come across enabled, so the "enable" transition that
-    // normally triggers a backfill never happens here.
-    //
-    // Ordering matters: the worker is live during a restore. Queued before
-    // restoreFiles, it races the copy and either scans the PREVIOUS
-    // instance's files or marks photos failed for originals that are not
-    // there yet — and nothing re-queues them afterwards.
-    try {
-      if (!externalPathsConverted) {
-        // Queueing now would hand the live worker rows whose paths the
-        // resolver cannot follow, and it would mark them 'failed' — a state
-        // only an explicit Re-scan clears. Leave them unqueued; the operator
-        // re-runs the conversion and then re-scans.
-        logger.warn('picpeakImport: skipping face requeue — external paths are unconverted');
-      } else {
-        const requeued = await db('photos')
-          .whereIn('event_id', db('events').select('id').where('face_recognition_enabled', true))
-          .update({
-            face_status: 'pending', face_count: null, face_started_at: null, face_error: null,
-          });
-        if (requeued > 0) {
-          logger.info(`picpeakImport: queued ${requeued} photo(s) for face detection after import`);
-        }
-      }
-    } catch (err) {
-      logger.debug?.(`picpeakImport: face requeue skipped: ${err.message}`);
-    }
-
-    const usesExternalMedia = await detectExternalMedia();
-
-    logger.info(
-      `[picpeak-import] restored ${tables.length} tables, ${filesRestored} files (externalMedia=${usesExternalMedia}, crossEngine=${crossEngine})`
-    );
-    return {
-      restored: true,
-      tables: tables.length,
-      filesRestored,
-      usesExternalMedia,
-      crossEngine,
-      manifest,
-      // Surfaced so the caller can warn rather than report an unqualified
-      // success: the rows and files are in place, but the external originals
-      // do not resolve until the conversion is retried (#1163).
-      externalPathsConverted,
-      externalPathError,
-    };
-  } finally {
-    await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
-  }
+async function recoverInMaintenanceWorker() {
+  return require('./portableImportMaintenance').recoverInMaintenanceWorker();
 }
 
 module.exports = {
+  importInMaintenanceWorker,
+  recoverInMaintenanceWorker,
+  replaceAllTables,
+  detectExternalMedia,
+  jsonColumnsFor,
+  serialiseJsonColumns,
   assertContainedPaths,
+  assertFilesEntriesAllowed,
+  importFilePathProblem,
   importFromPicpeak,
   readManifestFromZip,
   validateManifest,
@@ -914,6 +773,8 @@ module.exports = {
   reinjectCurrentAdmin,
   captureOperatorRole,
   preserveOperatorRole,
+  captureOperatorPasskeys,
+  preserveOperatorPasskeys,
   resyncSequences,
   SEED_ONLY_TABLES,
 };

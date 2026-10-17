@@ -1,3 +1,9 @@
+> 이 한국어 포크는 아래 공식 게시 워크플로를 비활성화했습니다. 실제 게시 경로는
+> `.github/workflows/aio.yml`이며 검증된 AMD64·ARM64 프런트엔드 오버레이만
+> `ghcr.io/acafela-coffee/picpeak/aio`에 게시합니다. 기준과 운영 절차는
+> [한국어 AIO 운영 안내](../../docs/deployment/korean-aio.md)를 따르세요.
+> 공식 Docker·릴리스·updater 게시 설정은 `.yml.disabled`로 보관합니다.
+
 # Docker Build and Push Workflow
 
 This GitHub Actions workflow automatically builds and pushes Docker images for the backend, the frontend, the all-in-one image and the optional ML sidecar to GitHub Container Registry (ghcr.io). On the canonical org repo every one of them is mirrored to Docker Hub as `docker.io/picpeak/{backend,frontend,aio,ml}`; forks build the same images GHCR-only.

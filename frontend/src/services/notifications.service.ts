@@ -1,6 +1,7 @@
 import { api } from '../config/api';
 import i18n from '../i18n/config';
 import { formatFeatureFlagsChanged } from './admin.service';
+import { mediaSplitLabel, splitMediaCount } from '../utils/mediaCounts';
 
 export interface Notification {
   id: number;
@@ -62,9 +63,17 @@ export const notificationsService = {
           eventName: notification.metadata.event_name 
         });
       case 'photos_uploaded':
-        return t('admin.notificationMessages.photosUploaded', { 
-          count: notification.metadata.count || 0, 
-          eventName: notification.eventName 
+        // Worded by the type split when the upload carried videos (issue
+        // 1430, item 3), same as the dashboard's activity line.
+        if (Number(notification.metadata.videoCount) > 0) {
+          return t('admin.notificationMessages.mediaUploaded', {
+            media: mediaSplitLabel(t, splitMediaCount(notification.metadata.count, notification.metadata.videoCount)),
+            eventName: notification.eventName
+          });
+        }
+        return t('admin.notificationMessages.photosUploaded', {
+          count: notification.metadata.count || 0,
+          eventName: notification.eventName
         });
       case 'photo_deleted':
         return t('admin.notificationMessages.photoDeleted', { eventName: notification.eventName });
@@ -72,6 +81,16 @@ export const notificationsService = {
         return t('admin.notificationMessages.photosBulkDeleted', { 
           count: notification.metadata.count || 0, 
           eventName: notification.eventName 
+        });
+      case 'photos_restored':
+        return t('admin.notificationMessages.photosRestored', {
+          count: notification.metadata.count || 0,
+          eventName: notification.eventName
+        });
+      case 'photos_trash_purged':
+        return t('admin.notificationMessages.photosTrashPurged', {
+          count: notification.metadata.count || 0,
+          eventName: notification.eventName
         });
       case 'event_expiring':
         return t('admin.notificationMessages.eventExpiring', { 
@@ -294,6 +313,27 @@ export const notificationsService = {
         return t('admin.notificationMessages.photoReplaced', { eventName: notification.eventName });
       case 'photo_uploaded':
         return t('admin.notificationMessages.photoUploaded', { eventName: notification.eventName });
+      // Gallery team and review of its uploads (issue 743).
+      case 'event_team_changed':
+        return t('admin.notificationMessages.eventTeamChanged', {
+          eventName: notification.eventName || notification.metadata.eventName,
+        });
+      case 'photos_review_approved':
+        return t('admin.notificationMessages.photosReviewApproved', {
+          count: notification.metadata.count || 0,
+          eventName: notification.eventName || notification.metadata.eventName,
+        });
+      case 'photos_review_rejected':
+        return t('admin.notificationMessages.photosReviewRejected', {
+          count: notification.metadata.count || 0,
+          eventName: notification.eventName || notification.metadata.eventName,
+        });
+      // Guest uploads held for approval (issue 1733).
+      case 'guest_uploads_pending_review':
+        return t('admin.notificationMessages.guestUploadsPendingReview', {
+          count: notification.metadata.count || 0,
+          eventName: notification.eventName || notification.metadata.eventName,
+        });
       case 'category_hero_updated':
         return t('admin.notificationMessages.categoryHeroUpdated');
       case 'public_site_reset_to_default':
@@ -331,24 +371,27 @@ export const notificationsService = {
   getNotificationStyle(type: string): { icon: string; color: string } {
     switch (type) {
       case 'event_created':
-        return { icon: 'Calendar', color: 'text-blue-600' };
+        return { icon: 'Calendar', color: 'text-info-text' };
       case 'event_archived':
-        return { icon: 'Archive', color: 'text-green-600' };
+        return { icon: 'Archive', color: 'text-success-text' };
       case 'event_updated':
       case 'event_deleted':
         return { icon: 'Calendar', color: 'text-gray-600' };
       case 'photos_uploaded':
-        return { icon: 'Image', color: 'text-purple-600' };
+        return { icon: 'Image', color: 'text-chart-4' };
       case 'photo_deleted':
       case 'photos_bulk_deleted':
-        return { icon: 'Image', color: 'text-red-600' };
+      case 'photos_trash_purged':
+        return { icon: 'Image', color: 'text-danger-text' };
+      case 'photos_restored':
+        return { icon: 'Image', color: 'text-success-text' };
       case 'event_expiring':
-        return { icon: 'AlertCircle', color: 'text-amber-600' };
+        return { icon: 'AlertCircle', color: 'text-warning-text' };
       case 'event_expired':
-        return { icon: 'Clock', color: 'text-red-600' };
+        return { icon: 'Clock', color: 'text-danger-text' };
       case 'password_changed':
       case 'password_reset':
-        return { icon: 'Lock', color: 'text-indigo-600' };
+        return { icon: 'Lock', color: 'text-chart-1' };
       case 'settings_updated':
       case 'branding_updated':
       case 'general_settings_updated':
@@ -356,101 +399,107 @@ export const notificationsService = {
       case 'theme_updated':
         return { icon: 'Settings', color: 'text-gray-600' };
       case 'admin_profile_updated':
-        return { icon: 'User', color: 'text-primary-600' };
+        return { icon: 'User', color: 'text-accent' };
       case 'email_template_updated':
       case 'email_config_updated':
-        return { icon: 'Mail', color: 'text-teal-600' };
+        return { icon: 'Mail', color: 'text-chart-2' };
       case 'bulk_download':
-        return { icon: 'Download', color: 'text-cyan-600' };
+        return { icon: 'Download', color: 'text-chart-7' };
       case 'storage_warning':
-        return { icon: 'Database', color: 'text-orange-600' };
+        return { icon: 'Database', color: 'text-chart-8' };
       case 'admin_logout':
         return { icon: 'LogOut', color: 'text-gray-600' };
       case 'category_created':
       case 'category_updated':
       case 'category_deleted':
-        return { icon: 'Folder', color: 'text-indigo-600' };
+        return { icon: 'Folder', color: 'text-chart-1' };
       case 'cms_page_updated':
-        return { icon: 'FileText', color: 'text-green-600' };
+        return { icon: 'FileText', color: 'text-success-text' };
       case 'favicon_uploaded':
-        return { icon: 'Globe', color: 'text-purple-600' };
+        return { icon: 'Globe', color: 'text-chart-4' };
       case 'archive_downloaded':
       case 'archive_deleted':
       case 'archive_restored':
-        return { icon: 'Archive', color: 'text-blue-600' };
+        return { icon: 'Archive', color: 'text-info-text' };
 
       // Feature flag toggles + customer / admin / webhook surfaces. Icon
       // choices favour the tone of the action (settings / users / network)
       // over per-event-type cleverness.
       case 'feature_flags_updated':
-        return { icon: 'ToggleRight', color: 'text-amber-600' };
+        return { icon: 'ToggleRight', color: 'text-warning-text' };
       case 'customer_login':
       case 'customer_event_access':
       case 'customer_self_profile_update':
       case 'customer_password_change':
-        return { icon: 'User', color: 'text-blue-600' };
+        return { icon: 'User', color: 'text-info-text' };
       case 'customer_invitation_created':
       case 'customer_invitation_accepted':
       case 'customer_invitation_cancelled':
-        return { icon: 'Mail', color: 'text-teal-600' };
+        return { icon: 'Mail', color: 'text-chart-2' };
       case 'customer_password_reset_requested':
       case 'customer_password_reset_applied':
-        return { icon: 'Lock', color: 'text-indigo-600' };
+        return { icon: 'Lock', color: 'text-chart-1' };
       case 'customer_updated':
       case 'customer_deactivated':
       case 'customer_reactivated':
         return { icon: 'UserCog', color: 'text-gray-600' };
       case 'customer_erased':
-        return { icon: 'Trash2', color: 'text-red-600' };
+        return { icon: 'Trash2', color: 'text-danger-text' };
       case 'admin_invitation_created':
       case 'admin_invitation_accepted':
       case 'admin_invitation_cancelled':
-        return { icon: 'Mail', color: 'text-teal-600' };
+        return { icon: 'Mail', color: 'text-chart-2' };
       case 'admin_user_updated':
       case 'admin_user_deactivated':
         return { icon: 'UserCog', color: 'text-gray-600' };
       case 'admin_password_reset':
-        return { icon: 'Lock', color: 'text-indigo-600' };
+        return { icon: 'Lock', color: 'text-chart-1' };
       case 'webhook_created':
       case 'webhook_updated':
       case 'webhook_deleted':
-        return { icon: 'Webhook', color: 'text-purple-600' };
+        return { icon: 'Webhook', color: 'text-chart-4' };
       case 'api_token_created':
       case 'api_token_revoked':
-        return { icon: 'Key', color: 'text-orange-600' };
+        return { icon: 'Key', color: 'text-chart-8' };
       case 'event_type_created':
       case 'event_type_updated':
       case 'event_type_deleted':
       case 'event_types_reordered':
-        return { icon: 'Tag', color: 'text-violet-600' };
+        return { icon: 'Tag', color: 'text-chart-4' };
       case 'event_published':
-        return { icon: 'CheckCircle', color: 'text-green-600' };
+        return { icon: 'CheckCircle', color: 'text-success-text' };
       case 'event_logo_uploaded':
       case 'event_logo_removed':
-        return { icon: 'Image', color: 'text-pink-600' };
+        return { icon: 'Image', color: 'text-chart-5' };
       case 'bulk_delete_completed':
-        return { icon: 'Trash2', color: 'text-red-600' };
+        return { icon: 'Trash2', color: 'text-danger-text' };
       case 'photo_replaced':
       case 'photo_uploaded':
-        return { icon: 'Image', color: 'text-purple-600' };
+      case 'photos_review_approved':
+      case 'photos_review_rejected':
+        return { icon: 'Image', color: 'text-chart-4' };
+      case 'guest_uploads_pending_review':
+        return { icon: 'Image', color: 'text-warning-text' };
+      case 'event_team_changed':
+        return { icon: 'User', color: 'text-accent' };
       case 'category_hero_updated':
-        return { icon: 'Folder', color: 'text-indigo-600' };
+        return { icon: 'Folder', color: 'text-chart-1' };
       case 'public_site_reset_to_default':
         return { icon: 'Globe', color: 'text-gray-600' };
       case 'cms_page_logo_uploaded':
-        return { icon: 'FileText', color: 'text-green-600' };
+        return { icon: 'FileText', color: 'text-success-text' };
 
       // Client activity (#746) — guest actions surfaced to the photographer.
       case 'gallery_opened':
-        return { icon: 'Eye', color: 'text-blue-600' };
+        return { icon: 'Eye', color: 'text-info-text' };
       case 'gallery_downloaded':
-        return { icon: 'Download', color: 'text-green-600' };
+        return { icon: 'Download', color: 'text-success-text' };
       case 'api_photo_downloaded':
       case 'api_photos_downloaded':
       case 'api_photos_zip_downloaded':
-        return { icon: 'Download', color: 'text-cyan-600' };
+        return { icon: 'Download', color: 'text-chart-7' };
       case 'photo_favorite':
-        return { icon: 'Heart', color: 'text-pink-600' };
+        return { icon: 'Heart', color: 'text-chart-5' };
       default:
         return { icon: 'Bell', color: 'text-gray-600' };
     }

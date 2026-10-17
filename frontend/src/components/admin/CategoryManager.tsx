@@ -1,23 +1,26 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Plus, Edit2, Trash2, Loader2, ArrowUp, ArrowDown } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { categoriesService, type PhotoCategory } from '../../services/categories.service';
-import { Button } from '../common';
+import { Button, EmptyState, ErrorState, useConfirm } from '../common';
 import { useMutationWithToast, useModal } from '../../hooks';
+import { isImeComposing } from '../../utils/imeComposition';
 
 export const CategoryManager: React.FC = () => {
   const { t } = useTranslation();
+  const confirm = useConfirm();
   const addingModal = useModal();
   const [editingId, setEditingId] = useState<number | null>(null);
   const [newCategoryName, setNewCategoryName] = useState('');
   const [editingName, setEditingName] = useState('');
 
   // Fetch global categories (ordered by the global default display_order)
-  const { data: categories = [], isLoading } = useQuery({
+  const { data, isLoading, isError, isFetching, refetch } = useQuery({
     queryKey: ['global-categories'],
     queryFn: categoriesService.getGlobalCategories,
   });
+  const categories = useMemo(() => data ?? [], [data]);
 
   // Local copy so the up/down reorder buttons feel instant; resynced when the
   // query data changes.
@@ -89,10 +92,13 @@ export const CategoryManager: React.FC = () => {
     }
   };
 
-  const handleDelete = (category: PhotoCategory) => {
-    if (window.confirm(t('categories.deleteConfirm', { name: category.name }))) {
-      deleteMutation.mutate(category.id);
-    }
+  const handleDelete = async (category: PhotoCategory) => {
+    const ok = await confirm({
+      message: t('categories.deleteConfirm', 'Delete the category "{{name}}"? A category that still holds photos cannot be deleted; move them first. This cannot be undone.', { name: category.name }),
+      variant: 'danger',
+      confirmLabel: t('categories.deleteCategoryTitle', 'Delete category'),
+    });
+    if (ok) deleteMutation.mutate(category.id);
   };
 
   const startEdit = (category: PhotoCategory) => {
@@ -136,10 +142,10 @@ export const CategoryManager: React.FC = () => {
             type="text"
             value={newCategoryName}
             onChange={(e) => setNewCategoryName(e.target.value)}
-            onKeyPress={(e) => e.key === 'Enter' && handleCreate()}
+            onKeyPress={(e) => e.key === 'Enter' && !isImeComposing(e) && handleCreate()}
             placeholder={t('categories.categoryName')}
             maxLength={100}
-            className="flex-1 px-3 py-2 border border-line-strong rounded-md bg-panel text-heading focus:ring-2 focus:ring-primary-500"
+            className="flex-1 px-3 py-2 border border-line-strong rounded-md bg-panel text-heading focus:ring-2 focus:ring-accent"
             autoFocus
           />
           <Button
@@ -169,10 +175,10 @@ export const CategoryManager: React.FC = () => {
 
       {/* Categories list */}
       <div className="space-y-2">
-        {ordered.length === 0 ? (
-          <p className="text-muted text-center py-8">
-            {t('categories.noCategoriesYet')}
-          </p>
+        {isError && !data ? (
+          <ErrorState size="inline" onRetry={() => refetch()} retrying={isFetching} />
+        ) : ordered.length === 0 ? (
+          <EmptyState size="inline" title={t('categories.noCategoriesYet')} />
         ) : (
           ordered.map((category, index) => (
             <div
@@ -185,12 +191,15 @@ export const CategoryManager: React.FC = () => {
                     type="text"
                     value={editingName}
                     onChange={(e) => setEditingName(e.target.value)}
-                    onKeyPress={(e) => {
+                    // keydown: browsers fire no keypress for Escape. Escape and
+                    // Enter of an IME composition are the field's.
+                    onKeyDown={(e) => {
+                      if (isImeComposing(e)) return;
                       if (e.key === 'Enter') handleUpdate(category.id);
                       if (e.key === 'Escape') cancelEdit();
                     }}
                     maxLength={100}
-                    className="flex-1 px-3 py-1 border border-line-strong rounded-md bg-panel text-heading focus:ring-2 focus:ring-primary-500"
+                    className="flex-1 px-3 py-1 border border-line-strong rounded-md bg-panel text-heading focus:ring-2 focus:ring-accent"
                     autoFocus
                   />
                   <Button
@@ -222,7 +231,7 @@ export const CategoryManager: React.FC = () => {
                       <button
                         onClick={() => handleMove(index, -1)}
                         disabled={index === 0 || reorderMutation.isPending}
-                        className="p-0.5 text-faint hover:text-accent-dark disabled:opacity-30 disabled:hover:text-neutral-400 transition-colors"
+                        className="p-0.5 text-faint hover:text-accent-dark disabled:opacity-30 disabled:hover:text-faint transition-colors"
                         title={t('categories.moveUp', 'Move up')}
                         aria-label={t('categories.moveUp', 'Move up')}
                       >
@@ -231,7 +240,7 @@ export const CategoryManager: React.FC = () => {
                       <button
                         onClick={() => handleMove(index, 1)}
                         disabled={index === ordered.length - 1 || reorderMutation.isPending}
-                        className="p-0.5 text-faint hover:text-accent-dark disabled:opacity-30 disabled:hover:text-neutral-400 transition-colors"
+                        className="p-0.5 text-faint hover:text-accent-dark disabled:opacity-30 disabled:hover:text-faint transition-colors"
                         title={t('categories.moveDown', 'Move down')}
                         aria-label={t('categories.moveDown', 'Move down')}
                       >
@@ -253,7 +262,7 @@ export const CategoryManager: React.FC = () => {
                     </button>
                     <button
                       onClick={() => handleDelete(category)}
-                      className="p-1.5 text-soft hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 rounded transition-colors"
+                      className="p-1.5 text-soft hover:text-danger-text hover:bg-danger-soft rounded transition-colors"
                       title={t('common.delete')}
                       disabled={deleteMutation.isPending}
                     >

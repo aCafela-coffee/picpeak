@@ -16,6 +16,7 @@ import { GeneralTab } from '../tabs/GeneralTab';
 import type { GeneralSettings } from '../hooks/useSettingsState';
 
 vi.mock('../components/MfaSettingsCard', () => ({ MfaSettingsCard: () => null }));
+vi.mock('../components/PasskeysCard', () => ({ PasskeysCard: () => null }));
 
 const base: GeneralSettings = {
   site_url: '',
@@ -24,6 +25,8 @@ const base: GeneralSettings = {
   default_expiration_days: 30,
   max_file_size_mb: 50,
   max_video_size_mb: 500,
+  video_web_rendition: false,
+  video_strip_metadata: true,
   max_files_per_upload: 500,
   allowed_file_types: 'jpg,png',
   max_upload_batch_size_mb: 95,

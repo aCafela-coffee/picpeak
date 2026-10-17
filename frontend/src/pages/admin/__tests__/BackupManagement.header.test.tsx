@@ -52,7 +52,7 @@ describe('BackupManagement header', () => {
     await renderWithStatus({ lastBackup: failed, lastSuccessfulBackup: completed });
 
     const label = screen.getByText(/backup.status.latestAttemptFailed/);
-    expect(label).toHaveClass('text-red-700');
+    expect(label).toHaveClass('text-danger-text');
     expect(label).toHaveTextContent(`at ${failed.created_at}`);
     expect(screen.getByText(/backup.status.lastSuccessfulBackup/)).toHaveTextContent(`at ${completed.created_at}`);
     expect(screen.queryByText(/backup.status.lastBackup:/)).not.toBeInTheDocument();
@@ -60,12 +60,24 @@ describe('BackupManagement header', () => {
 
   it('shows a running newest attempt in blue', async () => {
     await renderWithStatus({ lastBackup: running, lastSuccessfulBackup: completed });
-    expect(screen.getByText(/backup.status.latestAttemptRunning/)).toHaveClass('text-blue-600');
+    expect(screen.getByText(/backup.status.latestAttemptRunning/)).toHaveClass('text-info-text');
   });
 
   it('shows a completed newest attempt as the last backup, in green', async () => {
     await renderWithStatus({ lastBackup: completed, lastSuccessfulBackup: completed });
     const label = screen.getByText(/backup.status.lastBackup:/);
-    expect(label.previousElementSibling).toHaveClass('text-green-500');
+    expect(label.previousElementSibling).toHaveClass('text-success');
+  });
+
+  it('warns before a backup is started that an unusable signing key will fail it, with the reason', async () => {
+    const reason = 'The backup manifest key file /data/backup-manifest.key is group- or world-writable (mode 0666)';
+    await renderWithStatus({ lastBackup: completed, signingKey: { ready: false, source: 'invalid', keyId: null, reason } });
+    expect(screen.getByText('backup.status.signingKeyInvalid')).toBeInTheDocument();
+    expect(screen.getByText(reason)).toBeInTheDocument();
+  });
+
+  it('shows no key warning while the signing key is usable or not yet created', async () => {
+    await renderWithStatus({ lastBackup: completed, signingKey: { ready: false, source: 'missing', keyId: null } });
+    expect(screen.queryByText('backup.status.signingKeyInvalid')).not.toBeInTheDocument();
   });
 });

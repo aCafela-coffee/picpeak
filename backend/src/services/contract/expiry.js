@@ -38,7 +38,8 @@ const PURGE_AFTER_MS = 30 * DAY_MS;
 // customer's details first.
 const RUNNING = ['sent', 'awaiting_data'];
 
-const task = scheduledTask(() => runContractSigningSweep(), { schedule: '35 * * * *' });
+const task = scheduledTask(() => require('../../database/crmAccess')
+  .withTrustedCrmAccess('shipped contract expiry scheduler', () => runContractSigningSweep()), { schedule: '35 * * * *' });
 const startContractSigningSweep = () => task.start();
 const stopContractSigningSweep = () => task.stop();
 
@@ -175,6 +176,12 @@ async function remindDue(now) {
       if (since == null || now - since < steps[count] * DAY_MS) continue;
       // Someone on the page now keeps their session: a reminder would end it.
       if (await signers.hasActiveSession(row.id, now)) continue;
+      // A customer who takes no administrative emails (migration 300) would
+      // get none of these reminders, but each one still issues a new link (the
+      // old one stops working) and records `reminded` on the signing chain the
+      // audit certificate prints. Skip them: they sign in the portal or on paper.
+      const address = require('../../utils/fieldEncryption').tryDecrypt(row.email_enc) || '';
+      if (await require('../_adminEmailOptOut').isHeldBackFor(contract.customer_account_id, address)) continue;
       try {
         if ((await signingV2.sendReminder(contract.id, row.id, { expectedCount: count })).reminded) sent += 1;
       } catch (err) {

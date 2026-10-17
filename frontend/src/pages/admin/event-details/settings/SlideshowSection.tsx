@@ -80,7 +80,6 @@ export const SlideshowSection: React.FC<{
 
   return (
     <SectionCard
-      title={t('slideshow.adminTitle', 'Live Slideshow')}
       description={t('slideshow.adminDescription', 'A separate fullscreen link for projectors at live events. It shows all published photos and automatically picks up new uploads while running.')}
     >
       {!token ? (
@@ -119,7 +118,7 @@ export const SlideshowSection: React.FC<{
               <Button variant="ghost" size="sm" className="text-xs" leftIcon={<RotateCw className="w-3.5 h-3.5" />} onClick={generate} disabled={busy || !!event.is_archived}>
                 {t('slideshow.regenerate', 'Regenerate')}
               </Button>
-              <Button variant="ghost" size="sm" className="text-xs text-red-600 dark:text-red-400" leftIcon={<Trash2 className="w-3.5 h-3.5" />} onClick={disable} disabled={busy}>
+              <Button variant="ghost" size="sm" className="text-xs text-danger-text" leftIcon={<Trash2 className="w-3.5 h-3.5" />} onClick={disable} disabled={busy}>
                 {t('slideshow.disable', 'Disable')}
               </Button>
             </div>

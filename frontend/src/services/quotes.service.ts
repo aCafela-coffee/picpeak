@@ -82,6 +82,8 @@ export interface QuoteSummary {
      *  customer (no portal access). Drives the Passive badge in the
      *  editor pill + the quotes list. */
     isPassive?: boolean;
+    /** No administrative emails (migration 300): send becomes Issue. */
+    noAdminEmails?: boolean;
   };
   status: QuoteStatus;
   language: string;
@@ -119,6 +121,8 @@ export interface QuoteDetail extends QuoteSummary {
    *  quotes authored before the split. */
   paymentNetDaysTemplateId: number | null;
   paymentTimingTemplateId: number | null;
+  /** Per-quote installment plan (migration 142); null = the timing template's. */
+  installmentsOverride?: PaymentTermInstallment[] | null;
   netAmountMinor: number;
   vatRate: number | null;
   vatAmountMinor: number;

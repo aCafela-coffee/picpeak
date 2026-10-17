@@ -21,6 +21,8 @@ export interface SelectedCustomer {
   id: number;
   email: string;
   displayName: string | null;
+  /** Never invited, so cannot sign in to the portal (password_hash IS NULL). */
+  isPassive?: boolean;
   /** Their customer groups (#1443), when the admin may read customers. */
   groups?: CustomerGroup[];
 }
@@ -120,7 +122,7 @@ export const CustomerAccountPicker: React.FC<Props> = ({ value, onChange, disabl
   }, []);
 
   const select = (c: CustomerAccountSummary) => {
-    onChange([...value, { id: c.id, email: c.email, displayName: c.displayName, groups: c.groups }]);
+    onChange([...value, { id: c.id, email: c.email, displayName: c.displayName, isPassive: c.isPassive, groups: c.groups }]);
     setQuery('');
     setResults([]);
     setIsOpen(false);
@@ -131,7 +133,7 @@ export const CustomerAccountPicker: React.FC<Props> = ({ value, onChange, disabl
   };
 
   const created = (c: CustomerAccountSummary) => {
-    onChange([...value, { id: c.id, email: c.email, displayName: c.displayName, groups: c.groups }]);
+    onChange([...value, { id: c.id, email: c.email, displayName: c.displayName, isPassive: c.isPassive, groups: c.groups }]);
     setIsCreating(false);
     setQuery('');
     setResults([]);
@@ -207,7 +209,7 @@ export const CustomerAccountPicker: React.FC<Props> = ({ value, onChange, disabl
       <>
       {/* Search input */}
       <div className="relative">
-        <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400 pointer-events-none" />
+        <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-faint pointer-events-none" />
         <input
           type="text"
           value={query}
@@ -223,7 +225,7 @@ export const CustomerAccountPicker: React.FC<Props> = ({ value, onChange, disabl
         <button
           type="button"
           onClick={() => { setIsOpen(false); setIsCreating(true); }}
-          className="mt-2 inline-flex items-center gap-1 text-sm text-primary-600 dark:text-primary-400 hover:underline"
+          className="mt-2 inline-flex items-center gap-1 text-sm text-accent hover:underline"
         >
           {t('customers.create.openLink', '+ Create new customer')}
         </button>

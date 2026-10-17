@@ -4,6 +4,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { db } = require('../../database/db');
+const { livePhotos } = require('../../utils/photoVisibility');
 const { formatBoolean } = require('../../utils/dbCompat');
 
 const router = express.Router();
@@ -15,13 +16,16 @@ const { NotFoundError } = require('../../utils/errors');
 const { setGalleryAuthCookies } = require('../../utils/tokenUtils');
 const { getSlideshowGlobals } = require('../../utils/slideshowGlobals');
 const { isFeatureEnabled } = require('../../middleware/requireFeatureFlag');
+const { slideshowCredentialClaim } = require('../../utils/galleryCredentialCutoff');
 
 function slideshowPhotosQuery(eventId, categoryId = null) {
-  const q = db('photos')
+  const q = livePhotos(db)
     .where('photos.event_id', eventId)
     .where(function() {
       this.where('photos.processing_status', 'complete').orWhereNull('photos.processing_status');
     })
+    // A file gone from the share (migration 312) is in no gallery view.
+    .whereNull('photos.unavailable_reason')
     .where(function() {
       this.where('photos.visibility', 'visible').orWhereNull('photos.visibility');
     });
@@ -236,6 +240,9 @@ router.get('/:slug/show/:token/session', noStoreCache, handleAsync(async (req, r
     // so one guest's logout would revoke every same-second login (#1357).
     jti: crypto.randomUUID(),
     accessLevel: 'slideshow',
+    // Bound to this link: rotating or disabling it ends the session
+    // (assertGalleryCredentialCurrent).
+    ...slideshowCredentialClaim(event),
     loginTime: Date.now()
   }, process.env.JWT_SECRET, {
     expiresIn: '12h',

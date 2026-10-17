@@ -104,10 +104,26 @@ describe('transient source vs dead photo', () => {
     // directory does not resolve — the shape a dropped mount presents.
     const { photoId } = await seedExternalPhoto({ externalPath: 'vanished-share' });
 
-    await expect(faceProcessor.processPhotoFaces(photoId))
+    await expect(faceProcessor.processPhotoFaces({ id: photoId, face_attempt_id: null }))
       .rejects.toBeInstanceOf(faceProcessor.TransientSourceError);
 
     // Critically: still claimable. A 'failed' here is what stranded the photo.
+    const photo = await db('photos').where({ id: photoId }).first();
+    expect(photo.face_status).not.toBe('failed');
+  });
+
+  it('passes an unreachable storage backend on to the queue instead of failing the photo', async () => {
+    // Issue 1785: ensurePreviewImage now throws for an unreachable backend
+    // instead of regenerating. processPhotoFaces must neither swallow that
+    // nor mark the photo; faceQueue returns the row to pending and backs off.
+    const live = path.join(process.env.EXTERNAL_MEDIA_ROOT, 'storage-outage', 'individual');
+    await fs.promises.mkdir(live, { recursive: true });
+    await fs.promises.writeFile(path.join(live, 'a.jpg'), 'x');
+    const { photoId } = await seedExternalPhoto({ externalPath: 'storage-outage' });
+    mockEnsurePreviewImage.mockRejectedValueOnce(Object.assign(new Error('socket pool timeout'), { name: 'TimeoutError' }));
+
+    await expect(faceProcessor.processPhotoFaces({ id: photoId, face_attempt_id: null })).rejects.toMatchObject({ name: 'TimeoutError' });
+
     const photo = await db('photos').where({ id: photoId }).first();
     expect(photo.face_status).not.toBe('failed');
   });
@@ -121,7 +137,7 @@ describe('transient source vs dead photo', () => {
     await fs.promises.mkdir(emptyRoot, { recursive: true });
     const { photoId } = await seedExternalPhoto({ externalPath: 'unmounted' });
 
-    await expect(faceProcessor.processPhotoFaces(photoId))
+    await expect(faceProcessor.processPhotoFaces({ id: photoId, face_attempt_id: null }))
       .rejects.toBeInstanceOf(faceProcessor.TransientSourceError);
 
     const photo = await db('photos').where({ id: photoId }).first();
@@ -138,7 +154,7 @@ describe('transient source vs dead photo', () => {
     await fs.promises.writeFile(path.join(live, 'sibling.jpg'), 'x');
     const { photoId } = await seedExternalPhoto({ externalPath: 'live-share' });
 
-    const result = await faceProcessor.processPhotoFaces(photoId);
+    const result = await faceProcessor.processPhotoFaces({ id: photoId, face_attempt_id: null });
 
     expect(result.status).toBe('failed');
     const photo = await db('photos').where({ id: photoId }).first();
@@ -156,7 +172,7 @@ describe('transient source vs dead photo', () => {
     await fs.promises.writeFile(path.join(root, 'collages', 'kept.jpg'), 'x');
     const { photoId } = await seedExternalPhoto({ externalPath: 'partial' });
 
-    const result = await faceProcessor.processPhotoFaces(photoId);
+    const result = await faceProcessor.processPhotoFaces({ id: photoId, face_attempt_id: null });
     expect(result.status).toBe('failed');
   });
 
@@ -172,7 +188,7 @@ describe('transient source vs dead photo', () => {
 
     const { photoId } = await seedExternalPhoto({ externalPath: 'locked' });
     try {
-      await expect(faceProcessor.processPhotoFaces(photoId))
+      await expect(faceProcessor.processPhotoFaces({ id: photoId, face_attempt_id: null }))
         .rejects.toBeInstanceOf(faceProcessor.TransientSourceError);
     } finally {
       await fs.promises.chmod(file, 0o644).catch(() => {});
@@ -206,7 +222,7 @@ describe('transient source vs dead photo', () => {
       source_origin: 'managed',
     }).returning('id');
 
-    const result = await faceProcessor.processPhotoFaces(typeof p === 'object' ? p.id : p);
+    const result = await faceProcessor.processPhotoFaces({ id: typeof p === 'object' ? p.id : p, face_attempt_id: null });
     expect(result.status).toBe('failed');
   });
 });

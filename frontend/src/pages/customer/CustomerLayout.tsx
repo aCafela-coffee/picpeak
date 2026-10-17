@@ -16,7 +16,7 @@ import { CompactLanguageSelector } from '../../components/common/LanguageSelecto
  * Renders as a layout route (Outlet pattern) so individual pages don't need
  * to wrap their content in `<CustomerLayout>` — same approach AdminLayout uses.
  */
-import React, { useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { Link, NavLink, Outlet, Navigate, useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import {
@@ -35,6 +35,9 @@ import type { LucideIcon } from 'lucide-react';
 
 import { useCustomerAuth } from '../../contexts/CustomerAuthContext';
 import { usePublicSettings } from '../../hooks/usePublicSettings';
+import { usePublicDarkMode } from '../../hooks/usePublicDarkMode';
+import { useEscapeClose } from '../../components/common/useEscapeClose';
+import { useFocusTrap } from '../../hooks/useFocusTrap';
 
 interface NavItem {
   to: string;
@@ -61,22 +64,50 @@ const NAV: NavItem[] = [
   { to: '/customer/profile', labelKey: 'customer.nav.profile', fallback: 'Profile', icon: UserIcon },
 ];
 
+// Below Tailwind's `lg` the sidebar is an off-screen drawer; from `lg` up it
+// is always on screen. Without matchMedia (some test environments) the
+// layout is treated as desktop, i.e. the sidebar is left as it always was.
+const DRAWER_QUERY = '(max-width: 1023.98px)';
+const subscribeDrawer = (notify: () => void) => {
+  if (typeof window.matchMedia !== 'function') return () => {};
+  const mql = window.matchMedia(DRAWER_QUERY);
+  mql.addEventListener('change', notify);
+  return () => mql.removeEventListener('change', notify);
+};
+const isDrawerLayout = () => typeof window.matchMedia === 'function' && window.matchMedia(DRAWER_QUERY).matches;
+
 export const CustomerLayout: React.FC = () => {
   const { t } = useTranslation();
   const location = useLocation();
   const { customer, features, branding, isAuthenticated, isLoading, logout } = useCustomerAuth();
   const { data: settingsData } = usePublicSettings();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  useEscapeClose(sidebarOpen, () => setSidebarOpen(false));
+  const isDrawer = useSyncExternalStore(subscribeDrawer, isDrawerLayout);
+  // The open drawer covers the page behind a backdrop, so it holds the
+  // keyboard: focus moves to its close button and Tab wraps inside it.
+  const drawerOpen = isDrawer && sidebarOpen;
+  const sidebarRef = useFocusTrap(drawerOpen, { containFocus: true });
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    // A dialog open on top (the drawer opened by a resize) keeps its focus.
+    if (drawerOpen && !document.activeElement?.closest('[role="dialog"]')) closeButtonRef.current?.focus();
+  }, [drawerOpen]);
+  // The closed drawer is inert, so focus left inside it would be dropped to
+  // the body. Hand it back to the menu button before the browser does that.
+  useLayoutEffect(() => {
+    if (!isDrawer || sidebarOpen) return;
+    if (sidebarRef.current?.contains(document.activeElement)) {
+      menuButtonRef.current?.focus();
+    }
+  }, [isDrawer, sidebarOpen, sidebarRef]);
 
   const companyName = settingsData?.branding_company_name?.trim() || 'PicPeak';
-  // Theme-aware logo: the customer surface follows branding_force_color_mode.
-  // Only 'dark' and 'light' are persisted; null/absent means "follow the OS
-  // preference" — same resolution order as usePublicDarkMode. Symmetric
-  // fallback so a single uploaded logo serves both modes.
-  const forceMode = settingsData?.branding_force_color_mode;
-  const customerIsDark = forceMode === 'dark'
-    || (forceMode !== 'light' && typeof window !== 'undefined'
-        && window.matchMedia?.('(prefers-color-scheme: dark)').matches);
+  // The portal follows the operator's palette (usePublicDarkMode puts the
+  // theme tokens in charge on <html>, dialogs included). `isDark` picks the
+  // logo; symmetric fallback so a single uploaded logo serves both modes.
+  const { isDark: customerIsDark } = usePublicDarkMode();
   const lightLogo = settingsData?.branding_logo_url?.trim();
   const darkLogo = settingsData?.branding_logo_url_dark?.trim();
   const logoUrl = customerIsDark ? (darkLogo || lightLogo) : (lightLogo || darkLogo);
@@ -93,15 +124,12 @@ export const CustomerLayout: React.FC = () => {
   const showCompanyName = branding.showCompanyName;
 
   // Loading screen mirrors AdminLayout's so admin-as-customer dogfooding
-  // sees a familiar transition. Background uses the theme variable so a
+  // sees a familiar transition. Background uses the theme token so a
   // dark Branding palette doesn't flash white on first paint.
   if (isLoading) {
     return (
-      <div
-        className="min-h-screen flex items-center justify-center"
-        style={{ backgroundColor: 'var(--color-background, #fafafa)' }}
-      >
-        <div className="w-12 h-12 border-4 border-t-transparent rounded-full animate-spin" style={{ borderColor: 'var(--color-accent)', borderTopColor: 'transparent' }} />
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <div className="w-12 h-12 border-4 border-accent border-t-transparent rounded-full animate-spin" />
       </div>
     );
   }
@@ -119,18 +147,11 @@ export const CustomerLayout: React.FC = () => {
     || (customer?.email ? customer.email.split('@')[0] : '');
 
   return (
-    <div
-      // The `customer-surface` marker is read by index.css to retheme
-      // <Input> components via CSS variables — admin uses tailwind's
-      // `dark:` modifier (toggled on <html>), but the customer surface
-      // uses theme tokens so we scope the override here.
-      className="customer-surface h-screen flex overflow-hidden"
-      style={{ backgroundColor: 'var(--color-background, #fafafa)' }}
-    >
+    <div className="h-screen flex overflow-hidden bg-background">
       {/* Mobile backdrop */}
       {sidebarOpen && (
         <div
-          className="fixed inset-0 bg-black bg-opacity-50 z-40 lg:hidden"
+          className="fixed inset-0 bg-black/50 z-40 lg:hidden"
           onClick={() => setSidebarOpen(false)}
           aria-hidden="true"
         />
@@ -138,20 +159,18 @@ export const CustomerLayout: React.FC = () => {
 
       {/* Sidebar */}
       <aside
-        className={`fixed inset-y-0 left-0 z-50 w-64 border-r transform transition-transform duration-200 ease-in-out lg:relative lg:translate-x-0 lg:h-screen ${
+        ref={sidebarRef}
+        className={`fixed inset-y-0 left-0 z-50 w-64 border-r bg-surface border-border-token transform transition-transform duration-200 ease-in-out lg:relative lg:translate-x-0 lg:h-screen ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
-        style={{
-          backgroundColor: 'var(--color-surface, #ffffff)',
-          borderColor: 'var(--color-surface-border, #e5e5e5)',
-        }}
+        // Off screen is not out of reach: below lg the closed drawer leaves
+        // the tab order and the accessibility tree. Spread, as React 18 does
+        // not know `inert` as a prop.
+        {...(isDrawer && !sidebarOpen ? { inert: '' } : {})}
       >
         <div className="flex flex-col h-screen lg:h-full">
           {/* Brand */}
-          <div
-            className="flex items-center justify-between h-16 px-4 border-b flex-shrink-0"
-            style={{ borderColor: 'var(--color-surface-border, #e5e5e5)' }}
-          >
+          <div className="flex items-center justify-between h-16 px-4 border-b border-border-token flex-shrink-0">
             <Link
               to="/customer/dashboard"
               className="flex items-center gap-2 min-w-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 rounded"
@@ -171,6 +190,7 @@ export const CustomerLayout: React.FC = () => {
               )}
             </Link>
             <button
+              ref={closeButtonRef}
               type="button"
               onClick={() => setSidebarOpen(false)}
               className="lg:hidden text-muted-theme hover:text-theme"
@@ -195,37 +215,14 @@ export const CustomerLayout: React.FC = () => {
                   key={item.to}
                   to={item.to}
                   onClick={() => setSidebarOpen(false)}
+                  // Active: the filled accent with the label colour applyTheme()
+                  // picks for it. Rest: the theme's text, the elevated
+                  // surface on hover (the admin sidebar's subtle grey).
                   className={`flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-colors ${
-                    isActive
-                      ? 'bg-accent-dark text-white'
-                      // Hover uses the theme `--color-elevated` token
-                      // (light mode = #f5f5f5, dark mode = #1f1f1f) —
-                      // mirrors the admin sidebar's subtle grey hover.
-                      // Tailwind's bare `hover:bg-neutral-100 dark:
-                      // hover:bg-neutral-800` doesn't work here because
-                      // the customer portal toggles palette via CSS
-                      // variables, not the `.dark` class, so the
-                      // light-mode value was always winning and the
-                      // hover read as near-white.
-                      : 'hover:bg-[var(--color-elevated)]'
+                    isActive ? 'bg-accent-strong text-accent-fg' : 'text-theme hover:bg-elevated'
                   }`}
-                  // Non-active items take their colour from the theme
-                  // variable the admin chose in the colour pickers
-                  // (`--color-text`). The Tailwind dark:text-white
-                  // approach didn't apply because the customer
-                  // portal toggles the palette via CSS variables, not
-                  // the `.dark` class — so the previous styling
-                  // resolved to the body's inherited muted colour.
-                  style={isActive ? undefined : { color: 'var(--color-text)' }}
                 >
-                  {/* Mirrors AdminSidebar's active state exactly: solid
-                      accent-dark pill, white icon and label, no extra
-                      flex grow on the label so the pill width matches
-                      what the admin chrome renders. */}
-                  <Icon
-                    className="w-5 h-5 mr-3"
-                    style={isActive ? undefined : { color: 'var(--color-text)' }}
-                  />
+                  <Icon className="w-5 h-5 mr-3" />
                   {t(item.labelKey, item.fallback)}
                 </NavLink>
               );
@@ -233,10 +230,7 @@ export const CustomerLayout: React.FC = () => {
           </nav>
 
           {/* Footer (logout + greeting on a single line, mirrors admin) */}
-          <div
-            className="border-t px-4 py-3 flex items-center justify-between gap-2"
-            style={{ borderColor: 'var(--color-surface-border, #e5e5e5)' }}
-          >
+          <div className="border-t border-border-token px-4 py-3 flex items-center justify-between gap-2">
             <div className="min-w-0">
               <div className="text-sm font-medium text-theme truncate">{greetingName}</div>
               <div className="text-xs text-muted-theme truncate">{customer?.email}</div>
@@ -256,14 +250,9 @@ export const CustomerLayout: React.FC = () => {
 
       {/* Main column */}
       <div className="flex-1 flex flex-col min-w-0 h-screen">
-        <header
-          className="h-14 px-4 flex items-center justify-between border-b flex-shrink-0"
-          style={{
-            backgroundColor: 'var(--color-surface, #ffffff)',
-            borderColor: 'var(--color-surface-border, #e5e5e5)',
-          }}
-        >
+        <header className="h-14 px-4 flex items-center justify-between border-b bg-surface border-border-token flex-shrink-0">
           <button
+            ref={menuButtonRef}
             type="button"
             onClick={() => setSidebarOpen(true)}
             className="lg:hidden p-2 -ml-2 rounded hover-surface text-theme"
@@ -279,10 +268,7 @@ export const CustomerLayout: React.FC = () => {
           <Outlet />
         </main>
 
-        <footer
-          className="py-4 px-4 text-center text-xs"
-          style={{ color: 'var(--color-muted-text, #737373)' }}
-        >
+        <footer className="py-4 px-4 text-center text-xs text-muted-theme">
           <p>
             {settingsData?.branding_footer_text
               || `© ${new Date().getFullYear()} ${companyName}. All rights reserved.`}

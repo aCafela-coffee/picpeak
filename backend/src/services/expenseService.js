@@ -16,16 +16,17 @@
  */
 const crypto = require('crypto');
 const fsp = require('fs').promises;
-const { PDFDocument } = require('pdf-lib');
 const { db, logActivity } = require('../database/db');
 const { AppError } = require('../utils/errors');
 const logger = require('../utils/logger');
 const { toStoredPath } = require('../utils/storedPath');
+const { validatePdf } = require('../utils/pdfValidation');
 const invoiceService = require('./invoiceService');
 const { auditedInsert, auditedUpdate, auditedDelete } = require('./accountingHistory');
 // Tri-state proof-attach resolver — single source of truth lives with the
 // send-time attachment logic (no require cycle: rebillProofs never imports us).
 const { resolveDefaultAttach } = require('./invoice/rebillProofs');
+const { ownedBy, assertEventLinkable, lockOwned, assertKeepsAccess } = require('./expenseAccess');
 
 /**
  * Actor for logActivity. `adminId` is legitimately absent on automated paths —
@@ -38,6 +39,10 @@ const adminActor = (adminId) => (adminId ? { type: 'admin', id: adminId } : null
 
 // Actor for the accounting change history: the admin, or null (system).
 const historyActor = (adminId) => adminId || null;
+
+// An incoming invoice nobody recorded (mailbox intake) belongs to whoever
+// triages it (expenseAccess).
+const claimUnowned = (row, adminId) => (row.created_by_admin_id == null && adminId ? { created_by_admin_id: adminId } : {});
 
 const DISPOSITIONS = ['rebill', 'durchlaufend', 'eigener_aufwand', 'duplikat', 'abgelehnt'];
 const TAX_TREATMENTS = ['domestic', 'reverse_charge_service', 'foreign_vat_non_reclaimable', 'import_goods'];
@@ -160,29 +165,65 @@ function clampPage(page, pageSize) {
   return { p, ps };
 }
 
+// The intake caps a mail's attachments at 25 MB in total (emailIntakeService);
+// a PDF up to that size is checked, anything larger is refused as too large.
+const MAX_INBOUND_PDF_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Hash the file and, for a PDF, parse it in the PDF worker
+ * (utils/pdfValidation): heap, time and inflate budgets, active content and
+ * encryption refused. Anyone who can mail the accounting mailbox reaches this
+ * unauthenticated, and pdf-lib in this process inflated every object stream
+ * of whatever arrived — a small crafted file could take the backend down,
+ * and the retained message was ingested again after the restart.
+ *
+ * A refused PDF is reported as `pdfError`, not thrown: the caller records
+ * the document as failed so the message is finished with, not retried.
+ */
 async function inspectFile(filePath, mimeType) {
   const buf = await fsp.readFile(filePath);
+  // The ORIGINAL bytes are what is kept and hashed: a supplier invoice may
+  // carry a digital signature (PAdES /ByteRange) that re-serialising would
+  // break, and the received file is the accounting evidence.
   const sha = crypto.createHash('sha256').update(buf).digest('hex');
   let pageCount = null;
+  let pdfError = null;
   if ((mimeType || '').includes('pdf')) {
     try {
-      const pdf = await PDFDocument.load(buf, { updateMetadata: false });
-      pageCount = pdf.getPageCount();
+      const info = await validatePdf(buf, { maxBytes: MAX_INBOUND_PDF_BYTES });
+      // Because the upload is kept rather than `normalised`, the scan has to
+      // agree with what a viewer resolves (pdfInspect.findAmbiguousObjects):
+      // a file whose xref points at a definition the scan did not keep could
+      // carry active content the check never saw. Refused, like the signed
+      // contract upload refuses it.
+      if (info.ambiguousObjects) {
+        throw new AppError('The PDF defines objects ambiguously and cannot be verified.', 400, 'PDF_AMBIGUOUS_OBJECTS');
+      }
+      pageCount = info.pages == null ? null : Number(info.pages);
     } catch (e) {
-      logger.warn?.(`expenseService: PDF page count failed for ${filePath}: ${e.message}`);
+      logger.warn?.(`expenseService: PDF refused for ${filePath}: ${e.code || ''} ${e.message}`);
+      pdfError = e;
     }
   }
-  return { sha, pageCount };
+  return { sha, pageCount, pdfError };
 }
 
-async function recordInboundDocument({ source, filePath, originalFilename, mimeType }, adminId) {
+async function recordInboundDocument({ source, filePath, originalFilename, mimeType, mailClaim }, adminId) {
   let fileSha256 = null;
   let pageCount = null;
+  let pdfError = null;
   try {
     const info = await inspectFile(filePath, mimeType);
-    fileSha256 = info.sha; pageCount = info.pageCount;
+    fileSha256 = info.sha; pageCount = info.pageCount; pdfError = info.pdfError;
   } catch (e) {
     logger.warn?.(`expenseService: could not inspect ${filePath}: ${e.message}`);
+  }
+  // An admin's upload is answered like every other PDF upload: refused, and
+  // the file does not stay. The mailbox has nobody to answer, so its refused
+  // attachment is recorded below as a failed, declined document instead.
+  if (pdfError && source !== 'email') {
+    await fsp.unlink(filePath).catch(() => {});
+    throw new AppError(pdfError.message, pdfError.statusCode || 400, pdfError.code || 'PDF_MALFORMED');
   }
 
   let duplicateOfId = null;
@@ -198,8 +239,11 @@ async function recordInboundDocument({ source, filePath, originalFilename, mimeT
     file_path: toStoredPath(filePath),
     mime_type: mimeType || null,
     file_sha256: fileSha256,
-    status: duplicateOfId ? 'duplicate' : 'unsorted',
-    parse_status: 'pending',
+    // A refused PDF is terminal: declined and failed, with the reason, so
+    // neither the parsers nor the next poll pick it up again.
+    status: pdfError ? 'declined' : (duplicateOfId ? 'duplicate' : 'unsorted'),
+    parse_status: pdfError ? 'failed' : 'pending',
+    parse_error: pdfError ? `${pdfError.code || 'PDF_MALFORMED'}: ${pdfError.message}`.slice(0, 2000) : null,
     parse_method: 'none',
     // Cap stored page_count to the renderable max (rasterizeService
     // MAX_RENDERABLE_PAGES) so a hostile high-page PDF can't drive an
@@ -207,14 +251,26 @@ async function recordInboundDocument({ source, filePath, originalFilename, mimeT
     page_count: pageCount != null ? Math.min(pageCount, 200) : null,
     duplicate_of_id: duplicateOfId,
     created_by_admin_id: adminId || null,
-    created_at: now,
-    updated_at: now,
+    created_at: mailClaim ? now.toISOString() : now,
+    updated_at: mailClaim ? now.toISOString() : now,
+    ...(mailClaim ? { received_email_id: mailClaim.id, mail_account_key: mailClaim.accountKey } : {}),
   };
   // The mailbox poller records with no admin: attribute it to the intake.
-  const inserted = await auditedInsert(db, 'inbound_documents', row, {
-    actor: adminId || (row.source === 'email' ? 'email-intake' : null),
-    source: 'inbound.record',
-  });
+  const insert = async conn => {
+    // Automated captures share the quota lock: the duplicate decision must
+    // be made there too, not from an earlier pre-lock snapshot.
+    if (mailClaim && fileSha256) {
+      const duplicate = await conn('inbound_documents').where({ file_sha256: fileSha256 }).first('id');
+      duplicateOfId = duplicate?.id || null;
+      row.duplicate_of_id = duplicateOfId;
+      row.status = pdfError ? 'declined' : duplicateOfId ? 'duplicate' : 'unsorted';
+    }
+    return auditedInsert(conn, 'inbound_documents', row, {
+      actor: adminId || (row.source === 'email' ? 'email-intake' : null),
+      source: 'inbound.record',
+    });
+  };
+  const inserted = mailClaim ? await require('./mailRetentionService').recordDocument(mailClaim, insert) : await insert(db);
   const id = typeof inserted[0] === 'object' ? inserted[0].id : inserted[0];
   await logActivity('incoming_invoice_captured', { inboundDocumentId: id, source: row.source, duplicate: !!duplicateOfId }, null, adminActor(adminId));
   return getInbound(id);
@@ -231,7 +287,8 @@ const INBOUND_CUSTOMER_SELECT = [
 ];
 function inboundWithCustomer() {
   return db('inbound_documents')
-    .leftJoin('customer_accounts as c', 'inbound_documents.customer_account_id', 'c.id');
+    .leftJoin('customer_accounts as c', 'inbound_documents.customer_account_id', 'c.id')
+    .modify(ownedBy('inbound_documents'));
 }
 
 async function getInbound(id) {
@@ -259,13 +316,15 @@ const INBOUND_EDITABLE = {
 };
 
 async function updateInbound(id, payload, adminId) {
-  await getInbound(id);
   const patch = { updated_at: new Date(), parse_status: 'manual' };
   for (const [camel, snake] of Object.entries(INBOUND_EDITABLE)) {
     if (payload[camel] !== undefined) patch[snake] = payload[camel] === '' ? null : payload[camel];
   }
-  await auditedUpdate(db, 'inbound_documents', { id }, patch, {
-    actor: historyActor(adminId), source: 'inbound.update',
+  await db.transaction(async (trx) => {
+    if (!(await lockOwned(trx, 'inbound_documents', id))) throw new AppError('Incoming invoice not found', 404, 'INBOUND_NOT_FOUND');
+    await auditedUpdate(trx, 'inbound_documents', { id }, patch, {
+      actor: historyActor(adminId), source: 'inbound.update',
+    });
   });
   await logActivity('incoming_invoice_updated', { inboundDocumentId: id }, null, adminActor(adminId));
   return getInbound(id);
@@ -436,9 +495,12 @@ async function categorizeInbound(id, payload, adminId) {
 
   let billedInvoiceId = null;
   await db.transaction(async (trx) => {
-    const row = await trx('inbound_documents').where({ id }).first();
+    const row = await lockOwned(trx, 'inbound_documents', id);
     if (!row) throw new AppError('Incoming invoice not found', 404, 'INBOUND_NOT_FOUND');
     const doc = transformInbound(row);
+    const eventId = BOOKING_DISPOSITIONS.includes(disposition) ? (payload.eventId || null) : null;
+    await assertEventLinkable(eventId, trx);
+    assertKeepsAccess(row, eventId);
 
     // A doc attached to a customer will become a client invoice line, which
     // needs an amount. Require one NOW (0 is fine — a legitimately zero-value
@@ -465,7 +527,7 @@ async function categorizeInbound(id, payload, adminId) {
       disposition,
       // Explicit treatment wins; else auto-default from the supplier country.
       tax_treatment: resolveTaxTreatment(payload.taxTreatment, doc.supplierCountry, vatReclaimCountries),
-      event_id: BOOKING_DISPOSITIONS.includes(disposition) ? (payload.eventId || null) : null,
+      event_id: eventId,
       category_id: disposition === 'eigener_aufwand' ? (payload.categoryId || null) : null,
       customer_account_id: customerAccountId,
       markup_type: appliesMarkup ? markup.type : 'none',
@@ -476,6 +538,7 @@ async function categorizeInbound(id, payload, adminId) {
       billed_invoice_line_item_id: null,
       status: DISPOSITION_DOC_STATUS[disposition] || 'categorized',
       updated_at: new Date(),
+      ...claimUnowned(row, adminId),
     };
     if (disposition === 'duplikat' && payload.duplicateOfId) patch.duplicate_of_id = payload.duplicateOfId;
     await auditedUpdate(trx, 'inbound_documents', { id }, patch, {
@@ -507,9 +570,10 @@ async function categorizeInbound(id, payload, adminId) {
 async function rebillInbound(id, payload, adminId, trx0) {
   if (!payload.customerAccountId) throw new AppError('customerAccountId is required to re-bill', 400, 'CUSTOMER_REQUIRED');
   const run = async (trx) => {
-    const row = await trx('inbound_documents').where({ id }).first();
+    const row = await lockOwned(trx, 'inbound_documents', id);
     if (!row) throw new AppError('Incoming invoice not found', 404, 'INBOUND_NOT_FOUND');
     const doc = transformInbound(row);
+    await assertEventLinkable(payload.eventId, trx);
     // A client invoice line needs an amount (0 allowed, null not) — fail here
     // rather than deep inside buildInboundLineItem.
     if (doc.totalAmountMinor == null && doc.netAmountMinor == null) {
@@ -529,6 +593,7 @@ async function rebillInbound(id, payload, adminId, trx0) {
       markup_percent: markup.type === 'percent' ? markup.percent : null,
       markup_flat_minor: markup.type === 'flat' ? markup.flatMinor : null,
       updated_at: new Date(),
+      ...claimUnowned(row, adminId),
     }, { actor: historyActor(adminId), source: 'inbound.rebill' });
     return billInboundNow(trx, id, payload.customerAccountId, payload.eventId || doc.eventId || null, 'rebill', markup, adminId);
   };
@@ -548,6 +613,7 @@ async function rebillInbound(id, payload, adminId, trx0) {
 async function listPendingRebillSummary() {
   const rows = await db('inbound_documents as d')
     .join('customer_accounts as c', 'd.customer_account_id', 'c.id')
+    .modify(ownedBy('d'))
     .whereNotNull('d.customer_account_id')
     .whereNull('d.billed_invoice_id')
     .whereIn('d.disposition', CUSTOMER_DISPOSITIONS)
@@ -596,12 +662,16 @@ async function listPendingRebillSummary() {
 // assigns it, so re-bills can be combined contiguously with hours in one
 // invoice; #866). Shared by the re-bills-only path and the combined orchestrator.
 async function buildPendingRebillLineItems(trx, customer) {
-  const docs = await trx('inbound_documents')
+  const pending = trx('inbound_documents')
+    .modify(ownedBy('inbound_documents'))
     .where({ customer_account_id: customer.id })
     .whereNull('billed_invoice_id')
     .whereIn('disposition', CUSTOMER_DISPOSITIONS)
     .where('status', 'categorized')
     .orderBy('invoice_date', 'asc').orderBy('id', 'asc');
+  // Held until stampBilledRebills has written them (see expenseAccess.lockOwned).
+  if (trx.client.config.client === 'pg') pending.forNoKeyUpdate();
+  const docs = await pending;
   const lineItems = [];
   for (let i = 0; i < docs.length; i += 1) {
     const doc = transformInbound(docs[i]);
@@ -690,6 +760,7 @@ async function listCustomerRebills(customerId) {
   const rows = await db('inbound_documents as d')
     .leftJoin('invoices as inv', 'd.billed_invoice_id', 'inv.id')
     .leftJoin('events as e', 'd.event_id', 'e.id')
+    .modify(ownedBy('d'))
     .where('d.customer_account_id', customerId)
     .whereIn('d.disposition', CUSTOMER_DISPOSITIONS)
     .where('d.status', 'categorized')
@@ -770,17 +841,19 @@ async function listInvoiceRebillProofs(invoiceId) {
 
 /** Mark the supplier paid on the incoming invoice (the payable lives here). */
 async function markInboundSupplierPayment(id, { paid, paidAt, paymentMethod, paymentReference }, adminId) {
-  await getInbound(id);
   if (paymentMethod && !PAYMENT_METHODS.includes(paymentMethod)) {
     throw new AppError(`paymentMethod must be one of ${PAYMENT_METHODS.join(', ')}`, 400, 'BAD_PAYMENT_METHOD');
   }
-  await auditedUpdate(db, 'inbound_documents', { id }, {
-    supplier_paid: !!paid,
-    supplier_paid_at: paid ? (paidAt ? new Date(paidAt) : new Date()) : null,
-    supplier_payment_method: paid ? (paymentMethod || null) : null,
-    supplier_payment_ref: paid ? (paymentReference || null) : null,
-    updated_at: new Date(),
-  }, { actor: historyActor(adminId), source: 'inbound.supplierPayment' });
+  await db.transaction(async (trx) => {
+    if (!(await lockOwned(trx, 'inbound_documents', id))) throw new AppError('Incoming invoice not found', 404, 'INBOUND_NOT_FOUND');
+    await auditedUpdate(trx, 'inbound_documents', { id }, {
+      supplier_paid: !!paid,
+      supplier_paid_at: paid ? (paidAt ? new Date(paidAt) : new Date()) : null,
+      supplier_payment_method: paid ? (paymentMethod || null) : null,
+      supplier_payment_ref: paid ? (paymentReference || null) : null,
+      updated_at: new Date(),
+    }, { actor: historyActor(adminId), source: 'inbound.supplierPayment' });
+  });
   await logActivity('incoming_invoice_supplier_payment', { inboundDocumentId: id, paid: !!paid }, null, adminActor(adminId));
   return getInbound(id);
 }
@@ -854,7 +927,7 @@ function buildExpenseInsert(payload, adminId, opts = {}) {
 }
 
 async function getExpense(id) {
-  const row = await db('expenses').where({ id }).first();
+  const row = await db('expenses').where({ id }).modify(ownedBy('expenses')).first();
   if (!row) throw new AppError('Expense not found', 404, 'EXPENSE_NOT_FOUND');
   return transformExpense(row);
 }
@@ -864,6 +937,7 @@ async function createExpense(payload, adminId, { receiptPath } = {}) {
   if (settings.requireProof && !receiptPath) {
     throw new AppError('A proof file is required for expenses', 400, 'PROOF_REQUIRED');
   }
+  await assertEventLinkable(payload.eventId, db);
   const row = buildExpenseInsert(payload, adminId, {
     receiptPath,
     kmRateMinor: settings.kmRateMinor,
@@ -879,7 +953,7 @@ async function createExpense(payload, adminId, { receiptPath } = {}) {
 
 async function listExpenses({ kind, eventId, categoryId, page, pageSize } = {}) {
   const { p, ps } = clampPage(page, pageSize);
-  const base = db('expenses').where({ inbound_document_id: null }); // internal only
+  const base = db('expenses').where({ inbound_document_id: null }).modify(ownedBy('expenses')); // internal only
   if (kind) base.where({ kind });
   if (categoryId) base.where({ category_id: categoryId });
   if (eventId === 'company') base.whereNull('event_id');
@@ -896,17 +970,22 @@ const EXPENSE_EDITABLE = {
 };
 
 async function updateExpense(id, payload, adminId, { receiptPath } = {}) {
-  const existing = await getExpense(id);
-  if (existing.invoiced) {
-    throw new AppError('Expense is invoiced — editing is locked', 409, 'EXPENSE_LOCKED');
-  }
   const patch = { updated_at: new Date() };
   for (const [camel, snake] of Object.entries(EXPENSE_EDITABLE)) {
     if (payload[camel] !== undefined) patch[snake] = payload[camel] === '' ? null : payload[camel];
   }
   if (receiptPath) patch.receipt_path = receiptPath;
-  await auditedUpdate(db, 'expenses', { id }, patch, {
-    actor: historyActor(adminId), source: 'expense.update',
+  await db.transaction(async (trx) => {
+    const row = await lockOwned(trx, 'expenses', id);
+    if (!row) throw new AppError('Expense not found', 404, 'EXPENSE_NOT_FOUND');
+    if (row.billed_invoice_id) {
+      throw new AppError('Expense is invoiced — editing is locked', 409, 'EXPENSE_LOCKED');
+    }
+    if (patch.event_id != null && Number(patch.event_id) !== Number(row.event_id)) await assertEventLinkable(patch.event_id, trx);
+    if (patch.event_id !== undefined) assertKeepsAccess(row, patch.event_id);
+    await auditedUpdate(trx, 'expenses', { id }, patch, {
+      actor: historyActor(adminId), source: 'expense.update',
+    });
   });
   await logActivity('expense_updated', { expenseId: id }, null, adminActor(adminId));
   return getExpense(id);
@@ -916,9 +995,10 @@ async function updateExpense(id, payload, adminId, { receiptPath } = {}) {
  *  invoiced (locks editing) + links the invoice. base = chf amount + markup. */
 async function rebillExpense(id, payload, adminId, trx0) {
   const run = async (trx) => {
-    const row = await trx('expenses').where({ id }).first();
+    const row = await lockOwned(trx, 'expenses', id);
     if (!row) throw new AppError('Expense not found', 404, 'EXPENSE_NOT_FOUND');
     const exp = transformExpense(row);
+    await assertEventLinkable(payload.eventId, trx);
     if (exp.invoiced) throw new AppError('Expense already invoiced', 409, 'ALREADY_INVOICED');
     if (!payload.customerAccountId) throw new AppError('customerAccountId is required', 400, 'CUSTOMER_REQUIRED');
     const base = exp.chfAmountMinor;
@@ -957,17 +1037,19 @@ async function rebillExpense(id, payload, adminId, trx0) {
 
 /** Mark an expense paid/settled (manual). */
 async function markExpensePaid(id, { paid, paidAt, paymentMethod, paymentReference }, adminId) {
-  await getExpense(id);
   if (paymentMethod && !PAYMENT_METHODS.includes(paymentMethod)) {
     throw new AppError(`paymentMethod must be one of ${PAYMENT_METHODS.join(', ')}`, 400, 'BAD_PAYMENT_METHOD');
   }
-  await auditedUpdate(db, 'expenses', { id }, {
-    supplier_paid: !!paid,
-    supplier_paid_at: paid ? (paidAt ? new Date(paidAt) : new Date()) : null,
-    payment_method: paid ? (paymentMethod || null) : null,
-    payment_reference: paid ? (paymentReference || null) : null,
-    updated_at: new Date(),
-  }, { actor: historyActor(adminId), source: 'expense.markPaid' });
+  await db.transaction(async (trx) => {
+    if (!(await lockOwned(trx, 'expenses', id))) throw new AppError('Expense not found', 404, 'EXPENSE_NOT_FOUND');
+    await auditedUpdate(trx, 'expenses', { id }, {
+      supplier_paid: !!paid,
+      supplier_paid_at: paid ? (paidAt ? new Date(paidAt) : new Date()) : null,
+      payment_method: paid ? (paymentMethod || null) : null,
+      payment_reference: paid ? (paymentReference || null) : null,
+      updated_at: new Date(),
+    }, { actor: historyActor(adminId), source: 'expense.markPaid' });
+  });
   await logActivity('expense_paid', { expenseId: id, paid: !!paid }, null, adminActor(adminId));
   return getExpense(id);
 }

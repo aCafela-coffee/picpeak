@@ -1,15 +1,17 @@
 import React from 'react';
-import { Star, Heart, Bookmark, MessageCircle, Filter, X } from 'lucide-react';
+import { Star, Heart, Bookmark, MessageCircle, Filter, X, ThumbsUp, ThumbsDown, CircleDashed } from 'lucide-react';
 import { COLOR_LABELS, COLOR_LABEL_SWATCHES, type ColorLabel } from '../../services/feedback.service';
 import { useTranslation } from 'react-i18next';
 import { Button } from '../common';
-import { FeedbackFilters, FilterSummary } from '../../services/photos.service';
+import { FeedbackFilters, FilterSummary, type DecisionFilter } from '../../services/photos.service';
 
 interface PhotoFilterPanelProps {
   filters: FeedbackFilters;
   onChange: (filters: FeedbackFilters) => void;
   summary: FilterSummary | null;
   isLoading?: boolean;
+  // The event holds videos: the total is worded for media, not photos.
+  hasVideos?: boolean;
 }
 
 const RATING_OPTIONS = [
@@ -26,7 +28,8 @@ export const PhotoFilterPanel: React.FC<PhotoFilterPanelProps> = ({
   filters,
   onChange,
   summary,
-  isLoading = false
+  isLoading = false,
+  hasVideos = false
 }) => {
   const { t } = useTranslation();
 
@@ -63,6 +66,18 @@ export const PhotoFilterPanel: React.FC<PhotoFilterPanelProps> = ({
     });
   };
 
+  // Approve / reject (issue 744): multi-select like the colours; the chosen
+  // values OR together.
+  const toggleDecision = (decision: DecisionFilter) => {
+    const active = filters.decisions || [];
+    onChange({
+      ...filters,
+      decisions: active.includes(decision)
+        ? active.filter(d => d !== decision)
+        : [...active, decision],
+    });
+  };
+
   const handleLogicChange = (logic: 'AND' | 'OR') => {
     onChange({ ...filters, logic });
   };
@@ -75,6 +90,7 @@ export const PhotoFilterPanel: React.FC<PhotoFilterPanelProps> = ({
       hasComments: false,
       colorLabels: [],
       myColorLabels: [],
+      decisions: [],
       logic: 'AND'
     });
   };
@@ -84,7 +100,8 @@ export const PhotoFilterPanel: React.FC<PhotoFilterPanelProps> = ({
     filters.hasFavorites ||
     filters.hasComments ||
     (filters.colorLabels?.length || 0) > 0 ||
-    (filters.myColorLabels?.length || 0) > 0;
+    (filters.myColorLabels?.length || 0) > 0 ||
+    (filters.decisions?.length || 0) > 0;
 
   return (
     <div className="bg-panel rounded-lg border border-line p-4 mb-4">
@@ -115,7 +132,7 @@ export const PhotoFilterPanel: React.FC<PhotoFilterPanelProps> = ({
           <select
             value={filters.minRating ?? ''}
             onChange={(e) => handleRatingChange(e.target.value === '' ? null : parseFloat(e.target.value))}
-            className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-primary-500 focus:border-accent-dark"
+            className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-accent focus:border-accent-dark"
             disabled={isLoading}
           >
             {RATING_OPTIONS.map(option => (
@@ -133,10 +150,10 @@ export const PhotoFilterPanel: React.FC<PhotoFilterPanelProps> = ({
               type="checkbox"
               checked={filters.hasLikes || false}
               onChange={() => handleCheckboxChange('hasLikes')}
-              className="rounded border-neutral-300 text-accent focus:ring-primary-500"
+              className="rounded border-line-strong text-accent focus:ring-accent"
               disabled={isLoading}
             />
-            <Heart className="w-4 h-4 text-red-500" />
+            <Heart className="w-4 h-4 text-danger" />
             <span className="text-sm text-body">
               {t('filter.hasLikes', 'Has likes')}
               {summary && (
@@ -150,10 +167,10 @@ export const PhotoFilterPanel: React.FC<PhotoFilterPanelProps> = ({
               type="checkbox"
               checked={filters.hasFavorites || false}
               onChange={() => handleCheckboxChange('hasFavorites')}
-              className="rounded border-neutral-300 text-accent focus:ring-primary-500"
+              className="rounded border-line-strong text-accent focus:ring-accent"
               disabled={isLoading}
             />
-            <Bookmark className="w-4 h-4 text-yellow-500" />
+            <Bookmark className="w-4 h-4 text-rating" />
             <span className="text-sm text-body">
               {t('filter.hasFavorites', 'Has favorites')}
               {summary && (
@@ -167,10 +184,10 @@ export const PhotoFilterPanel: React.FC<PhotoFilterPanelProps> = ({
               type="checkbox"
               checked={filters.hasComments || false}
               onChange={() => handleCheckboxChange('hasComments')}
-              className="rounded border-neutral-300 text-accent focus:ring-primary-500"
+              className="rounded border-line-strong text-accent focus:ring-accent"
               disabled={isLoading}
             />
-            <MessageCircle className="w-4 h-4 text-blue-500" />
+            <MessageCircle className="w-4 h-4 text-info" />
             <span className="text-sm text-body">
               {t('filter.hasComments', 'Has comments')}
               {summary && (
@@ -215,6 +232,43 @@ export const PhotoFilterPanel: React.FC<PhotoFilterPanelProps> = ({
                     />
                     <span>{name}</span>
                     <span className="text-muted">({count})</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Approve / reject (issue 744). Like the colours, only once some
+            guest has decided — dead UI in galleries without the feature. */}
+        {(summary?.withDecisions || 0) > 0 && (
+          <div>
+            <span className="block text-sm font-medium text-body mb-2">
+              {t('filter.decisions', 'Approve / reject')}
+            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              {([
+                { value: 'approved', icon: <ThumbsUp className="w-3.5 h-3.5 text-success-text" aria-hidden="true" />, label: t('filter.decisionApproved', 'Approved'), count: summary?.withApproved || 0 },
+                { value: 'rejected', icon: <ThumbsDown className="w-3.5 h-3.5 text-danger-text" aria-hidden="true" />, label: t('filter.decisionRejected', 'Rejected'), count: summary?.withRejected || 0 },
+                { value: 'undecided', icon: <CircleDashed className="w-3.5 h-3.5 text-muted" aria-hidden="true" />, label: t('filter.decisionUndecided', 'Undecided'), count: Math.max(0, (summary?.total || 0) - (summary?.withDecisions || 0)) },
+              ] as Array<{ value: DecisionFilter; icon: React.ReactNode; label: string; count: number }>).map((option) => {
+                const isActive = (filters.decisions || []).includes(option.value);
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    onClick={() => toggleDecision(option.value)}
+                    disabled={isLoading}
+                    aria-pressed={isActive}
+                    className={`flex items-center gap-2 px-2.5 py-1 rounded-full border text-sm transition-colors ${
+                      isActive
+                        ? 'border-accent-dark bg-accent-dark/10 text-heading'
+                        : 'border-line text-soft hover:bg-hover'
+                    }`}
+                  >
+                    {option.icon}
+                    <span>{option.label}</span>
+                    <span className="text-muted">({option.count})</span>
                   </button>
                 );
               })}
@@ -300,7 +354,7 @@ export const PhotoFilterPanel: React.FC<PhotoFilterPanelProps> = ({
         {/* Summary */}
         {summary && (
           <div className="pt-2 border-t border-line text-sm text-soft">
-            {t('filter.showingPhotos', 'Total photos')}: {summary.total}
+            {hasVideos ? t('filter.showingMedia', 'Total media') : t('filter.showingPhotos', 'Total photos')}: {summary.total}
             {summary.withRatings > 0 && (
               <span className="ml-2">
                 | {t('filter.withRatings', 'With ratings')}: {summary.withRatings}

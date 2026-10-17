@@ -2,6 +2,8 @@ import { api } from '../config/api';
 
 export interface ExternalEntry {
   name: string;
+  /** Absolute root-relative path for a virtual approved source entry. */
+  path?: string;
   type: 'dir' | 'file';
   size?: number;
   mtime?: string;
@@ -35,9 +37,24 @@ export interface ExternalImportStatus {
     failed?: boolean;
     error?: 'folder_missing' | 'permission_denied' | 'import_failed';
   } | null;
+  /** Photos of the gallery whose file the scans found gone (issue 2121). */
+  missing_files?: number;
 }
 
 export const externalMediaService = {
+  async getSources(): Promise<ExternalSourcesResponse> {
+    const res = await api.get<ExternalSourcesResponse>('/admin/external-media/sources');
+    return res.data;
+  },
+
+  async assignSource(path: string, ownerId: number): Promise<void> {
+    await api.put('/admin/external-media/sources', { path, owner_id: ownerId });
+  },
+
+  async revokeSource(id: number): Promise<void> {
+    await api.delete(`/admin/external-media/sources/${id}`);
+  },
+
   async list(pathRel: string = ''): Promise<ExternalMediaListResponse> {
     const params = new URLSearchParams();
     if (pathRel) params.set('path', pathRel);
@@ -75,3 +92,9 @@ export const externalMediaService = {
     return res.data;
   }
 };
+
+export interface ExternalSourcesResponse {
+  sources: Array<{ id: number; path: string; owner_id: number | null }>;
+  can_assign: boolean;
+  owners: Array<{ id: number; username: string }>;
+}

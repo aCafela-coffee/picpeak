@@ -16,7 +16,7 @@ import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { AlertTriangle, CheckCircle2, FileDown, XCircle } from 'lucide-react';
-import { Button, Loading } from '../../../components/common';
+import { Button, Loading, Notice } from '../../../components/common';
 import { ContractLayoutPreview } from '../../../components/contracts/ContractLayoutPreview';
 import { contractsService } from '../../../services/contracts.service';
 import { formatMoneyMinor } from '../../../utils/money';
@@ -35,11 +35,14 @@ export const SendReviewModal: React.FC<{
   sending: boolean;
   /** {{customer_address}} would print empty: offer collect-then-freeze. */
   customerAddressMissing?: boolean;
-}> = ({ contractId, onClose, onSend, onPreviewPdf, sending, customerAddressMissing = false }) => {
+  /** Customer takes no administrative emails (migration 300): the final
+   *  button says Issue and the review says no mail goes to the customer. */
+  noMail?: boolean;
+}> = ({ contractId, onClose, onSend, onPreviewPdf, sending, customerAddressMissing = false, noMail = false }) => {
   const { t } = useTranslation();
   const [showLayout, setShowLayout] = useState(false);
   const [collectChecked, setCollectData] = useState(false);
-  const collectData = customerAddressMissing && collectChecked;
+  const collectData = customerAddressMissing && !noMail && collectChecked;
   const { data: review, isLoading, isError, refetch } = useQuery({
     queryKey: ['contract-send-preview', contractId],
     queryFn: () => contractsService.sendPreview(contractId),
@@ -63,7 +66,9 @@ export const SendReviewModal: React.FC<{
           ? t('contracts.detail.review.sending', 'Sending…')
           : collectData
             ? t('contracts.detail.review.requestDetails', 'Ask for the details')
-            : t('contracts.detail.review.sendTo', 'Send to {{count}} signers', { count: invited })}
+            : noMail
+              ? t('contracts.detail.review.issue', 'Issue')
+              : t('contracts.detail.review.sendTo', 'Send to {{count}} signers', { count: invited })}
       </Button>
     </>
   );
@@ -78,18 +83,24 @@ export const SendReviewModal: React.FC<{
     >
       {isLoading && <Loading />}
       {isError && (
-        <div role="alert" className="text-sm text-red-800 dark:text-red-200">
+        <div role="alert" className="text-sm text-danger-text">
           {t('contracts.detail.review.loadFailed', 'The review could not be loaded.')}{' '}
           <button type="button" className="underline" onClick={() => { void refetch(); }}>{t('common.retry', 'Retry')}</button>
         </div>
       )}
       {review && (
         <div className="space-y-4 text-sm">
+          {noMail && (
+            <Notice tone="info">
+              {t('contracts.detail.review.noMailNotice',
+                'This customer gets no administrative emails. With portal access they can sign it there; otherwise upload the paper-signed copy. Other signers are invited by email as usual.')}
+            </Notice>
+          )}
           {review.problems.length > 0 ? (
             <section aria-labelledby="send-review-problems" role="status"
               className={`p-3 rounded-md border ${errors.length
-                ? 'border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-950/30'
-                : 'border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/30'}`}>
+                ? 'border-danger-line bg-danger-soft'
+                : 'border-warning-line bg-warning-soft'}`}>
               <h3 id="send-review-problems" className={heading}>
                 {errors.length
                   ? t('contracts.detail.review.blocked', 'This contract can\'t be sent yet')
@@ -99,8 +110,8 @@ export const SendReviewModal: React.FC<{
                 {[...errors, ...warnings].map((p, i) => (
                   <li key={`${p.code}-${i}`} className="flex items-start gap-2">
                     {p.severity === 'error'
-                      ? <XCircle className="w-4 h-4 mt-0.5 shrink-0 text-red-700 dark:text-red-400" aria-hidden="true" />
-                      : <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-amber-700 dark:text-amber-400" aria-hidden="true" />}
+                      ? <XCircle className="w-4 h-4 mt-0.5 shrink-0 text-danger-text" aria-hidden="true" />
+                      : <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-warning-text" aria-hidden="true" />}
                     <span className="sr-only">{p.severity === 'error' ? t('contracts.templates.check.error', 'Error') : t('contracts.templates.check.warning', 'Warning')}:</span>
                     <span>{problemText(p)}</span>
                   </li>
@@ -108,13 +119,22 @@ export const SendReviewModal: React.FC<{
               </ul>
             </section>
           ) : (
-            <p role="status" className="flex items-center gap-2 text-green-800 dark:text-green-300">
+            <p role="status" className="flex items-center gap-2 text-success-text">
               <CheckCircle2 className="w-4 h-4" aria-hidden="true" />
-              {t('contracts.detail.review.ready', 'Everything is ready to send.')}
+              {noMail
+                ? t('contracts.detail.review.readyToIssue', 'Everything is ready to issue.')
+                : t('contracts.detail.review.ready', 'Everything is ready to send.')}
             </p>
           )}
 
-          {customerAddressMissing && (
+          {/* The details request goes out by email, which this customer doesn't
+              get; the address has to be entered on the customer instead. */}
+          {customerAddressMissing && noMail && (
+            <p className="text-soft">
+              {t('contracts.detail.review.noMailAddressHint', "This customer gets no administrative emails, so they can't be asked for their details by email. Enter the missing address on the customer first.")}
+            </p>
+          )}
+          {customerAddressMissing && !noMail && (
             <section className="p-3 rounded-md border border-line">
               <label className="flex items-start gap-2 text-body">
                 <input type="checkbox" className="mt-0.5" checked={collectChecked}
@@ -165,8 +185,8 @@ export const SendReviewModal: React.FC<{
                   {review.attachments.map((a) => (
                     <li key={a.attachmentId} className="flex flex-wrap items-center gap-2">
                       {a.ok
-                        ? <CheckCircle2 className="w-3.5 h-3.5 text-green-700 dark:text-green-400" aria-hidden="true" />
-                        : <XCircle className="w-3.5 h-3.5 text-red-700 dark:text-red-400" aria-hidden="true" />}
+                        ? <CheckCircle2 className="w-3.5 h-3.5 text-success-text" aria-hidden="true" />
+                        : <XCircle className="w-3.5 h-3.5 text-danger-text" aria-hidden="true" />}
                       <span>{a.name}</span>
                       <span className="text-xs text-soft">
                         {a.delivery === 'merged'
@@ -174,7 +194,7 @@ export const SendReviewModal: React.FC<{
                           : t('contracts.detail.review.separate', 'separate file')}
                         {' · '}{t('contracts.detail.review.pages', '{{count}} pages', { count: a.pages })}
                       </span>
-                      {!a.ok && <span className="text-xs text-red-700 dark:text-red-400">{t('contracts.detail.review.fileProblem', 'file problem')}</span>}
+                      {!a.ok && <span className="text-xs text-danger-text">{t('contracts.detail.review.fileProblem', 'file problem')}</span>}
                     </li>
                   ))}
                 </ul>

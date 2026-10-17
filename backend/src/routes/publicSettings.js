@@ -2,6 +2,7 @@ const express = require('express');
 const { db, withRetry } = require('../database/db');
 const logger = require('../utils/logger');
 const { normaliseDownloadLimit } = require('../services/downloadQuota');
+const { normalizeStatusColors } = require('../utils/statusColors');
 const router = express.Router();
 
 // Get public settings (branding and theme)
@@ -28,12 +29,15 @@ router.get('/', async (req, res) => {
               'event_default_allow_comments',
               'event_default_allow_reactions',
               'event_default_allow_color_labels',
+              'event_default_allow_decisions',
               'event_default_keybind_mode',
               // Download limit default (issue 1560) — pre-fills the create form.
               'event_default_download_limit',
               // Uploader names (#1561), for the create form.
               'event_default_guest_name_mode',
               'event_default_show_credits_to_guests',
+              // Folder structure default (issue 1786), for the create form.
+              'event_default_folder_structure',
               'gallery_show_filter_bar',
               'event_phone_field_enabled',
               // #613 — guest upload UI needs to know the per-batch file
@@ -132,6 +136,9 @@ router.get('/', async (req, res) => {
         : settingsObject.branding_force_color_mode === 'light'
           ? 'light'
           : null,
+      // Status colours (Branding › Colours). Only the hues the studio picked;
+      // the frontend falls back to tokens.css for the rest.
+      branding_status_colors: normalizeStatusColors(settingsObject.branding_status_colors),
       // Login-page-only branding (#354 follow-up). Applies exclusively
       // to /admin/login and /customer/login — the rest of the app keeps
       // using branding_logo_size / branding_logo_max_height. Default
@@ -150,6 +157,9 @@ router.get('/', async (req, res) => {
       // storage is always HH:mm (24h); only the displayed form toggles.
       // Default '24h' to match the operator's CH/DE locale.
       general_time_format: settingsObject.general_time_format === '12h' ? '12h' : '24h',
+      // The instance time zone a date-only gallery expiry ends its day in
+      // (utils/galleryExpiry): every view shows an expiry as its day there.
+      expiry_time_zone: await require('../utils/galleryExpiry').getInstanceTimeZone(),
       // CRM overview tile visibility (admin-only — these are surfaced
       // via the public-settings endpoint because the dashboard reads
       // them on mount and the value never depends on auth state. All
@@ -169,47 +179,49 @@ router.get('/', async (req, res) => {
       // Cached (10s TTL): this endpoint is unauthenticated and hit by every
       // new client; the login route itself always checks uncached.
       oidc_local_login_disabled: await require('../services/oidcService').isLocalLoginDisabledCached().catch(() => false),
+      // Passkey login (issue 1733): the origin passkeys are bound to, or null
+      // when the login page should not offer one (no valid relying party for
+      // this install, SSO-only mode, or nobody has registered a passkey). The
+      // page compares it with its own origin before showing the button.
+      passkey_origin: await (async () => {
+        const passkeyService = require('../services/passkeyService');
+        const rp = await passkeyService.getRelyingParty();
+        if (!rp.available || !(await passkeyService.anyRegistered())) return null;
+        if (await require('../services/oidcService').isLocalLoginDisabledCached()) return null;
+        return rp.origin;
+      })().catch(() => null),
       enable_recaptcha: settingsObject.security_enable_recaptcha === true || settingsObject.security_enable_recaptcha === 'true',
       recaptcha_site_key: settingsObject.security_recaptcha_site_key || null,
       maintenance_mode: settingsObject.general_maintenance_mode === true || settingsObject.general_maintenance_mode === 'true',
-      // Umami analytics configuration (only if enabled). Kept for
-      // back-compat: pre-#663 installs without `analytics_tracker_provider`
-      // still surface Umami settings under their original keys so the
-      // frontend tracker script switches over cleanly.
+      // Legacy Umami flag. Kept for back-compat: on pre-#663 installs without
+      // `analytics_tracker_provider` the data-only client still reads it. The
+      // collector URLs and site IDs stay server-side; the client only needs
+      // to know which provider is on.
       umami_enabled: settingsObject.analytics_umami_enabled === true || settingsObject.analytics_umami_enabled === 'true',
-      umami_url: (settingsObject.analytics_umami_enabled === true || settingsObject.analytics_umami_enabled === 'true') ? (settingsObject.analytics_umami_url || null) : null,
-      umami_website_id: (settingsObject.analytics_umami_enabled === true || settingsObject.analytics_umami_enabled === 'true') ? (settingsObject.analytics_umami_website_id || null) : null,
-      umami_share_url: (settingsObject.analytics_umami_enabled === true || settingsObject.analytics_umami_enabled === 'true') ? (settingsObject.analytics_umami_share_url || null) : null,
-      // Tracker-provider switch (#663 Phase 1). Drives which provider's
-      // script gets injected into the gallery <head>. 'none' / unset =
-      // no tracker. The frontend tracker service picks the right shape
-      // from the (provider, *_url, *_website_id) tuple below.
+      // The share URL is the bearer link to the whole Umami dashboard, not
+      // tracker bootstrap; the admin analytics page reads it from
+      // /admin/settings, so it never leaves the authenticated API.
+      // Only supported, data-only collectors are public. Legacy custom mode
+      // stays disabled, even if its old enable flag is still true.
       analytics_tracker_provider: (() => {
         const explicit = settingsObject.analytics_tracker_provider;
-        if (typeof explicit === 'string' && ['none', 'umami', 'rybbit', 'custom'].includes(explicit)) {
+        if (typeof explicit === 'string' && ['none', 'umami', 'rybbit'].includes(explicit)) {
           return explicit;
         }
+        if (explicit) return 'none';
         // Back-compat with installs that haven't picked yet.
         return (settingsObject.analytics_umami_enabled === true || settingsObject.analytics_umami_enabled === 'true')
           ? 'umami'
           : 'none';
       })(),
-      // Rybbit native provider (#663). Only exposed when actively chosen
-      // — otherwise hidden so the front-end never tries to inject a
-      // stale tracker.
-      rybbit_url: settingsObject.analytics_tracker_provider === 'rybbit'
-        ? (settingsObject.analytics_rybbit_url || null)
-        : null,
-      rybbit_website_id: settingsObject.analytics_tracker_provider === 'rybbit'
-        ? (settingsObject.analytics_rybbit_website_id || null)
-        : null,
-      // Custom-mode pre-sanitised HTML snippet (#663). Sanitised at save
-      // time via customScriptSanitiser; surfaced as-is here so the
-      // gallery <head> can render it without re-sanitising on every
-      // request.
-      analytics_custom_head_html: settingsObject.analytics_tracker_provider === 'custom'
-        ? (settingsObject.analytics_custom_head_html || '')
-        : '',
+      // Whether the client drops events for a browser that sends Do Not Track
+      // (issue 1921). On unless switched off; Global Privacy Control is
+      // always honoured and has no switch.
+      analytics_honor_do_not_track: settingsObject.analytics_honor_do_not_track !== false
+        && settingsObject.analytics_honor_do_not_track !== 'false',
+      // Never distribute administrator-supplied executable HTML, including
+      // legacy rows written through another generic settings endpoint.
+      analytics_custom_head_html: '',
       // Event field requirements
       event_require_customer_name: settingsObject.event_require_customer_name !== false,
       event_require_customer_email: settingsObject.event_require_customer_email !== false,
@@ -228,6 +240,8 @@ router.get('/', async (req, res) => {
         ? settingsObject.event_default_guest_name_mode
         : 'off',
       event_default_show_credits_to_guests: settingsObject.event_default_show_credits_to_guests === true,
+      // Folder structure (issue 1786): on unless turned off, as on create.
+      event_default_folder_structure: settingsObject.event_default_folder_structure !== false,
       // Per-type feedback defaults (#1044). The fallbacks mirror
       // FEEDBACK_TOGGLES in services/feedbackDefaults.js — the backend is
       // still the authority; these only pre-fill the create form.
@@ -237,6 +251,7 @@ router.get('/', async (req, res) => {
       event_default_allow_comments: settingsObject.event_default_allow_comments !== false,
       event_default_allow_reactions: settingsObject.event_default_allow_reactions !== false,
       event_default_allow_color_labels: settingsObject.event_default_allow_color_labels === true,
+      event_default_allow_decisions: settingsObject.event_default_allow_decisions === true,
       event_default_keybind_mode: settingsObject.event_default_keybind_mode === 'lightroom' ? 'lightroom' : 'colors',
       // Download limit default (issue 1560). null = unlimited; the backend
       // applies the same value when a create request omits the field.

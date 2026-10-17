@@ -8,18 +8,23 @@
 
 const path = require('path');
 const fsp = require('fs/promises');
-const sharp = require('sharp');
+const sharp = require('./isolatedSharp');
+const { isResourceError } = require('./imageResourcePolicy');
 const { db } = require('../database/db');
+const { livePhotos } = require('../utils/photoVisibility');
 const {
   generateThumbnail, extractCaptureDate, withProcessableImage,
   deleteThumbnailTiers, deletePreviewTiers,
 } = require('./imageProcessor');
 const { generatePhotoFilename } = require('../utils/filenameSanitizer');
-const watermarkGeneratorService = require('./watermarkGeneratorService');
+const watermarkService = require('./watermarkService');
 const { getStorage } = require('./storage');
 const { resolvePhotoStorageKey } = require('./photoResolver');
 const { resolveCredit } = require('./photoCredit');
+const { exifColumn } = require('./photoExif');
 const logger = require('../utils/logger');
+const uploadQuota = require('./publicUploadQuota');
+const { claimPromotion } = require('./watchFolderClaims');
 
 /**
  * The trailing digit run of a filename stem, e.g. `Smith_Wedding_11234.jpg`
@@ -90,7 +95,7 @@ async function findReplacementCandidate(eventId, originalFilename, opts = {}) {
     // the exact trailing-run check below is still what decides, so semantics
     // are unchanged and only the row count drops.
     const pattern = '%' + token + '%';
-    const rows = await db('photos')
+    const rows = await livePhotos(db)
       .where({ event_id: eventId })
       .where(function () {
         this.where('source_filename', 'like', pattern)
@@ -107,21 +112,89 @@ async function findReplacementCandidate(eventId, originalFilename, opts = {}) {
     if (matches.length === 1) {
       // Re-read the full row: replacePhoto() needs the columns the narrowed
       // select above deliberately skipped (type, filename, source_filename).
-      return db('photos').where({ id: matches[0].id }).first();
+      return livePhotos(db).where({ id: matches[0].id }).first();
     }
     return null;
   }
 
-  const matches = await db('photos')
+  const exactMatches = (name) => livePhotos(db)
     .where({ event_id: eventId })
     .where(function () {
-      this.whereRaw('LOWER(original_filename) = LOWER(?)', [originalFilename])
-        .orWhereRaw('LOWER(source_filename) = LOWER(?)', [originalFilename]);
+      this.whereRaw('LOWER(original_filename) = LOWER(?)', [name])
+        .orWhereRaw('LOWER(source_filename) = LOWER(?)', [name]);
     });
 
-  if (matches.length === 1) return matches[0];
+  let matches = await exactMatches(originalFilename);
+  // Uploads before issue 2072 stored non-ASCII names latin1-decoded
+  // (`ümläut.jpg` as `Ã¼mlÃ¤ut.jpg`). A re-upload now arrives correctly
+  // decoded, so without this it would land as a new photo. Only that exact
+  // legacy form, and only when nothing matches the real name.
+  let legacyName = null;
+  if (matches.length === 0) {
+    const decoded = Buffer.from(originalFilename, 'utf8').toString('latin1');
+    if (decoded !== originalFilename) {
+      matches = await exactMatches(decoded);
+      legacyName = decoded;
+    }
+  }
+
+  if (matches.length === 1) {
+    // Tells replacePhoto the row was found through its legacy name, so it can
+    // repair source_filename. Non-enumerable: never spread into a write.
+    if (legacyName) Object.defineProperty(matches[0], 'legacyNameMatch', { value: legacyName });
+    return matches[0];
+  }
   if (matches.length > 1) return { ambiguous: true, count: matches.length };
   return null;
+}
+
+/** True when a fallback match left source_filename mangled (or empty). */
+function repairsLegacySource(photo) {
+  if (!photo.legacyNameMatch) return false;
+  return !photo.source_filename
+    || photo.source_filename.toLowerCase() === photo.legacyNameMatch.toLowerCase();
+}
+
+/**
+ * Delete what described the replaced file, once the row no longer names it.
+ *
+ * Afterwards rather than before the switch: until the row points at the new
+ * original, a failure must leave the old photo whole. Every step is
+ * best-effort; the replacement itself has already succeeded.
+ */
+async function removeReplacedAssets(oldPhoto, { event, finalKey, thumbnailPath, storage, videoRendition }) {
+  try {
+    const oldOriginalKey = resolvePhotoStorageKey(event, oldPhoto);
+    if (oldOriginalKey && oldOriginalKey !== finalKey) {
+      await storage.delete(oldOriginalKey).catch(() => {});
+    }
+    if (oldPhoto.thumbnail_path && oldPhoto.thumbnail_path !== thumbnailPath) {
+      await storage.delete(oldPhoto.thumbnail_path).catch(() => {});
+    }
+    // Managed preview and hero names derive from the source basename, which
+    // another row can share (see dropSupersededHero); such a file stays.
+    for (const column of ['preview_path', 'hero_path']) {
+      const key = oldPhoto[column];
+      if (!key) continue;
+      const shared = await db('photos').whereNot({ id: oldPhoto.id })
+        .where((q) => q.where('preview_path', key).orWhere('hero_path', key)).first('id');
+      if (!shared) await storage.delete(key).catch(() => {});
+    }
+    // The browser-playable copy (issue 1430) describes the old bytes.
+    await videoRendition.deleteWebCopy(oldPhoto);
+    // Responsive tiers, keyed off the OLD row (#1095 / #492). Their key embeds
+    // the basename the update replaced, so the old row is the only thing they
+    // can still be derived from.
+    await deleteThumbnailTiers(oldPhoto);
+    await deletePreviewTiers(oldPhoto);
+    // The recorded watermark, and the one a job still cutting the old file
+    // writes under its name (it then finds the row moved on and records
+    // nothing).
+    await watermarkService.deleteWatermarkFile(oldPhoto.watermark_path);
+    await watermarkService.deleteWatermarkFile(watermarkService.watermarkKey(oldPhoto));
+  } catch (err) {
+    logger.warn('replacePhoto: old asset cleanup failed', { photoId: oldPhoto.id, error: err.message });
+  }
 }
 
 /**
@@ -132,16 +205,24 @@ async function findReplacementCandidate(eventId, originalFilename, opts = {}) {
  * @param {Object} opts - { originalFilename, mimeType, event }
  * @returns {{ success: boolean, photo?: Object, error?: string }}
  */
-async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, mimeType, event }) {
+async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, mimeType, event, uploadReservation = null }) {
   const categorySlug = existingPhoto.type === 'collage' ? 'collages' : 'individual';
+  let object;
+  let storage;
+  let promotionSettled = false;
+  let releaseClaim = null;
+  let switched = false;
+  let finalKey;
+  let newFilename;
+  let thumbnailPath = null;
 
   try {
     // Generate new filename + storage key
     const ext = path.extname(originalFilename);
-    const newFilename = generatePhotoFilename(event.event_name, categorySlug, Date.now(), ext);
+    newFilename = generatePhotoFilename(event.event_name, categorySlug, Date.now(), ext);
     const relativePath = path.posix.join(event.slug, categorySlug, newFilename);
-    const finalKey = path.posix.join('events/active', relativePath);
-    const storage = getStorage();
+    finalKey = path.posix.join('events/active', relativePath);
+    storage = getStorage();
 
     // Sharp/EXIF need a local file. The temp file from multer still satisfies
     // that — we read metadata before uploading the original to storage.
@@ -153,11 +234,15 @@ async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, 
     }
 
     const stats = await fsp.stat(newFileTempPath);
+    // The row now holds other bytes: its content hash follows (issue 1733, C2).
+    const contentSha256 = await require('./photoDuplicates').sha256File(newFileTempPath);
 
     // Credit (#1561): an automatic one describes the file, so the new file's
     // EXIF replaces it. Guest and manual credits are decisions about the
     // photo and stay.
     const isVideoReplacement = !!mimeType?.startsWith('video/');
+    // Read while the temp file is still here, like the date above.
+    const exif = isVideoReplacement ? {} : await exifColumn(newFileTempPath);
     const autoCredit = existingPhoto.uploaded_by !== 'guest'
       && (!existingPhoto.credit_source || existingPhoto.credit_source === 'exif')
       ? await resolveCredit({ localPath: newFileTempPath, isVideo: isVideoReplacement })
@@ -168,7 +253,7 @@ async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, 
     // the ingest paths (processPhoto / processUploadedPhotos).
     let width = null;
     let height = null;
-    let thumbnailPath = null;
+    const thumbMeta = {};
     // Detect/name by the unique stored filename (newFilename), not the
     // client-supplied original, so RAW derivative keys can't collide.
     const proc = await withProcessableImage(newFileTempPath, newFilename);
@@ -177,47 +262,43 @@ async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, 
         const metadata = await sharp(proc.path).metadata();
         // Oriented, not raw — see imageProcessor.orientedDimensions (#1185).
         ({ width, height } = require('./imageProcessor').orientedDimensions(metadata));
-      } catch {
+      } catch (error) {
+        if (isResourceError(error)) throw error;
         // Non-image or corrupt
       }
       try {
-        thumbnailPath = await generateThumbnail(proc.path, { outputBasename: proc.outputBasename });
-      } catch {
+        thumbnailPath = await generateThumbnail(proc.path, { outputBasename: proc.outputBasename, meta: thumbMeta });
+      } catch (error) {
+        if (isResourceError(error)) throw error;
         logger.warn('Failed to generate thumbnail for replaced photo', { photoId: existingPhoto.id });
       }
     } finally {
       await proc.cleanup();
     }
 
-    // Delete old assets BEFORE uploading the new key — if they share the path
-    // (rare but possible if filename collision), we want the new content.
-    const oldOriginalKey = resolvePhotoStorageKey(event, existingPhoto);
-    if (oldOriginalKey && oldOriginalKey !== finalKey) {
-      await storage.delete(oldOriginalKey).catch(() => {});
-    }
-    if (existingPhoto.thumbnail_path && existingPhoto.thumbnail_path !== thumbnailPath) {
-      await storage.delete(existingPhoto.thumbnail_path).catch(() => {});
-    }
-    // Responsive tiers, keyed off the OLD row (#1095 / #492). Their key embeds
-    // the basename, which the update below replaces — so this is the last
-    // moment they can be derived at all. Miss it and a later delete or archive
-    // computes keys from the new basename and leaves them in storage forever.
-    await deleteThumbnailTiers(existingPhoto);
-    await deletePreviewTiers(existingPhoto);
-    try {
-      await watermarkGeneratorService.deleteForPhoto(existingPhoto.id);
-    } catch {
-      // Ignore — watermark may not exist
-    }
+    if (uploadReservation) object = await uploadQuota.prepareObject(uploadReservation, finalKey, stats.size);
+    const videoRendition = require('./videoRenditionService');
 
-    // Upload the new original. `putFromFile` COPIES (LocalFsStorage) or
+    // Upload the new original first. The old files are deleted only once the
+    // row points at the new one (see removeReplacedAssets below): a failed
+    // upload used to leave the unchanged row pointing at a deleted original.
+    //
+    // `putFromFile` COPIES (LocalFsStorage) or
     // uploads (S3) — neither consumes the source, and this function used to
     // leave it behind. The v1 route additionally stops its own cleanup on the
     // (wrong) assumption that this moved the file, so every replacement
     // stranded up to 100 MB in storage/temp. Cleaning up here closes the v1
     // and the admin path at once: adminPhotos only unlinks in its
     // new-files branch, so replaced files leaked there too.
+    // Claimed until the row points at it, so the file watcher does not
+    // import the new file as a photo of its own (issue 1970).
+    releaseClaim = claimPromotion(finalKey);
     await storage.putFromFile(finalKey, newFileTempPath, { contentType: mimeType });
+    promotionSettled = true;
+    if (uploadReservation) {
+      const promoted = await storage.stat(finalKey);
+      if (!promoted || promoted.size !== stats.size) throw new Error('Size mismatch after replacement upload');
+    }
     await fsp.unlink(newFileTempPath).catch(() => {});
 
     // Update DB record — preserve id, event_id, category_id, type, visibility,
@@ -230,17 +311,58 @@ async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, 
       // Lightroom round-trip (#745) loses its match key the first time an
       // editor uploads a renamed render over the proof. Backfilled here only
       // when the row predates migration 193 and has nothing stored yet.
-      ...(existingPhoto.source_filename
-        ? {}
-        : { source_filename: existingPhoto.original_filename || originalFilename }),
+      // One repair: a row matched only through its latin1-decoded legacy name
+      // (issue 2072) whose source_filename is that same mangled string, or
+      // empty, gets the correctly decoded name; any other camera name is kept.
+      ...(repairsLegacySource(existingPhoto)
+        ? { source_filename: originalFilename }
+        : existingPhoto.source_filename
+          ? {}
+          : { source_filename: existingPhoto.original_filename || originalFilename }),
       path: relativePath,
       thumbnail_path: thumbnailPath,
+      // The old hash describes the replaced image; none beats a wrong one.
+      thumb_hash: thumbMeta.thumbHash || null,
+      // The preview, hero and watermark were cut from the old picture, and
+      // their readers keep any readable file the row names: left set, the
+      // new photo went on showing the old one. Cleared, they regenerate.
+      preview_path: null,
+      hero_path: null,
+      hero_anchor: null,
+      watermark_path: null,
+      watermark_generated_at: null,
       size_bytes: stats.size,
+      content_sha256: contentSha256,
       width,
       height,
       captured_at: capturedAt,
+      // Camera details describe the file (issue 1733, D1): the new file's,
+      // or none. NULL leaves an unreadable one to the backfill.
+      exif_json: null,
+      ...exif,
       mime_type: mimeType,
       media_type: mimeType?.startsWith('video/') ? 'video' : 'image',
+      // A replaced video is queued for a new copy while the setting is on;
+      // anything else starts over with none.
+      web_path: null,
+      // The new file starts its own attempts: a worker still busy with the
+      // old one loses its claim and can publish nothing.
+      processing_attempt_id: null,
+      web_attempt_id: null,
+      web_attempts: 0,
+      web_retry_at: null,
+      // Either setting queues it (metadata stripping, issue 2102, included).
+      web_status: isVideoReplacement && await videoRendition.queuesVideos() ? 'pending' : null,
+      web_started_at: null,
+      web_error: null,
+      // The ladder starts over the same way; the queue picks a video up.
+      hls_path: null,
+      hls_status: null,
+      hls_attempt_id: null,
+      hls_attempts: 0,
+      hls_retry_at: null,
+      hls_started_at: null,
+      hls_error: null,
       // The replacement lives in the managed backend, so the row has to say
       // so. resolvePhotoStorageKey gives photo.source_origin precedence over
       // everything and returns null for 'reference'/'external' — so leaving
@@ -260,6 +382,9 @@ async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, 
       // The external file itself is never touched: this repoints the row, it
       // does not delete or move anything on the share.
       source_origin: 'managed',
+      // A photo whose share file had vanished (issue 2121) is served from
+      // the new upload now; the scan no longer looks after it.
+      unavailable_reason: null,
     };
 
     // Face data (#1074): the row keeps its id but now points at a DIFFERENT
@@ -275,6 +400,7 @@ async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, 
       updates.face_status = (await isEnabledForEvent(event)) ? 'pending' : null;
       updates.face_count = null;
       updates.face_started_at = null;
+      updates.face_attempt_id = null;
       updates.face_error = null;
     } catch (err) {
       logger.warn(`replacePhoto: face reset failed for photo ${existingPhoto.id}`, {
@@ -282,7 +408,41 @@ async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, 
       });
     }
 
-    await db('photos').where({ id: existingPhoto.id }).update(updates);
+    // The adaptive streaming ladder (issue 1733) describes the old bytes too.
+    // Its files are listed now and removed once the row has started over:
+    // by then a transcode of the old file has lost its claim and cannot
+    // publish behind the sweep, and whatever another replica writes for the
+    // new file in between is not on the list.
+    const sweepOldLadder = await require('./videoHlsService').captureLadder(existingPhoto);
+
+    // Scene tags (issue 1733) describe the old picture too: drop them and
+    // re-queue when the gallery has tagging on.
+    try {
+      const { purgePhotoTags } = require('./tagProcessor');
+      await purgePhotoTags(existingPhoto.id);
+      const event = await db('events').where({ id: existingPhoto.event_id }).first();
+      updates.tag_status = (await require('./tagSettings').isEnabledForEvent(event)) ? 'pending' : null;
+      updates.tag_started_at = null;
+      updates.tag_attempt_id = null;
+      updates.tag_error = null;
+    } catch (err) {
+      logger.warn(`replacePhoto: tag reset failed for photo ${existingPhoto.id}`, {
+        error: err.message,
+      });
+    }
+
+    if (object) {
+      await uploadQuota.commitObject(object, 'photo', async conn => {
+        if (await conn('photos').where({ id: existingPhoto.id, event_id: event.id }).update(updates) !== 1) {
+          throw new Error('Replacement target no longer exists');
+        }
+        return existingPhoto.id;
+      });
+    } else await db('photos').where({ id: existingPhoto.id }).update(updates);
+    switched = true;
+    releaseClaim();
+    await removeReplacedAssets(existingPhoto, { event, finalKey, thumbnailPath, storage, videoRendition });
+    await sweepOldLadder();
     if (autoCredit) {
       // Fenced like the upload worker: a manual credit set meanwhile wins,
       // and so does a replacement that installed another file since.
@@ -293,6 +453,10 @@ async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, 
     }
 
     const updatedPhoto = await db('photos').where({ id: existingPhoto.id }).first();
+    if (object && updatedPhoto && !['pending', 'processing', 'failed'].includes(updatedPhoto.processing_status)) {
+      try { await uploadQuota.processingComplete(existingPhoto.id); }
+      catch (err) { logger.warn('Replacement pending charge retained', { photoId: existingPhoto.id, error: err.message }); }
+    }
 
     logger.info('Photo replaced', {
       photoId: existingPhoto.id,
@@ -307,8 +471,32 @@ async function replacePhoto(existingPhoto, newFileTempPath, { originalFilename, 
       previousFilename: existingPhoto.filename,
     };
   } catch (err) {
+    if (object) {
+      try { await uploadQuota.failedObject(object, { storage, settled: promotionSettled }); }
+      catch (cleanupError) {
+        logger.warn('Replacement object cleanup failed; charge retained', { objectId: object.id, error: cleanupError.message });
+      }
+    }
+    // The row still names the old files, so what was written for the new one
+    // is nobody's. (failedObject above owns the original when quota-tracked.)
+    // A commit whose acknowledgement was lost did switch it: asked, not assumed.
+    if (!switched && storage) {
+      try {
+        const committed = newFilename && await db('photos').where({ id: existingPhoto.id, filename: newFilename }).first('id');
+        if (!committed) {
+          if (!object && promotionSettled && finalKey !== resolvePhotoStorageKey(event, existingPhoto)) {
+            await storage.delete(finalKey).catch(() => {});
+          }
+          if (thumbnailPath && thumbnailPath !== existingPhoto.thumbnail_path) await storage.delete(thumbnailPath).catch(() => {});
+        }
+      } catch (cleanupError) {
+        logger.warn('Replacement upload cleanup failed', { photoId: existingPhoto.id, error: cleanupError.message });
+      }
+    }
     logger.error('replacePhoto error', { photoId: existingPhoto.id, error: err.message });
     return { success: false, error: err.message };
+  } finally {
+    releaseClaim?.();
   }
 }
 

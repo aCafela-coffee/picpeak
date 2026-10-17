@@ -31,6 +31,8 @@ export interface PublicSettings {
    * AdminDarkModeContext + ThemeContext both honor this.
    */
   branding_force_color_mode?: 'dark' | 'light' | null;
+  /** Status hues picked in Branding › Colours; missing keys use tokens.css. */
+  branding_status_colors?: Partial<Record<'success' | 'warning' | 'danger' | 'info' | 'storno', string>>;
   /**
    * Login-page-only branding (#354 follow-up). Applies exclusively to
    * /admin/login and /customer/login. Defaults: frame on, size 'medium'.
@@ -57,6 +59,9 @@ export interface PublicSettings {
   /** '12h' or '24h' — controls how times are rendered in admin +
    *  customer views. Storage is always 24h; only display toggles. */
   general_time_format?: '12h' | '24h';
+  /** The instance time zone a date-only gallery expiry ends its day in;
+   *  expiry dates are shown as their day there (useLocalizedDate.formatExpiry). */
+  expiry_time_zone?: string | null;
   /** Dashboard CRM-overview tile visibility. All default true; only
    *  explicit false hides the matching tile. */
   crm_overview_show_revenue?: boolean;
@@ -67,16 +72,11 @@ export interface PublicSettings {
   recaptcha_site_key: string | null;
   maintenance_mode: boolean;
   umami_enabled: boolean;
-  umami_url: string | null;
-  umami_website_id: string | null;
-  umami_share_url: string | null;
-  // Pluggable trackers (#663 Phase 1). The backend always surfaces these;
-  // missing fields fall back via the existing umami_* shape so older
-  // builds keep working.
-  analytics_tracker_provider?: 'none' | 'umami' | 'rybbit' | 'custom';
-  rybbit_url?: string | null;
-  rybbit_website_id?: string | null;
-  // Custom-mode HTML snippet, already sanitised server-side.
+  // Pluggable trackers (#663 Phase 1). Only the provider is public; a
+  // missing value falls back to the legacy umami_enabled flag.
+  analytics_tracker_provider?: 'none' | 'umami' | 'rybbit';
+  analytics_honor_do_not_track?: boolean;
+  // Deprecated compatibility field: always empty; custom scripts are disabled.
   analytics_custom_head_html?: string;
   // Upload settings
   allowed_file_types?: string;
@@ -105,6 +105,7 @@ export interface PublicSettings {
   event_default_allow_comments?: boolean;
   event_default_allow_reactions?: boolean;
   event_default_allow_color_labels?: boolean;
+  event_default_allow_decisions?: boolean;
   event_default_keybind_mode?: 'colors' | 'lightroom';
   // Download limit default (issue 1560). null = unlimited.
   event_default_download_limit?: number | null;
@@ -119,6 +120,11 @@ export interface PublicSettings {
   oidc_button_label?: string;
   /** Effective flag (phase 2): the API refuses password logins right now. */
   oidc_local_login_disabled?: boolean;
+  /**
+   * Passkey login (issue 1733): the origin passkeys are bound to, or null when
+   * the login page should not offer one. Compare with window.location.origin.
+   */
+  passkey_origin?: string | null;
 }
 
 export const publicSettingsService = {

@@ -61,7 +61,7 @@ export const AdminAuthenticatedImage: React.FC<AdminAuthenticatedImageProps> = (
 
   if (loading) {
     return (
-      <div className="w-full h-full bg-neutral-200 animate-pulse" />
+      <div className="w-full h-full bg-fill animate-pulse" />
     );
   }
 
@@ -69,11 +69,25 @@ export const AdminAuthenticatedImage: React.FC<AdminAuthenticatedImageProps> = (
     return fallback ? (
       <>{fallback}</>
     ) : (
-      <div className="w-full h-full bg-neutral-100 flex items-center justify-center text-neutral-400">
+      <div className="w-full h-full bg-inset flex items-center justify-center text-faint">
         <span className="text-xs">Failed to load</span>
       </div>
     );
   }
 
-  return <img src={imageSrc || ''} alt={alt} {...props} />;
+  // onError as well as the fetch catch. A derivative that is present but
+  // undecodable — a truncated write, or an original a browser cannot render —
+  // comes back as HTTP 200, so the fetch succeeds and only the decode fails.
+  // Without this the component renders an <img> that silently shows nothing.
+  return (
+    <img
+      src={imageSrc || ''}
+      alt={alt}
+      {...props}
+      onError={(e) => {
+        setError(true);
+        props.onError?.(e);
+      }}
+    />
+  );
 };

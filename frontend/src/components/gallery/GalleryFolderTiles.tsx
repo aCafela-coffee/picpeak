@@ -1,5 +1,6 @@
 /**
- * Folder tiles for the gallery root (#1160).
+ * Folder tiles for the current level (#1160; nested since issue 1786 — the
+ * root shows top-level folders, an open folder its subfolders).
  *
  * Rendered above the photo grid rather than inside any one layout, so all eight
  * gallery layouts (Grid, Masonry, Justified, Mosaic, Timeline, Carousel, Story,
@@ -53,7 +54,7 @@ export const GalleryFolderTiles: React.FC<GalleryFolderTilesProps> = ({
             type="button"
             onClick={() => onOpen(folderKey(category))}
             aria-label={t('gallery.openFolder', 'Open folder {{name}}', { name: category.name })}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-surface bg-surface text-sm hover:shadow-sm transition-shadow focus:outline-none focus:ring-2 focus:ring-primary-500"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-border-token bg-surface text-sm hover:shadow-sm transition-shadow focus:outline-none focus:ring-2 focus:ring-accent"
             style={{ color: 'var(--color-text)' }}
           >
             <Folder className="w-3.5 h-3.5 text-muted-theme" />
@@ -74,13 +75,13 @@ export const GalleryFolderTiles: React.FC<GalleryFolderTilesProps> = ({
         {t('gallery.folders', 'Folders')}
       </h2>
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
-        {tiles.map(({ category, count, coverPhoto }) => (
+        {tiles.map(({ category, count, subfolderCount, coverPhoto }) => (
           <button
             key={category.id}
             type="button"
             onClick={() => onOpen(folderKey(category))}
             aria-label={t('gallery.openFolder', 'Open folder {{name}}', { name: category.name })}
-            className="group text-left rounded-lg overflow-hidden border border-surface bg-surface hover:shadow-md transition-all focus:outline-none focus:ring-2 focus:ring-primary-500"
+            className="group text-left rounded-lg overflow-hidden border border-border-token bg-surface hover:shadow-md transition-all focus:outline-none focus:ring-2 focus:ring-accent"
           >
             <div className="aspect-[4/3] relative" style={{ backgroundColor: 'var(--color-background)' }}>
               {coverPhoto?.thumbnail_url ? (
@@ -105,8 +106,16 @@ export const GalleryFolderTiles: React.FC<GalleryFolderTilesProps> = ({
                   {category.name}
                 </span>
               </div>
-              <p className="mt-1 text-sm text-muted-theme">
-                {t('gallery.folderPhotoCount', '{{count}} photos', { count })}
+              <p className="mt-1 text-sm text-muted-theme flex items-center gap-2 flex-wrap">
+                {/* Recursive (issue 1786): what the folder holds all the way
+                    down, so the number matches what opening it leads to. */}
+                <span>{t('gallery.folderPhotoCount', '{{count}} photos', { count })}</span>
+                {subfolderCount > 0 && (
+                  <span className="inline-flex items-center gap-1">
+                    <span aria-hidden="true">·</span>
+                    {t('gallery.subfolderCount', '{{count}} folders', { count: subfolderCount })}
+                  </span>
+                )}
               </p>
             </div>
           </button>

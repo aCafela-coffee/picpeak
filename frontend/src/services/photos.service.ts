@@ -1,5 +1,7 @@
 import { api } from '../config/api';
+import type { PhotoExif } from '../types';
 import { parseContentDispositionFilename } from '../utils/contentDisposition';
+import { uploadMultipartBudget } from '../utils/uploadMultipartBudget';
 
 export interface AdminPhoto {
   id: number;
@@ -8,6 +10,8 @@ export interface AdminPhoto {
   path: string;
   url: string;
   thumbnail_url: string | null;
+  // Blurred tile placeholder (issue 1733): a base64 ThumbHash, or null.
+  thumb_hash?: string | null;
   type: string;
   category_id: number | string | null;
   category_name: string | null;
@@ -16,6 +20,14 @@ export interface AdminPhoto {
   uploaded_at: string;
   media_type?: 'photo' | 'video';
   mime_type?: string | null;
+  // Browser-playable copy of a video (issue 1430, item 8); null until the
+  // setting has queued it.
+  web_status?: 'pending' | 'processing' | 'complete' | 'skipped' | 'deferred' | 'failed' | null;
+  web_error?: string | null;
+  processing_status?: 'pending' | 'processing' | 'complete' | 'failed';
+  // Set on a complete video that shows the placeholder tile because no
+  // poster frame could be taken (issue 1430, item 6).
+  processing_error?: string | null;
   view_count?: number;
   download_count?: number;
   // Feedback fields
@@ -30,6 +42,9 @@ export interface AdminPhoto {
   color_label_count?: number;
   color_labels?: Record<string, number>;
   dominant_color_label?: string | null;
+  // Approve / reject tallies across guests (issue 744).
+  approved_count?: number;
+  rejected_count?: number;
   // The requesting admin's OWN triage mark (#1044 follow-up) — separate from
   // the client's selections above, and never shown in the gallery.
   my_rating?: number | null;
@@ -37,25 +52,101 @@ export interface AdminPhoto {
   // Photo credit (#1561). The admin always sees it, whatever the event's
   // show-to-guests switch says.
   credit_name?: string | null;
-  credit_source?: 'guest' | 'exif' | 'manual' | null;
+  credit_source?: 'guest' | 'exif' | 'manual' | 'account' | null;
   uploaded_by?: 'admin' | 'guest';
+  // Camera details (issue 1733, D1); null when the photo carries none.
+  exif?: PhotoExif | null;
+  // Folders (issue 1786): the folder the photo lives in (null = gallery
+  // root), and the open folder request it waits on, if any.
+  folder_id?: number | null;
+  pending_folder_request_id?: number | null;
+  // Delivered as part of a first look (issue 1562).
+  first_look?: boolean;
+  // Review of team members' uploads (issue 743): null = published as usual.
+  moderation_status?: PhotoModerationStatus | null;
+  // Why no gallery viewer sees the photo (issue 2121): 'source_missing' when
+  // its file is gone from the external folder; null otherwise.
+  unavailable_reason?: 'source_missing' | null;
+  // The admin account that ran the upload; null for imports and older rows.
+  uploaded_by_admin?: { id: number; username: string | null } | null;
+}
+
+/** A photo a team member uploaded, waiting for the owner or turned down (issue 743). */
+export type PhotoModerationStatus = 'pending' | 'rejected';
+
+export interface PhotoModerationCounts {
+  pending: number;
+  rejected: number;
 }
 
 // Filter value for "photos without a credit" — mirrors CREDIT_NONE in
 // backend/src/services/photoCredit.js.
 export const CREDIT_FILTER_NONE = '__none__';
 
+/**
+ * What a delete did (issue 1733): `trashed` photos can be restored for
+ * `retention_days`, `deleted` ones are gone, `failed` ids are still in the
+ * gallery.
+ */
+export interface PhotoDeleteResult {
+  trashed?: number;
+  deleted?: number;
+  failed?: number[];
+  retention_days?: number;
+}
+
+export interface TrashedPhoto {
+  /** The photo's own id: trash and restore do not change it. */
+  id: number;
+  filename: string;
+  media_type: string;
+  size_bytes: number;
+  deleted_at: string;
+  deleted_by_name: string | null;
+  purge_after: string;
+  /** It was under review when deleted and comes back that way. */
+  held: boolean;
+  /** Admin-only; null when the photo has no thumbnail. */
+  thumbnail_url: string | null;
+}
+
+export interface PhotoTrash {
+  items: TrashedPhoto[];
+  /** 0: deleting is final, nothing goes to the trash. */
+  retention_days: number;
+}
+
+export interface TrashRestoreResult {
+  restored: number;
+  photo_ids: number[];
+  failed: Array<{ id: number; filename: string; code: string; error: string }>;
+}
+
+/** Admin filter on the guests' approve / reject (issue 744). */
+export type DecisionFilter = 'approved' | 'rejected' | 'undecided';
+
 export interface PhotoCreditSummary {
   credits: Array<{ name: string; count: number }>;
   none: number;
 }
 
+/** Sort keys of the admin photo list. `date` is the upload date. */
+export type PhotoSortKey = 'date' | 'name' | 'size' | 'rating' | 'capture_date';
+
+/**
+ * Folder filter of the admin photo list (issue 1786): `root` = photos in no
+ * folder, a number = the photos directly in that folder, `pending` = photos
+ * waiting for a folder request. Absent = every photo.
+ */
+export type PhotoFolderFilter = number | 'root' | 'pending';
+
 export interface PhotoFilters {
   category_id?: number | string | null;
+  folder_id?: PhotoFolderFilter;
   type?: string;
   media_type?: 'photo' | 'video';
   search?: string;
-  sort?: 'date' | 'name' | 'size' | 'rating';
+  sort?: PhotoSortKey;
   order?: 'asc' | 'desc';
   hasLikes?: boolean;
   hasFavorites?: boolean;
@@ -65,9 +156,54 @@ export interface PhotoFilters {
   colorLabels?: string[];
   /** Same, against the caller's own marks. */
   myColorLabels?: string[];
+  /** Approve / reject (issue 744); several OR together. */
+  decisions?: DecisionFilter[];
   /** Exact credit name, or CREDIT_FILTER_NONE (#1561). */
   credit?: string;
+  /** Only the photos under review with this status (issue 743). */
+  moderation?: PhotoModerationStatus;
+  /** Only the photos whose file is gone from the external folder (issue 2121). */
+  unavailable?: boolean;
   logic?: 'AND' | 'OR';
+}
+
+/**
+ * Where one upload batch lands (issues 1786 + 1562). The folder fields come
+ * from POST …/folders/resolve; one batch is one placement.
+ */
+export interface UploadPlacement {
+  /** Filter category for every file of the batch. */
+  categoryId?: number | null;
+  /** Target folder; null/absent = gallery root. */
+  folderId?: number | null;
+  /** Open folder request the batch waits on (the server parks it in the request's fallback folder). */
+  folderRequestId?: number | null;
+  /** The batch came from a first-look keyword folder. */
+  firstLook?: boolean;
+}
+
+/** The folder half of a placement, as the chunked-upload helpers take it. */
+export type FolderPlacement = Omit<UploadPlacement, 'categoryId'>;
+
+/**
+ * Placement fields of the chunked complete body. category_id is always sent
+ * (as before); the folder fields only when set, so a plain upload's body is
+ * unchanged.
+ */
+export function uploadPlacementBody(placement: UploadPlacement): Record<string, number | boolean | null> {
+  const body: Record<string, number | boolean | null> = { category_id: placement.categoryId ?? null };
+  if (placement.folderId) body.folder_id = placement.folderId;
+  if (placement.folderRequestId) body.folder_request_id = placement.folderRequestId;
+  if (placement.firstLook) body.first_look = true;
+  return body;
+}
+
+/** The same fields on a multipart upload; only the ones that are set. */
+export function appendUploadPlacement(formData: FormData, placement: UploadPlacement): void {
+  if (placement.categoryId) formData.append('category_id', placement.categoryId.toString());
+  if (placement.folderId) formData.append('folder_id', placement.folderId.toString());
+  if (placement.folderRequestId) formData.append('folder_request_id', placement.folderRequestId.toString());
+  if (placement.firstLook) formData.append('first_look', 'true');
 }
 
 class PhotosService {
@@ -91,6 +227,7 @@ class PhotosService {
       if (filters.category_id !== undefined) {
         params.append('category_id', filters.category_id?.toString() || '');
       }
+      if (filters.folder_id !== undefined) params.append('folder_id', String(filters.folder_id));
       if (filters.type) params.append('type', filters.type);
       if (filters.media_type) params.append('media_type', filters.media_type);
       if (filters.search) params.append('search', filters.search);
@@ -108,7 +245,12 @@ class PhotosService {
       if (filters.myColorLabels && filters.myColorLabels.length > 0) {
         params.append('my_color_label', filters.myColorLabels.join(','));
       }
+      if (filters.decisions && filters.decisions.length > 0) {
+        params.append('decision', filters.decisions.join(','));
+      }
       if (filters.credit) params.append('credit', filters.credit);
+      if (filters.moderation) params.append('moderation', filters.moderation);
+      if (filters.unavailable) params.append('unavailable', 'true');
       if (filters.logic) params.append('logic', filters.logic);
     }
     
@@ -120,6 +262,22 @@ class PhotosService {
     
     // Return photos as-is, URLs are already relative API paths
     return response.data.photos;
+  }
+
+  /** How many photos of the event wait for review or were rejected (issue 743). */
+  async getModerationCounts(eventId: number): Promise<PhotoModerationCounts> {
+    const response = await api.get<{ moderation: PhotoModerationCounts }>(`/admin/photos/${eventId}/photos/moderation`);
+    return response.data.moderation;
+  }
+
+  /** Publish (approve) or turn down (reject) photos under review; owner only. */
+  async moderatePhotos(
+    eventId: number,
+    photoIds: number[],
+    action: 'approve' | 'reject'
+  ): Promise<{ updated: number; moderation: PhotoModerationCounts }> {
+    const response = await api.post(`/admin/photos/${eventId}/photos/moderation`, { photoIds, action });
+    return response.data;
   }
 
   /** The names on this event's photos with their counts (#1561). */
@@ -141,12 +299,33 @@ class PhotosService {
     return response.data;
   }
 
-  async deletePhoto(eventId: number, photoId: number): Promise<void> {
-    await api.delete(`/admin/events/${eventId}/photos/${photoId}`);
+  async deletePhoto(eventId: number, photoId: number): Promise<PhotoDeleteResult> {
+    const response = await api.delete(`/admin/events/${eventId}/photos/${photoId}`);
+    return response.data;
   }
 
-  async deletePhotos(eventId: number, photoIds: number[]): Promise<void> {
-    await api.post(`/admin/events/${eventId}/photos/bulk-delete`, { photoIds });
+  async deletePhotos(eventId: number, photoIds: number[]): Promise<PhotoDeleteResult> {
+    const response = await api.post(`/admin/events/${eventId}/photos/bulk-delete`, { photoIds });
+    return response.data;
+  }
+
+  /** The gallery's trash (issue 1733): deleted photos that can still be restored. */
+  async getTrash(eventId: number): Promise<PhotoTrash> {
+    const response = await api.get(`/admin/events/${eventId}/photos/trash`);
+    return response.data;
+  }
+
+  async restoreFromTrash(eventId: number, ids: number[]): Promise<TrashRestoreResult> {
+    // 409 carries the same body: nothing could be restored, and why.
+    const response = await api.post(`/admin/events/${eventId}/photos/trash/restore`, { ids }, {
+      validateStatus: (status) => (status >= 200 && status < 300) || status === 409,
+    });
+    return response.data;
+  }
+
+  async purgeFromTrash(eventId: number, ids: number[]): Promise<{ purged: number; failed: number[] }> {
+    const response = await api.post(`/admin/events/${eventId}/photos/trash/purge`, { ids });
+    return response.data;
   }
 
   async updatePhotoCategory(eventId: number, photoId: number, categoryId: number | string | null): Promise<AdminPhoto> {
@@ -161,11 +340,16 @@ class PhotosService {
     });
   }
 
-  async bulkUpdatePhotos(eventId: number, photoIds: number[], updates: Record<string, unknown>): Promise<void> {
-    await api.post(`/admin/events/${eventId}/photos/bulk-update`, {
+  /**
+   * `skipped_under_review`: photos a visibility change left alone because they
+   * wait for review (issue 743); only approving them publishes them.
+   */
+  async bulkUpdatePhotos(eventId: number, photoIds: number[], updates: Record<string, unknown>): Promise<{ skipped_under_review?: number }> {
+    const response = await api.post(`/admin/events/${eventId}/photos/bulk-update`, {
       photoIds,
       updates
     });
+    return response.data;
   }
 
   async downloadPhoto(eventId: number, photoId: number, filename: string): Promise<void> {
@@ -245,11 +429,15 @@ class PhotosService {
   async completeChunkedUpload(
     eventId: number,
     uploadId: string,
-    categoryId?: number | null
+    categoryId?: number | null,
+    folder: FolderPlacement = {},
+    detectDuplicates = false
   ): Promise<{ success: boolean; uploaded: number; photos: AdminPhoto[] }> {
     const response = await api.post(
       `/admin/photos/${eventId}/chunked-upload/${uploadId}/complete`,
-      { category_id: categoryId },
+      // detect_duplicates asks the server to refuse a file the gallery already
+      // holds (issue 1733, C2); "upload anyway" leaves it out.
+      { ...uploadPlacementBody({ ...folder, categoryId }), ...(detectDuplicates ? { detect_duplicates: true } : {}) },
       // Merge + ffmpeg thumbnail can take a while on large videos.
       { timeout: 0 }
     );
@@ -264,7 +452,9 @@ class PhotosService {
     eventId: number,
     file: File,
     categoryId?: number | null,
-    onProgress?: (progress: number) => void
+    onProgress?: (progress: number) => void,
+    folder: FolderPlacement = {},
+    detectDuplicates = false
   ): Promise<AdminPhoto[]> {
     // Initialize upload
     const { uploadId, expectedChunks } = await this.initChunkedUpload(
@@ -289,7 +479,7 @@ class PhotosService {
       }
 
       // Complete upload
-      const result = await this.completeChunkedUpload(eventId, uploadId, categoryId);
+      const result = await this.completeChunkedUpload(eventId, uploadId, categoryId, folder, detectDuplicates);
       return result.photos;
     } catch (error) {
       // Abort on error
@@ -305,7 +495,7 @@ class PhotosService {
   // Check if file should use chunked upload (default > 95MB Cloudflare-safe batch).
   shouldUseChunkedUpload(fileSize: number, thresholdBytes?: number): boolean {
     const threshold = thresholdBytes ?? this.DEFAULT_CHUNKED_THRESHOLD;
-    return fileSize > threshold;
+    return fileSize > uploadMultipartBudget(threshold);
   }
 
   // ============================================
@@ -329,6 +519,9 @@ class PhotosService {
     }
     if (filters.myColorLabels && filters.myColorLabels.length > 0) {
       params.append('my_color_labels', filters.myColorLabels.join(','));
+    }
+    if (filters.decisions && filters.decisions.length > 0) {
+      params.append('decisions', filters.decisions.join(','));
     }
     if (filters.categoryId) params.append('category_id', filters.categoryId.toString());
     if (filters.logic) params.append('logic', filters.logic);
@@ -428,6 +621,8 @@ export interface FeedbackFilters {
   colorLabels?: string[];
   /** Same, against the caller's own marks. */
   myColorLabels?: string[];
+  /** Approve / reject (issue 744). Empty = no filtering. */
+  decisions?: DecisionFilter[];
   categoryId?: number;
   logic?: 'AND' | 'OR';
   sort?: 'rating' | 'likes' | 'favorites' | 'date' | 'filename';
@@ -447,6 +642,10 @@ export interface FilterSummary {
   colorLabelCounts?: Record<string, number>;
   /** Same, for the caller's own marks. */
   myColorLabelCounts?: Record<string, number>;
+  /** Photos some guest approved / rejected / either (issue 744). */
+  withApproved?: number;
+  withRejected?: number;
+  withDecisions?: number;
 }
 
 export interface FilteredPhotosResponse {
@@ -477,6 +676,7 @@ export interface ExportFilter {
   has_comments?: boolean;
   color_labels?: string[];
   my_color_labels?: string[];
+  decisions?: DecisionFilter[];
   category_id?: number;
   logic?: 'AND' | 'OR';
   sort?: 'rating' | 'likes' | 'favorites' | 'date' | 'filename';

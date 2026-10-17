@@ -1,13 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Calendar, Heart } from 'lucide-react';
-import { format, parseISO, startOfDay, startOfWeek, startOfMonth } from 'date-fns';
+import { format, startOfDay, startOfWeek, startOfMonth } from 'date-fns';
 import { useTheme } from '../../../contexts/ThemeContext';
 import { PhotoCard } from '../PhotoCard';
+import { firstLookAboveChips } from '../GalleryTileBadges';
+import { ClientVisibilityToggle, isHiddenFromGuests } from '../ClientVisibilityToggle';
 import type { BaseGalleryLayoutProps } from './BaseGalleryLayout';
 import type { Photo } from '../../../types';
+import { useLazyBands } from './lazyBands';
 import { FeedbackIdentityModal } from '../../gallery/FeedbackIdentityModal';
 import { feedbackService } from '../../../services/feedback.service';
-import { useLocalizedDate } from '../../../hooks/useLocalizedDate';
+import { toDisplayDate, useLocalizedDate } from '../../../hooks/useLocalizedDate';
 
 export const TimelineGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
   photos,
@@ -20,8 +23,11 @@ export const TimelineGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
   onPhotoSelect,
   allowDownloads = true,
   feedbackEnabled = false,
-  feedbackOptions
+  feedbackOptions,
+  isClient = false,
+  onToggleVisibility,
 }) => {
+  const bands = useLazyBands();
   const { theme } = useTheme();
   const { formatTime: fmtTime } = useLocalizedDate();
   const [likedIds, setLikedIds] = useState<Set<number>>(new Set());
@@ -45,8 +51,12 @@ export const TimelineGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
   // uploaded_at (pre-fix archive restores) — parseISO throws on numbers
   // and crashed the whole Timeline view (#485 class). The API normalizes
   // to ISO now; this guard covers stale caches and old backends.
+  // Strings go through the date hook's parser, so SQLite's zone-less
+  // 'YYYY-MM-DD HH:MM:SS' is read as UTC here exactly as the time chip reads
+  // it; a local reading filed a photo under a different day than its chip
+  // shows (issue 1815).
   const parseUploadedAt = (value: string | number) =>
-    typeof value === 'string' ? parseISO(value) : new Date(value);
+    typeof value === 'string' ? toDisplayDate(value) : new Date(value);
 
   // Group photos by date
   const groupedPhotos = useMemo(() => {
@@ -84,10 +94,19 @@ export const TimelineGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
       .map(([date, photos]) => ({
         date,
         label: photos[0] ? format(parseUploadedAt(photos[0].uploaded_at), grouping === 'month' ? 'MMMM yyyy' : grouping === 'week' ? "'Week of' MMM d, yyyy" : 'EEEE, MMMM d, yyyy') : date,
-        photos: photos.sort((a, b) => new Date(b.uploaded_at).getTime() - new Date(a.uploaded_at).getTime())
+        photos: photos.sort((a, b) => parseUploadedAt(b.uploaded_at).getTime() - parseUploadedAt(a.uploaded_at).getTime())
       }))
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   }, [photos, grouping]);
+
+  // Position of each photo in `photos`, which is what the lightbox indexes
+  // by. Grouping reorders the tiles, and a `findIndex` per tile made every
+  // render of an N-photo gallery O(N²) (issue 1733).
+  const photoIndexById = useMemo(() => {
+    const map = new Map<number, number>();
+    photos.forEach((photo, index) => map.set(photo.id, index));
+    return map;
+  }, [photos]);
 
   return (
     <div className="relative">
@@ -101,7 +120,7 @@ export const TimelineGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
             {/* Date marker */}
             {showDates && (
               <div className="flex items-center gap-4 mb-6">
-                <div className="hidden lg:flex items-center justify-center w-16 h-16 bg-white border-4 border-accent-dark rounded-full z-10">
+                <div className="hidden lg:flex items-center justify-center w-16 h-16 bg-surface border-4 border-accent-dark rounded-full z-10">
                   <Calendar className="w-6 h-6 text-accent" />
                 </div>
                 <h3 className="text-xl font-semibold text-theme">
@@ -113,10 +132,12 @@ export const TimelineGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
             {/* Photos grid for this date */}
             <div className="photo-grid lg:ml-24 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
               {group.photos.map((photo) => {
-                const actualIndex = photos.findIndex(p => p.id === photo.id);
+                const actualIndex = photoIndexById.get(photo.id) ?? -1;
                 return (
                   <PhotoCard
                     key={photo.id}
+                    // Above the always-present time chip (issue 1562).
+                    firstLookClassName={firstLookAboveChips(photo.type === 'collage' ? 2 : 1)}
                     photo={photo}
                     isSelected={selectedPhotos.has(photo.id)}
                     isSelectionMode={isSelectionMode}
@@ -124,10 +145,20 @@ export const TimelineGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
                     onDownload={(e) => onDownload(photo, e)}
                     onToggleSelect={() => onPhotoSelect && onPhotoSelect(photo.id)}
                     className="photo-card relative group cursor-pointer aspect-square"
+                    // Issue 1733: skip offscreen tile work, as in Grid — the
+                    // `aspect-square` box needs no intrinsic size.
+                    style={{ contentVisibility: 'auto' }}
+                    // Lazy mount + release with Grid's bands (issue 1733).
+                    // AuthenticatedImage fetches on mount, so without `lazy`
+                    // every tile of the gallery was requested on first render.
+                    lazy
+                    inViewRootMargin={bands.load}
+                    releaseRootMargin={bands.keep}
                     imageProps={{
                       src: photo.thumbnail_url || photo.url,
                       alt: photo.filename,
-                      className: 'w-full h-full object-cover rounded-lg',
+                      // Dimmed when the client hid it from guests, as in Grid (issue 1992).
+                      className: `w-full h-full object-cover rounded-lg${isClient && onToggleVisibility && isHiddenFromGuests(photo) ? ' opacity-40' : ''}`,
                       loading: 'lazy',
                       isGallery: true,
                     }}
@@ -148,12 +179,16 @@ export const TimelineGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
                       });
                     }}
                     savedIdentity={savedIdentity}
+                    onIdentitySaved={setSavedIdentity}
                     onRequireIdentity={(action, photoId) => {
                       setPendingAction({ type: action, photoId });
                       setShowIdentityModal(true);
                     }}
                     likeBeforeComment
                     checkboxTestId
+                    topLeftControl={isClient && onToggleVisibility
+                      ? <ClientVisibilityToggle photo={photo} onToggle={onToggleVisibility} />
+                      : undefined}
                     beforeOverlay={
                       <div className="absolute bottom-2 left-2 px-2 py-1 bg-black/60 text-white text-xs rounded">
                         {fmtTime(photo.uploaded_at)}
@@ -162,7 +197,7 @@ export const TimelineGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
                     afterOverlay={((photo.like_count ?? 0) > 0 || likedIds.has(photo.id)) ? (
                       <div className={`absolute ${photo.type === 'collage' ? 'bottom-8' : 'bottom-2'} left-2 z-10`}>
                         <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-white/90 backdrop-blur-sm" title="Liked">
-                          <Heart className="w-3.5 h-3.5 text-red-500" fill="currentColor" />
+                          <Heart className="w-3.5 h-3.5 text-danger" fill="currentColor" />
                         </span>
                       </div>
                     ) : undefined}

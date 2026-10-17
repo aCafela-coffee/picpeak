@@ -32,11 +32,25 @@ const path = require('path');
 
 const { getAppSetting } = require('../utils/appSettings');
 const { buildContentDisposition } = require('../utils/filenameSanitizer');
+const { ALLOWED_IMAGE_TYPES } = require('../utils/fileSecurityUtils');
 
 const DEFAULT_ALLOWED_MIME = [
   'image/jpeg', 'image/png', 'image/webp', 'image/gif',
   'image/tiff', 'application/pdf', 'application/zip', 'application/x-zip-compressed',
 ];
+
+// Every camera RAW type, as MIME -> extensions.
+//
+// Read off the upload registry rather than written out again. This is a
+// lookup, not the gate the docblock above refuses: nothing here decides what a
+// transfer may contain. It only supplies the extensions for a type the admin
+// has already listed, and RAW is the set where that matters most, because the
+// browser sends no MIME for these at all.
+const RAW_MIME_EXTENSIONS = Object.fromEntries(
+  Object.entries(ALLOWED_IMAGE_TYPES)
+    .filter(([, config]) => config.raw)
+    .map(([mime, config]) => [mime, config.extensions])
+);
 
 // Mirrors migration 257's table. Used only to give a legacy flat MIME list
 // sensible extensions when `transfer_upload_allowed_types` is missing.
@@ -49,7 +63,7 @@ const LEGACY_MIME_EXTENSIONS = {
   'image/svg+xml': ['.svg'],
   'image/heic': ['.heic'],
   'image/heif': ['.heif'],
-  'image/x-adobe-dng': ['.dng'],
+  ...RAW_MIME_EXTENSIONS,
   'application/pdf': ['.pdf'],
   'application/zip': ['.zip'],
   // What Chrome and Firefox on Windows actually send for a .zip.
@@ -154,8 +168,30 @@ async function getTransferUploadPolicy() {
   }
 
   const maxSizeMb = Number(await getAppSetting('transfer_max_upload_size_mb', 50)) || 50;
+  const maxFiles = normalizeMaxFiles(await getAppSetting('transfer_upload_max_files', DEFAULT_MAX_FILES))
+    || DEFAULT_MAX_FILES;
 
-  return { acceptAll, allowedTypes, maxSizeMb };
+  return { acceptAll, allowedTypes, maxSizeMb, maxFiles };
+}
+
+// How many files a client may select in one upload round (issue 1914). 25 was
+// the hardcoded value; the ceiling keeps one round a size the per-request
+// multer limits and the upload page can still handle.
+const DEFAULT_MAX_FILES = 25;
+const MAX_FILES_CEILING = 1000;
+
+/** A usable files-per-upload value, or null for anything else. */
+function normalizeMaxFiles(value) {
+  const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+  return Number.isInteger(n) && n >= 1 && n <= MAX_FILES_CEILING ? n : null;
+}
+
+/**
+ * The limit in force for one file request: its own override when it has one,
+ * otherwise the global default from `policy`.
+ */
+function effectiveMaxFiles(transfer, policy) {
+  return normalizeMaxFiles(transfer && transfer.max_files_per_upload) || policy.maxFiles;
 }
 
 /**
@@ -257,6 +293,10 @@ module.exports = {
   SAFE_ECHO_MIME,
   normalizeAllowedTypes,
   getTransferUploadPolicy,
+  DEFAULT_MAX_FILES,
+  MAX_FILES_CEILING,
+  normalizeMaxFiles,
+  effectiveMaxFiles,
   validateTransferFileType,
   allowedMimeList,
   allowedExtensionList,

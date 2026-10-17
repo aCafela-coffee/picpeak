@@ -12,12 +12,12 @@
  * it was loaded from, and the events row only receives the fields whose
  * request value differs. A save the admin never touched writes nothing.
  */
-import { format } from 'date-fns';
-import type { Event } from '../../../../types';
+import type { AssignedAdmin, Event } from '../../../../types';
 import type { FeedbackSettings } from '../../../../services/feedback.service';
 import { DEFAULT_SLIDESHOW_STYLE, type SlideshowStyle } from '../../../../services/slideshow.service';
 import { GALLERY_THEME_PRESETS, type ThemeConfig } from '../../../../types/theme.types';
 import { normalizeRequirePassword } from '../../../../utils/accessControl';
+import { expiryDay } from '../../../../utils/expiryDay';
 import type { CustomerGroup } from '../../../../services/customerAdmin.service';
 import type { EditFormState } from '../types';
 import { safeParseDate } from '../utils';
@@ -29,12 +29,20 @@ export type SettingsSectionKey =
   | 'guests'
   | 'appearance'
   | 'source'
+  | 'delivery'
   | 'reminder'
   | 'slideshow'
   | 'faces'
+  | 'tags'
   | 'danger';
 
 export interface EventFields extends EditFormState {
+  /**
+   * Read-only. The gallery's password was generated for portal-only access
+   * (migration 264) and no customer email has been told it, so adding one
+   * needs a real password first — the gallery email carries it.
+   */
+  generated_password_pending: boolean;
   /** Off: the gallery renders the global Branding theme. */
   custom_theme_enabled: boolean;
   /** The gallery's own theme; only written while custom_theme_enabled is on. */
@@ -43,6 +51,22 @@ export interface EventFields extends EditFormState {
   /** '' = inherit the global offset. */
   event_reminder_offset_days: string;
   event_reminder_body_override: string;
+  /** Mirror subfolders of uploads and imports as gallery folders (issue 1786). */
+  folder_structure: boolean;
+  /** Two-stage delivery (issue 1562). */
+  delivery_status: 'complete' | 'partial';
+  /** '' = not set. */
+  delivery_expected_count: string;
+  /** 'yyyy-MM-dd', '' = not set. */
+  delivery_due_at: string;
+  /** '' = the translated default ("First look"). */
+  delivery_badge_label: string;
+  /** Team members (issue 743); only the owner changes them. */
+  assigned_admins: AssignedAdmin[];
+  /** Hold the team members' uploads until the owner approves them. */
+  review_contributor_uploads: boolean;
+  /** Hold guest uploads until the owner or a reviewer approves them. */
+  moderate_guest_uploads: boolean;
 }
 
 export const INHERIT = '__inherit__';
@@ -102,8 +126,28 @@ export function usesCustomTheme(event: Event): boolean {
   return truthy(event.custom_theme_enabled);
 }
 
+/**
+ * The date field's value for a stored expiry: the day it stands for in the
+ * instance time zone (`timeZone`, from the event detail payload). See
+ * utils/expiryDay for the stored shapes.
+ */
+export function expiryDateField(value: unknown, timeZone?: string | null): string {
+  const date = safeParseDate(value);
+  return date ? expiryDay(date, timeZone) : '';
+}
+
+/**
+ * The date field's value for a stored delivery due date: its UTC date, the
+ * day deliveryDue() and the backend's due/overdue checks read. The field
+ * stores noon UTC, which the browser zone would push to the next day east of
+ * UTC+12.
+ */
+export function deliveryDueDateField(value: unknown): string {
+  const date = safeParseDate(value);
+  return date && !Number.isNaN(date.getTime()) ? date.toISOString().slice(0, 10) : '';
+}
+
 export function eventFieldsFromEvent(event: Event, branding: ThemeConfig | null | undefined): EventFields {
-  const expiresAt = safeParseDate(event.expires_at);
   const extra = event as Event & {
     promo_mode?: 'inherit' | 'custom' | 'off';
     info_mode?: 'inherit' | 'custom' | 'off';
@@ -115,7 +159,7 @@ export function eventFieldsFromEvent(event: Event, branding: ThemeConfig | null 
     welcome_message: event.welcome_message || '',
     color_theme: event.color_theme || '',
     css_template_id: event.css_template_id ?? null,
-    expires_at: expiresAt ? format(expiresAt, 'yyyy-MM-dd') : '',
+    expires_at: expiryDateField(event.expires_at, event.expiry_time_zone),
     allow_user_uploads: truthy(event.allow_user_uploads),
     reveal_mode: truthy(event.reveal_mode),
     // datetime-local wants local "YYYY-MM-DDTHH:mm"
@@ -123,12 +167,16 @@ export function eventFieldsFromEvent(event: Event, branding: ThemeConfig | null 
       ? (() => { const d = new Date(event.reveal_at); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); })()
       : '',
     upload_category_id: event.upload_category_id || null,
+    guest_upload_max_edge: event.guest_upload_max_edge ? String(event.guest_upload_max_edge) : '',
     guest_name_mode: event.guest_name_mode || 'off',
     show_credits_to_guests: truthy(event.show_credits_to_guests),
+    live_refresh: truthy(event.live_refresh),
+    show_exif_to_guests: truthy(event.show_exif_to_guests),
     hero_photo_id: event.hero_photo_id || null,
     customer_name: event.customer_name || '',
     customer_email: event.customer_email || '',
     customer_phone: event.customer_phone || '',
+    generated_password_pending: truthy((event as Event & { password_generated?: unknown }).password_generated) && !event.customer_email,
     source_mode: event.source_mode === 'reference' ? 'reference' : 'managed',
     external_path: event.external_path || '',
     external_watch: truthy(event.external_watch),
@@ -139,6 +187,7 @@ export function eventFieldsFromEvent(event: Event, branding: ThemeConfig | null 
     disable_right_click: event.disable_right_click == null ? true : truthy(event.disable_right_click),
     allow_downloads: event.allow_downloads == null ? true : truthy(event.allow_downloads),
     watermark_downloads: truthy(event.watermark_downloads),
+    watermark_text: event.watermark_text || '',
     enable_devtools_protection: event.enable_devtools_protection == null ? true : truthy(event.enable_devtools_protection),
     use_canvas_rendering: truthy(event.use_canvas_rendering),
     // null = inherit the global branding toggle / size (#756)
@@ -164,6 +213,14 @@ export function eventFieldsFromEvent(event: Event, branding: ThemeConfig | null 
     event_reminder_disabled: truthy(event.event_reminder_disabled),
     event_reminder_offset_days: event.event_reminder_offset_days == null ? '' : String(event.event_reminder_offset_days),
     event_reminder_body_override: event.event_reminder_body_override || '',
+    folder_structure: truthy(event.folder_structure),
+    delivery_status: event.delivery_status === 'partial' ? 'partial' : 'complete',
+    delivery_expected_count: event.delivery_expected_count ? String(event.delivery_expected_count) : '',
+    delivery_due_at: deliveryDueDateField(event.delivery_due_at),
+    delivery_badge_label: event.delivery_badge_label || '',
+    assigned_admins: event.assigned_admins || [],
+    review_contributor_uploads: truthy(event.review_contributor_uploads),
+    moderate_guest_uploads: truthy(event.moderate_guest_uploads),
   };
 }
 
@@ -190,6 +247,9 @@ export const SECTION_OF_FIELD: Record<keyof EventFields, SettingsSectionKey> = {
   customer_email: 'general',
   customer_phone: 'general',
   customer_accounts: 'general',
+  generated_password_pending: 'general',
+  assigned_admins: 'general',
+  review_contributor_uploads: 'general',
   expires_at: 'access',
   require_password: 'access',
   new_password: 'access',
@@ -201,12 +261,17 @@ export const SECTION_OF_FIELD: Record<keyof EventFields, SettingsSectionKey> = {
   disable_right_click: 'downloads',
   allow_downloads: 'downloads',
   watermark_downloads: 'downloads',
+  watermark_text: 'downloads',
   enable_devtools_protection: 'downloads',
   use_canvas_rendering: 'downloads',
   allow_user_uploads: 'guests',
   upload_category_id: 'guests',
+  moderate_guest_uploads: 'guests',
+  guest_upload_max_edge: 'guests',
   guest_name_mode: 'guests',
   show_credits_to_guests: 'guests',
+  live_refresh: 'guests',
+  show_exif_to_guests: 'guests',
   reveal_mode: 'guests',
   reveal_at: 'guests',
   hero_photo_id: 'appearance',
@@ -230,6 +295,11 @@ export const SECTION_OF_FIELD: Record<keyof EventFields, SettingsSectionKey> = {
   event_reminder_disabled: 'reminder',
   event_reminder_offset_days: 'reminder',
   event_reminder_body_override: 'reminder',
+  folder_structure: 'delivery',
+  delivery_status: 'delivery',
+  delivery_expected_count: 'delivery',
+  delivery_due_at: 'delivery',
+  delivery_badge_label: 'delivery',
 };
 
 /** Key-order independent JSON, so two equal drafts always compare equal. */
@@ -259,6 +329,24 @@ export function dirtySections(draft: EventSettingsDraft, base: EventSettingsDraf
 }
 
 /**
+ * The draft with one section put back to the server state ("Undo changes in
+ * this section"). Every other section keeps its edits.
+ */
+export function resetSection(draft: EventSettingsDraft, base: EventSettingsDraft, section: SettingsSectionKey): EventSettingsDraft {
+  const fields = { ...draft.event } as Record<string, unknown>;
+  const baseFields = base.event as unknown as Record<string, unknown>;
+  (Object.keys(SECTION_OF_FIELD) as Array<keyof EventFields>).forEach((key) => {
+    if (SECTION_OF_FIELD[key] === section) fields[key] = baseFields[key];
+  });
+  return {
+    event: fields as unknown as EventFields,
+    feedback: section === 'guests' ? base.feedback : draft.feedback,
+    downloads: section === 'downloads' ? base.downloads : draft.downloads,
+    slideshow: section === 'slideshow' ? base.slideshow : draft.slideshow,
+  };
+}
+
+/**
  * The draft after the server state moved from `prevBase` to `server`. On the
  * events row this goes per FIELD: a field the admin has not touched takes the
  * server value, so a change made elsewhere (an instant action, another admin,
@@ -282,6 +370,10 @@ export function rebaseDraft(current: EventSettingsDraft, prevBase: EventSettings
   };
 }
 
+// The range the server accepts (services/guestUploadDownscale.js).
+export const GUEST_UPLOAD_MIN_EDGE = 1024;
+export const GUEST_UPLOAD_MAX_EDGE = 16384;
+
 export class DraftValidationError extends Error {
   readonly section: SettingsSectionKey;
 
@@ -304,23 +396,33 @@ function requestFields(f: EventFields): Record<string, unknown> {
   const body: Record<string, unknown> = {
     welcome_message: f.welcome_message,
     customer_name: f.customer_name,
-    customer_email: f.customer_email.trim() || undefined,
-    // '' as null so an admin can clear it; the backend drops it when the
-    // global phone field is off.
+    // '' as null so an admin can clear them (issue 1733; the email used to
+    // go out as undefined, which the payload loop skips, so it could never be
+    // cleared). The backend refuses the clear where Settings require the
+    // field, and drops the phone when the global phone field is off.
+    customer_email: f.customer_email.trim() || null,
     customer_phone: f.customer_phone.trim() || null,
     customer_account_ids: f.customer_accounts.map((c) => c.id),
+    // Only sent when changed, so a team member's save never carries them.
+    assigned_admin_ids: f.assigned_admins.map((a) => a.id),
+    review_contributor_uploads: f.review_contributor_uploads,
     expires_at: f.expires_at || null,
     require_password: f.require_password,
     allow_user_uploads: f.allow_user_uploads,
     upload_category_id: f.upload_category_id,
+    moderate_guest_uploads: f.moderate_guest_uploads,
+    guest_upload_max_edge: f.guest_upload_max_edge.trim() === '' ? null : Number(f.guest_upload_max_edge),
     guest_name_mode: f.guest_name_mode,
     show_credits_to_guests: f.show_credits_to_guests,
+    live_refresh: f.live_refresh,
+    show_exif_to_guests: f.show_exif_to_guests,
     reveal_mode: reveal,
     reveal_at: reveal && f.reveal_at ? new Date(f.reveal_at).toISOString() : null,
     protection_level: f.protection_level,
     disable_right_click: f.disable_right_click,
     allow_downloads: f.allow_downloads,
     watermark_downloads: f.watermark_downloads,
+    watermark_text: f.watermark_text.trim(),
     enable_devtools_protection: f.enable_devtools_protection,
     use_canvas_rendering: f.use_canvas_rendering,
     photo_cap: f.photo_cap > 0 ? f.photo_cap : null,
@@ -344,6 +446,12 @@ function requestFields(f: EventFields): Record<string, unknown> {
     event_reminder_disabled: f.event_reminder_disabled,
     event_reminder_offset_days: offset === '' ? null : Math.floor(Number(offset)),
     event_reminder_body_override: f.event_reminder_body_override.trim() === '' ? null : f.event_reminder_body_override,
+    folder_structure: f.folder_structure,
+    delivery_status: f.delivery_status,
+    delivery_expected_count: f.delivery_expected_count.trim() === '' ? null : Math.floor(Number(f.delivery_expected_count)),
+    // Noon UTC: a calendar date that reads the same in every timezone.
+    delivery_due_at: f.delivery_due_at ? `${f.delivery_due_at}T12:00:00.000Z` : null,
+    delivery_badge_label: f.delivery_badge_label.trim() === '' ? null : f.delivery_badge_label.trim(),
   };
   // The gallery's own look is only written while it is in use; switching
   // custom styling off leaves the stored theme for a later switch back on.
@@ -356,12 +464,20 @@ function requestFields(f: EventFields): Record<string, unknown> {
   return body;
 }
 
+/** Adding a customer email to this gallery needs a password first (see generated_password_pending). */
+export function emailNeedsPassword(f: EventFields): boolean {
+  return f.generated_password_pending && f.require_password && !!f.customer_email.trim();
+}
+
 /** The fields to PUT, or null when the events row is unchanged. */
 export function eventUpdatePayload(
   draft: EventFields,
   base: EventFields,
   t: Translate,
 ): Record<string, unknown> | null {
+  if (emailNeedsPassword(draft) && !draft.new_password) {
+    throw new DraftValidationError(t('events.recipients.passwordForEmailRequired', 'Set a gallery password before adding the customer email — the gallery email carries it.'), 'general');
+  }
   if (draft.require_password) {
     if (draft.require_password !== base.require_password && !draft.new_password) {
       throw new DraftValidationError(t('events.newPasswordRequired', 'Please set a password before enabling protection.'), 'access');
@@ -381,6 +497,18 @@ export function eventUpdatePayload(
   const offset = draft.event_reminder_offset_days.trim();
   if (offset !== '' && (!Number.isFinite(Number(offset)) || Number(offset) < 0)) {
     throw new DraftValidationError(t('eventReminderOverride.invalidOffset', 'Offset must be a non-negative integer or blank.'), 'reminder');
+  }
+  const maxEdge = draft.guest_upload_max_edge.trim();
+  if (maxEdge !== '' && (!Number.isInteger(Number(maxEdge))
+    || Number(maxEdge) < GUEST_UPLOAD_MIN_EDGE || Number(maxEdge) > GUEST_UPLOAD_MAX_EDGE)) {
+    throw new DraftValidationError(
+      t('events.guestUploadMaxEdgeInvalid', 'The longest edge must be a whole number from 1024 to 16384, or empty.'),
+      'guests',
+    );
+  }
+  const expected = draft.delivery_expected_count.trim();
+  if (expected !== '' && (!Number.isInteger(Number(expected)) || Number(expected) < 1)) {
+    throw new DraftValidationError(t('events.delivery.invalidExpected', 'The expected number of photos must be a whole number above 0, or empty.'), 'delivery');
   }
 
   const next = requestFields(draft);

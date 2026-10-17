@@ -1,6 +1,6 @@
 # Frontend-only overlay. Runtime, backend, dependencies, environment, volume,
 # healthcheck, entrypoint and command are inherited from this exact official AIO.
-# Source: 76492c11836fdf0e79e8cecfbc18e004e0cde9cc (see aio-baseline.json).
+# Source: ec7b22354fd6b5a66aec9e2a965e22fbcf7334f2 (see aio-baseline.json).
 FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
 WORKDIR /app
 COPY frontend/package*.json ./
@@ -8,13 +8,13 @@ RUN npm ci --legacy-peer-deps
 COPY frontend/ .
 RUN npm run build
 
-FROM ghcr.io/picpeak/picpeak/aio@sha256:dde09c55e29bc40065f33d94a18f2cc90a604e5c02c4b62bd1dcd1a504226588
+FROM ghcr.io/picpeak/picpeak/aio@sha256:efd3fa3473e6ac6f518fdead86c43deaa3eca5ce28abec22928e8e2f6cdca4bc
 ARG VCS_REF
 LABEL org.opencontainers.image.source="https://github.com/aCafela-coffee/picpeak" \
       org.opencontainers.image.revision="$VCS_REF" \
       org.opencontainers.image.description="PicPeak Korean screen translations; official backend unchanged" \
-      io.picpeak.upstream.commit="76492c11836fdf0e79e8cecfbc18e004e0cde9cc" \
-      io.picpeak.upstream.image="sha256:dde09c55e29bc40065f33d94a18f2cc90a604e5c02c4b62bd1dcd1a504226588"
+      io.picpeak.upstream.commit="ec7b22354fd6b5a66aec9e2a965e22fbcf7334f2" \
+      io.picpeak.upstream.image="sha256:efd3fa3473e6ac6f518fdead86c43deaa3eca5ce28abec22928e8e2f6cdca4bc"
 # Remove old hashed assets too; the overlay contains only the new frontend.
 RUN rm -rf /app/frontend/dist
 COPY --from=frontend-builder --chown=nodejs:nodejs /app/dist /app/frontend/dist

@@ -4,85 +4,64 @@
  * The folder itself is chosen in Settings → Photo source, never here.
  */
 import React from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'react-toastify';
-import { FolderOpen, RefreshCw } from 'lucide-react';
+import { FileX, FolderOpen, FolderTree, RefreshCw } from 'lucide-react';
 import type { Event } from '../../../types';
-import { Button } from '../../../components/common';
+import { Button, useConfirm, Badge } from '../../../components/common';
+import { folderErrorMessage, invalidateFolderViews } from '../../../components/admin/folders/folderQueries';
+import { foldersService } from '../../../services/folders.service';
 import { usePermission } from '../../../hooks/usePermission';
-import { useLocalizedDate } from '../../../hooks/useLocalizedDate';
-import { externalMediaService } from '../../../services/externalMedia.service';
+import { useExternalImport } from './useExternalImport';
 import { toBoolean } from '../../../utils/parsers';
 
-export const ExternalSourceBar: React.FC<{ event: Event; onChangeFolder: () => void }> = ({ event, onChangeFolder }) => {
+export const ExternalSourceBar: React.FC<{
+  event: Event;
+  onChangeFolder: () => void;
+  /** The grid shows only the photos whose file is gone (issue 2121). */
+  missingFilter?: boolean;
+  onToggleMissing?: () => void;
+}> = ({ event, onChangeFolder, missingFilter = false, onToggleMissing }) => {
   const { t } = useTranslation();
-  const { formatDistanceToNow } = useLocalizedDate();
   const queryClient = useQueryClient();
-  const canImport = usePermission('photos.upload');
   const canChangeFolder = usePermission('events.edit') && !event.is_archived;
   const watched = toBoolean(event.external_watch, false);
+  const confirm = useConfirm();
+  // Folder structure switched on after the first import (issue 1786): the
+  // photos already imported are still flat until this mirrors the folder.
+  const imp = useExternalImport(event);
+  const canManageFolders = usePermission('folders.manage');
+  const canApplyStructure = canManageFolders && imp.canImport
+    && toBoolean(event.folder_structure, false) && !event.is_archived;
 
-  const { data: status } = useQuery({
-    queryKey: ['external-import-status', event.id],
-    queryFn: () => externalMediaService.getImportStatus(event.id),
-    // While an import runs (a rescan, the watcher, or the first import right
-    // after creating the gallery) keep the line and the grid moving.
-    refetchInterval: (query) => (query.state.data?.is_running ? 3000 : false),
-  });
-
-  const refreshPhotos = () => {
-    queryClient.invalidateQueries({ queryKey: ['admin-event', String(event.id)] });
-    queryClient.invalidateQueries({ queryKey: ['admin-event-photos', String(event.id)] });
-    queryClient.invalidateQueries({ queryKey: ['admin-event-filter-summary', String(event.id)] });
-    queryClient.invalidateQueries({ queryKey: ['admin-photo-credits', event.id] });
-  };
-
-  // When a running import finishes, show what it brought in.
-  const wasRunning = React.useRef(false);
-  React.useEffect(() => {
-    if (status?.is_running) wasRunning.current = true;
-    else if (wasRunning.current) {
-      wasRunning.current = false;
-      refreshPhotos();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status?.is_running]);
-
-  const rescan = useMutation({
-    mutationFn: () => externalMediaService.rescanEvent(event.id),
+  const applyStructure = useMutation({
+    mutationFn: () => foldersService.applyExternalStructure(event.id),
     onSuccess: (result) => {
-      toast.success(t('events.externalSource.rescanDone', 'Rescan done: {{count}} new photos', { count: result?.imported ?? 0 }));
-      refreshPhotos();
-      queryClient.invalidateQueries({ queryKey: ['external-import-status', event.id] });
+      toast.success(result.moved > 0
+        ? t('events.externalSource.structureApplied', '{{count}} photos moved into folders', { count: result.moved })
+        : t('events.externalSource.structureNothing', 'Every photo from a subfolder is in a folder already'));
+      if (result.limited) {
+        toast.warning(t('events.externalSource.structureLimited', 'The gallery reached its folder limit: some photos went into the closest existing folder.'));
+      }
+      invalidateFolderViews(queryClient, event.id);
     },
     onError: (error: unknown) => {
-      const e = error as { response?: { status?: number; data?: { error?: string } } };
-      toast.error(e.response?.status === 409
-        ? t('events.externalSource.alreadyRunning', 'An import of this folder is already running.')
-        : e.response?.data?.error || t('events.externalSource.rescanFailed', 'Rescan failed'));
-      queryClient.invalidateQueries({ queryKey: ['external-import-status', event.id] });
+      toast.error(folderErrorMessage(error, t) || t('events.externalSource.structureFailed', 'The folder structure could not be applied'));
     },
   });
 
-  const running = rescan.isPending || status?.is_running === true;
-  // A failed run is recorded as its outcome; without this it would read as a
-  // finished scan of an empty folder.
-  const failed = !running && status?.last_result?.failed === true;
-  // The server stores a code, never the fs message (that quotes host paths).
-  const failureText = (() => {
-    switch (status?.last_result?.error) {
-      case 'folder_missing':
-        return t('events.externalSource.failedMissing', 'The last import failed: the folder can no longer be found.');
-      case 'permission_denied':
-        return t('events.externalSource.failedPermission', 'The last import failed: PicPeak is not allowed to read the folder.');
-      default:
-        return t('events.externalSource.failedGeneric', 'The last import failed.');
-    }
-  })();
-  const lastScan = status?.finished_at
-    ? t('events.externalSource.lastScan', 'Last scan {{when}}', { when: formatDistanceToNow(new Date(status.finished_at), { addSuffix: true }) })
-    : t('events.externalSource.neverScanned', 'Not scanned yet');
+  const handleApplyStructure = async () => {
+    const ok = await confirm({
+      title: t('events.externalSource.applyStructureTitle', 'Apply the folder structure?'),
+      message: t(
+        'events.externalSource.applyStructureMessage',
+        "Photos that are not in a gallery folder yet move into folders that mirror the external folder's subfolders. Photos already in a folder stay where they are."
+      ),
+      confirmLabel: t('events.externalSource.applyStructure', 'Apply folder structure'),
+    });
+    if (ok) applyStructure.mutate();
+  };
 
   return (
     <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-line bg-panel px-4 py-3">
@@ -92,31 +71,54 @@ export const ExternalSourceBar: React.FC<{ event: Event; onChangeFolder: () => v
         <code className="px-1.5 py-0.5 rounded bg-inset text-xs break-all">/external-media/{event.external_path}</code>
       </span>
       {watched && (
-        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300">
+        <Badge tone="success">
           {t('events.externalSource.watching', 'Watching for new files')}
-        </span>
+        </Badge>
       )}
-      {failed ? (
-        <span className="text-xs text-red-700 dark:text-red-400" role="alert">
-          {failureText}
+      {imp.failed ? (
+        <span className="text-xs text-danger-text" role="alert">
+          {imp.failureText}
         </span>
       ) : (
         <span className="text-xs text-soft" role="status">
-          {running ? t('events.externalSource.importing', 'Importing…') : lastScan}
+          {imp.statusText}
         </span>
       )}
       <div className="ml-auto flex flex-wrap items-center gap-2">
-        {canImport && (
+        {onToggleMissing && (imp.missingFiles > 0 || missingFilter) && (
+          <Button
+            variant={missingFilter ? 'secondary' : 'outline'}
+            size="sm"
+            leftIcon={<FileX className="w-4 h-4" />}
+            onClick={onToggleMissing}
+            aria-pressed={missingFilter}
+            title={t('events.externalSource.missingFilesHint', 'Show the photos whose file is gone from the folder')}
+          >
+            {t('events.externalSource.missingFiles', '{{count}} files missing', { count: imp.missingFiles })}
+          </Button>
+        )}
+        {imp.canImport && (
           <Button
             variant="outline"
             size="sm"
-            leftIcon={<RefreshCw className={`w-4 h-4 ${running ? 'animate-spin' : ''}`} />}
-            onClick={() => rescan.mutate()}
-            disabled={running || !!event.is_archived}
+            leftIcon={<RefreshCw className={`w-4 h-4 ${imp.running ? 'animate-spin' : ''}`} />}
+            onClick={imp.run}
+            disabled={!imp.canRun}
           >
-            {failed
-              ? t('events.externalSource.retry', 'Try again')
-              : status?.finished_at ? t('events.externalSource.rescan', 'Rescan') : t('events.externalSource.importNow', 'Import now')}
+            {imp.buttonLabel}
+          </Button>
+        )}
+        {canApplyStructure && (
+          <Button
+            variant="outline"
+            size="sm"
+            leftIcon={<FolderTree className="w-4 h-4" />}
+            onClick={handleApplyStructure}
+            disabled={imp.running || applyStructure.isPending}
+            isLoading={applyStructure.isPending}
+            title={t('events.externalSource.applyStructureHint', 'Mirror the subfolders onto photos imported before folder structure was on')}
+          >
+            {t('events.externalSource.applyStructure', 'Apply folder structure')}
           </Button>
         )}
         {canChangeFolder && (

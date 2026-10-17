@@ -3,10 +3,12 @@ const crypto = require('crypto');
 const archiver = require('archiver');
 const router = express.Router();
 const { db, logActivity } = require('../database/db');
+const { joinLivePhotos, livePhotos } = require('../utils/photoVisibility');
 const { adminAuth } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const { requireEventOwnership } = require('../middleware/ownership');
 const feedbackService = require('../services/feedbackService');
+const selectionSubmissions = require('../services/selectionSubmissions');
 const { clearGuestCredits, reassignGuestCredits } = require('../services/photoCredit');
 const logger = require('../utils/logger');
 const { errorResponse } = require('../utils/routeHelpers');
@@ -42,6 +44,7 @@ function serializeGuest(row) {
 }
 
 const { neutralizeSpreadsheetFormula } = require('../utils/spreadsheetSafe');
+const { sanitizeName } = require('../utils/personName');
 
 function escapeCsvCell(value) {
   // Neutralize spreadsheet formulas FIRST (a `=cmd()` guest name executes on
@@ -69,7 +72,10 @@ router.get(
 
       const rows = await db('gallery_guests')
         .leftJoin('photo_feedback', function () {
-          this.on('photo_feedback.guest_id', '=', 'gallery_guests.id');
+          // Feedback on photos in the trash is not counted, as in the guest's
+          // own list and exports below; the guest stays listed with zeros.
+          this.on('photo_feedback.guest_id', '=', 'gallery_guests.id')
+            .andOn(db.raw('NOT EXISTS (SELECT 1 FROM photos WHERE photos.id = photo_feedback.photo_id AND photos.deleted_at IS NOT NULL)'));
         })
         .where('gallery_guests.event_id', eventId)
         .where('gallery_guests.is_deleted', false)
@@ -169,7 +175,7 @@ router.get(
     try {
       const { eventId } = req.params;
 
-      const photos = await db('photos')
+      const photos = await livePhotos(db)
         .leftJoin('photo_feedback', function () {
           this.on('photo_feedback.photo_id', '=', 'photos.id')
             .andOn(db.raw('photo_feedback.feedback_type IN (\'like\',\'favorite\')'))
@@ -269,7 +275,9 @@ router.post(
   async (req, res) => {
     try {
       const { eventId } = req.params;
-      const name = String(req.body?.name || '').trim().slice(0, 100);
+      // The same sanitiser as the guest's own registration and the photo
+      // credit made from this name, so all three store the same string.
+      const name = sanitizeName(req.body?.name);
       const email = String(req.body?.email || '').trim().slice(0, 255).toLowerCase();
       if (!name) {
         return res.status(400).json({ error: 'Name is required' });
@@ -399,7 +407,7 @@ router.get(
 
       for (const g of guests) {
         const selections = await db('photo_feedback')
-          .join('photos', 'photo_feedback.photo_id', 'photos.id')
+          .modify(joinLivePhotos, 'photo_feedback.photo_id', 'photos.id')
           .where('photo_feedback.guest_id', g.id)
           .whereIn('photo_feedback.feedback_type', ['like', 'favorite'])
           .select('photos.filename', 'photos.original_filename', 'photo_feedback.feedback_type');
@@ -451,7 +459,7 @@ router.get(
       if (!guest) return;
 
       const feedback = await db('photo_feedback')
-        .join('photos', 'photo_feedback.photo_id', 'photos.id')
+        .modify(joinLivePhotos, 'photo_feedback.photo_id', 'photos.id')
         .where('photo_feedback.guest_id', guestId)
         .select(
           'photo_feedback.id as feedback_id',
@@ -543,7 +551,7 @@ router.get(
       if (!guest) return;
 
       const selections = await db('photo_feedback')
-        .join('photos', 'photo_feedback.photo_id', 'photos.id')
+        .modify(joinLivePhotos, 'photo_feedback.photo_id', 'photos.id')
         .where('photo_feedback.guest_id', guestId)
         .whereIn('photo_feedback.feedback_type', ['like', 'favorite'])
         .select('photos.filename', 'photos.original_filename', 'photo_feedback.feedback_type');
@@ -599,10 +607,15 @@ router.delete(
         email: null,
         last_seen_at: db.fn.now(),
       });
+      // Their "mail me when the download is ready" requests (issue 1733).
+      await require('../services/downloadJobNotifier').forgetGuest(guest);
       // The denormalised uploader name must not outlive the guest (#1561).
       // After the soft delete: an upload still in flight checks for it once
       // its row is in (photoCredit.settleGuestCredit).
       const creditsCleared = await clearGuestCredits(guestId);
+      // Again after the soft delete, for the same reason: a hand-over that got
+      // in before it was stored with the guest's name (issue 1733).
+      await selectionSubmissions.anonymizeGuest(guestId);
 
       await logActivity(
         'guest_deleted',
@@ -660,6 +673,13 @@ router.post(
       }
 
       const result = await db.transaction(async (trx) => {
+        // The event row first on PostgreSQL (issue 2108): the activity row at
+        // the end takes a key share on it through its foreign key, after the
+        // merge has rewritten the guests' photos, and a rename holds it FOR
+        // UPDATE before it rewrites the same photos.
+        if (trx.client.config.client === 'pg') {
+          await trx('events').where({ id: eventId }).forKeyShare().first('id');
+        }
         // Lock in a stable order on PostgreSQL so overlapping merges cannot
         // move feedback into an identity another merge has just deleted.
         const guestQuery = trx('gallery_guests')

@@ -29,7 +29,7 @@ for (const engine of ['sqlite3', ...(process.env.PICPEAK_PG_TEST_URL ? ['pg'] : 
         t.increments('id'); t.text('color_theme'); t.string('external_path'); t.integer('css_template_id');
         t.string('default_photo_sort'); t.boolean('is_archived'); t.boolean('is_draft'); t.boolean('allow_downloads');
       });
-      await db.schema.createTable('photos', t => { t.increments('id'); t.integer('event_id'); t.string('media_type'); t.string('filename'); });
+      await db.schema.createTable('photos', t => { t.increments('id'); t.integer('event_id'); t.string('media_type'); t.string('filename'); t.timestamp('deleted_at'); });
       await db.schema.createTable('css_templates', t => { t.increments('id'); t.boolean('is_enabled'); t.text('css_content'); });
       await db.schema.createTable('photo_categories', t => { t.increments('id'); t.integer('event_id'); t.boolean('is_folder'); });
       await db.schema.createTable('workflows', t => { t.increments('id'); t.boolean('enabled'); });
@@ -124,6 +124,23 @@ for (const engine of ['sqlite3', ...(process.env.PICPEAK_PG_TEST_URL ? ['pg'] : 
       expect((await snap({ transfers: true })).transfer_upload_links.configured).toBe(false);
       await db('photo_categories').update({ event_id: 999 });
       expect((await snap({})).gallery_folders.configured).toBe(false);
+    });
+
+    test('camera RAW counts as configured for any RAW extension, not only DNG', async () => {
+      const configured = async (allowedFileTypes) => {
+        await db('app_settings').where({ setting_key: 'general_allowed_file_types' }).delete();
+        await db('app_settings').insert({ setting_key: 'general_allowed_file_types', setting_value: allowedFileTypes });
+        const snapshot = await expandSnapshot(db, {
+          features: p.emptyFeatures('usage.v1'), flags: {}, used: new Set(), now, version: 'usage.v3'
+        });
+        return snapshot.camera_raw_uploads.configured;
+      };
+      expect(await configured('jpg,jpeg,png,webp')).toBe(false);
+      expect(await configured('jpg,dng')).toBe(true);
+      // The regression: an install that opts into Sony or Olympus and not DNG
+      // used to report no RAW at all.
+      expect(await configured('jpg,arw')).toBe(true);
+      expect(await configured('jpg, .ORF ')).toBe(true);
     });
 
     test('ML recognition is already represented without querying faces or results', async () => {

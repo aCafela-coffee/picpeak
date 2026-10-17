@@ -1,5 +1,6 @@
 const { secretValues, redactEmailData, redactRenderedHtml, replaceMaskedSecrets, isSecretKey, redactRecoveryLinks, redactRecoveryLinksInData, hasMaskedRecoveryLink } = require('../utils/emailSecretRedaction');
 const nodemailer = require('nodemailer');
+const { smtpConnectionOptions } = require('../utils/mailConnection');
 const { db } = require('../database/db');
 const logger = require('../utils/logger');
 const { getFrontendBaseUrl } = require('../utils/frontendUrl');
@@ -8,6 +9,12 @@ const {
   normaliseSchedule,
 } = require('../utils/businessHours');
 const { hasColumnCached } = require('../utils/schemaCache');
+const {
+  decryptEmailData,
+  encryptEmailData,
+  isProtectedEmailType,
+  PROTECTED_PENDING_STATUS,
+} = require('../utils/emailQueueEncryption');
 const emailWebhookTransport = require('./emailWebhookTransport');
 // Migration 198 — the global email footer signature is read from the
 // business profile. No cycle: businessProfileService only pulls db + utils.
@@ -111,7 +118,7 @@ async function initializeTransporter(forceReinit = false) {
       try { transporter.close(); } catch (_) { /* best-effort */ }
     }
 
-    transporter = nodemailer.createTransport({
+    transporter = nodemailer.createTransport(smtpConnectionOptions({
       host: config.smtp_host,
       port: config.smtp_port,
       secure: config.smtp_secure,
@@ -123,10 +130,11 @@ async function initializeTransporter(forceReinit = false) {
         // Allow ignoring SSL certificate errors when tls_reject_unauthorized is false
         rejectUnauthorized: config.tls_reject_unauthorized !== false
       }
-    });
+    }));
 
     // Verify configuration
     await transporter.verify();
+    transporterError = null;
     logger.info('Email transporter initialized successfully');
     
     // Update the config hash
@@ -135,6 +143,7 @@ async function initializeTransporter(forceReinit = false) {
     return transporter;
   } catch (error) {
     logger.error('Failed to initialize email transporter:', error);
+    transporterError = error;
     transporter = null;
     lastConfigHash = null;
     return null;
@@ -308,7 +317,7 @@ function renderSignatureLink(href, text, color) {
  * @param {object} opts  { mutedTextColor, brandingCompanyName, language }
  * @returns {string} HTML rows for the footer <td>, or '' when disabled.
  */
-function renderEmailSignature(signature, { mutedTextColor, brandingCompanyName, language }) {
+function renderEmailSignature(signature, { mutedTextColor, brandingCompanyName, language, dividerColor = '#eeeeee' }) {
   if (!signature) return '';
 
   const lineStyle = `color:${mutedTextColor};font-size:12px;line-height:18px;margin:4px 0;`;
@@ -358,7 +367,7 @@ function renderEmailSignature(signature, { mutedTextColor, brandingCompanyName, 
   if (!rows.length) return '';
 
   return `
-              <div style="margin:15px 0 5px;padding-top:15px;border-top:1px solid #eeeeee;">
+              <div style="margin:15px 0 5px;padding-top:15px;border-top:1px solid ${dividerColor};">
                 ${rows.join('\n                ')}
               </div>`;
 }
@@ -400,8 +409,89 @@ function renderEmailSignatureText(signature, { brandingCompanyName, language } =
   return `\n\n--\n${lines.join('\n')}`;
 }
 
-// Wrap HTML body in the styled email template with header, footer, and logo
-async function wrapEmailHtml(htmlBody, subject, language = 'en') {
+// The branding rows below are written by `settings.edit`, a permission the
+// email templates themselves are NOT in (email.edit). So the wrapper has to
+// treat them as text, not markup: the company name is HTML-escaped where it
+// is rendered, the logo URL is escaped inside src="" and may not carry a
+// scheme other than http(s), and each colour has to match a colour grammar
+// before it is interpolated into <style>, style="" and bgcolor="".
+const { sanitizeCssColor } = require('../utils/cssSanitizer');
+const { readableTextOn, dividerOn, contrastRatio, parseColor } = require('../utils/colorContrast');
+const { loadBrandingTheme } = require('./galleryTheme');
+
+// The green every seeded template and the old defaults used. A template that
+// still carries it gets the email accent instead (wrapEmailHtml).
+const LEGACY_EMAIL_GREEN = '#5C8762';
+
+/**
+ * The email accent: Settings → Email → Primary when set, else the brand's
+ * filled accent from Branding › Colours, else the legacy green.
+ *
+ * The button label is the configured one. Unset, it stays the white every
+ * install has always sent on the legacy green or on a Primary colour the
+ * admin chose (white on the green is ~4.1:1, under the 4.5 floor
+ * readableTextOn applies, so deriving it there would turn every upgraded
+ * install's CTAs dark). Only an accent taken from Branding gets a label
+ * derived to read on it: that colour was never paired with white before.
+ */
+async function resolveEmailAccent(configuredPrimary, configuredButtonText) {
+  let primary = sanitizeCssColor(configuredPrimary || '') || null;
+  let fromBranding = false;
+  if (!primary) {
+    try {
+      const brand = await loadBrandingTheme();
+      const brandAccent = sanitizeCssColor((brand && (brand.accentDarkColor || brand.primaryColor)) || '') || null;
+      // Same floor as the PDF accent (services/pdf/theme.js brandColors): a
+      // brand colour too pale for a white email card keeps the legacy green.
+      // A colour whose contrast can't be computed (a named colour, hsl())
+      // fails it too — it could be just as pale.
+      const ratio = brandAccent ? contrastRatio(brandAccent, '#ffffff') : null;
+      if (ratio !== null && ratio >= 3) {
+        primary = brandAccent;
+        fromBranding = true;
+      }
+    } catch (error) {
+      // The mail still goes out, in the legacy green.
+      logger.warn('Could not read the Branding accent for emails', { error: error.message });
+    }
+  }
+  primary = primary || LEGACY_EMAIL_GREEN;
+  const buttonText = sanitizeCssColor(configuredButtonText || '')
+    || (fromBranding ? readableTextOn(primary, '#ffffff') : '#ffffff');
+  return { primary, buttonText };
+}
+
+/**
+ * The colour the seeded templates' inline green turns into. It is link text
+ * as well as border and box colour, so it has to read on the email card at
+ * 4.5:1: the accent itself when it does, else the accent darkened step by
+ * step until it does. null when the contrast can't be computed (a named or
+ * hsl() colour) — the template then keeps its green.
+ */
+function templateAccentOn(accent, card) {
+  const rgb = parseColor(accent);
+  if (!rgb || contrastRatio(accent, card) === null) return null;
+  const hex = (c) => Math.round(c).toString(16).padStart(2, '0');
+  for (let step = 0; step <= 20; step += 1) {
+    const f = 1 - step * 0.05;
+    const candidate = `#${hex(rgb.r * f)}${hex(rgb.g * f)}${hex(rgb.b * f)}`;
+    if (contrastRatio(candidate, card) >= 4.5) return step === 0 ? accent : candidate;
+  }
+  // A card too dark for any darker accent: the template keeps its green.
+  return null;
+}
+
+function isUsableLogoUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  const scheme = value.match(/^\s*([a-z][a-z0-9+.-]*)\s*:/i);
+  return !scheme || ['http', 'https'].includes(scheme[1].toLowerCase());
+}
+
+// Wrap HTML body in the styled email template with header, footer, and logo.
+// `seededTemplate` marks a body that comes from an email template (sends and
+// the template preview): only those carry the legacy green as the accent.
+// Newsletters, test mails and other hand-written bodies keep their colours.
+async function wrapEmailHtml(htmlBody, subject, language = 'en', { seededTemplate = false } = {}) {
   // Email colour palette. The two original settings (email_primary_color and
   // email_secondary_color) keep their existing semantics so emails sent by
   // upgraded instances render byte-for-byte identically until an admin
@@ -410,14 +500,14 @@ async function wrapEmailHtml(htmlBody, subject, language = 'en') {
   // and default to the previously hard-coded literals when absent.
   let logoUrl = '';
   let companyName = 'PicPeak';
-  let primaryColor = '#5C8762';
+  let primaryColor = null;            // unset: the brand accent (resolveEmailAccent)
   let secondaryColor = '#f9f9f9';
   let bodyBgColor = '#f5f5f5';        // outer wrapper + body background
   let containerBgColor = '#ffffff';    // email card
   let listBgColor = '#f9f9f9';         // <ul> info panel inside content
   let bodyTextColor = '#333333';       // paragraph text + <strong>
   let mutedTextColor = '#666666';      // footer text
-  let buttonTextColor = '#ffffff';     // CTA text on primary button
+  let buttonTextColor = null;          // CTA text on primary button; unset: readable on it
   try {
     const brandingSettings = await db('app_settings')
       .whereIn('setting_key', [
@@ -433,41 +523,71 @@ async function wrapEmailHtml(htmlBody, subject, language = 'en') {
       if (!val) return fallback;
       try { return JSON.parse(val); } catch (e) { return val; }
     };
+    // A stored value that is not a colour keeps the default.
+    const readColor = (val, fallback) => sanitizeCssColor(readSetting(val, fallback)) || fallback;
 
     brandingSettings.forEach(setting => {
       const val = setting.setting_value;
       switch (setting.setting_key) {
       case 'branding_logo_url':       logoUrl = readSetting(val, logoUrl); break;
       case 'branding_company_name':   companyName = readSetting(val, companyName); break;
-      case 'email_primary_color':     primaryColor = readSetting(val, primaryColor); break;
-      case 'email_secondary_color':   secondaryColor = readSetting(val, secondaryColor); break;
-      case 'email_body_bg_color':     bodyBgColor = readSetting(val, bodyBgColor); break;
-      case 'email_container_bg_color': containerBgColor = readSetting(val, containerBgColor); break;
-      case 'email_list_bg_color':     listBgColor = readSetting(val, listBgColor); break;
-      case 'email_body_text_color':   bodyTextColor = readSetting(val, bodyTextColor); break;
-      case 'email_muted_text_color':  mutedTextColor = readSetting(val, mutedTextColor); break;
-      case 'email_button_text_color': buttonTextColor = readSetting(val, buttonTextColor); break;
+      case 'email_primary_color':     primaryColor = readColor(val, primaryColor); break;
+      case 'email_secondary_color':   secondaryColor = readColor(val, secondaryColor); break;
+      case 'email_body_bg_color':     bodyBgColor = readColor(val, bodyBgColor); break;
+      case 'email_container_bg_color': containerBgColor = readColor(val, containerBgColor); break;
+      case 'email_list_bg_color':     listBgColor = readColor(val, listBgColor); break;
+      case 'email_body_text_color':   bodyTextColor = readColor(val, bodyTextColor); break;
+      case 'email_muted_text_color':  mutedTextColor = readColor(val, mutedTextColor); break;
+      case 'email_button_text_color': buttonTextColor = readColor(val, buttonTextColor); break;
       default: break;
       }
     });
   } catch (error) {
     logger.error('Error fetching branding settings:', error);
   }
+  ({ primary: primaryColor, buttonText: buttonTextColor } = await resolveEmailAccent(primaryColor, buttonTextColor));
+  // Seeded templates carry the legacy green inline (boxes, links, a few
+  // buttons); it is the email accent, so it follows it — darkened where the
+  // accent is too light to read as link text on the card. Template bodies
+  // only: an edited template can't be told apart from a seeded one, but a
+  // newsletter or a hand-written mail never meant the accent by it.
+  if (seededTemplate && primaryColor.toLowerCase() !== LEGACY_EMAIL_GREEN.toLowerCase()) {
+    const inlineAccent = templateAccentOn(primaryColor, containerBgColor);
+    if (inlineAccent) htmlBody = String(htmlBody).replace(/#5c8762\b/gi, inlineAccent);
+  }
 
   const hoverColor = darkenColor(primaryColor, 0.15);
+  // The info panel only had a background colour, so its text inherited the
+  // body text colour: a dark palette with the default light panel (or a
+  // Branding sync that filled a light panel in) put near-white text on a
+  // near-white box. Keep the body text colour when it reads on the panel,
+  // otherwise switch to a neutral that does (utils/colorContrast). Links in
+  // the panel get the same check against the primary colour, at 3:1: they
+  // are underlined, and the default green on the default panel is ~4:1 —
+  // 4.5:1 would turn every default install's list links grey.
+  const listTextColor = readableTextOn(listBgColor, bodyTextColor);
+  const listLinkColor = readableTextOn(listBgColor, primaryColor, 3);
+  // The footer's top border and the signature rule were a fixed #eeeeee —
+  // a bright stripe across any dark palette. Derive them from the footer
+  // background instead; light footers keep #eeeeee.
+  const dividerColor = dividerOn(secondaryColor);
 
   // Build full logo URL - ensure logoUrl is a valid non-empty string
   const frontendUrl = (await getFrontendBaseUrl()) || 'http://localhost:3000';
-  const logoPath = (typeof logoUrl === 'string' && logoUrl.trim()) ? logoUrl : '/picpeak-logo-transparent.png';
+  const logoPath = isUsableLogoUrl(logoUrl) ? logoUrl : '/picpeak-logo-transparent.png';
   const logoFullUrl = `${frontendUrl}${logoPath.startsWith('/') ? '' : '/'}${logoPath}`;
   logger.debug('Email logo URL:', { frontendUrl, logoPath, logoFullUrl });
+  // Attribute-context encodings. companyName stays raw for the signature
+  // comparison below; these are what the markup gets.
+  const logoSrc = escapeHtml(logoFullUrl);
+  const companyNameHtml = escapeHtml(companyName);
 
   // Migration 198 — global footer signature from the business profile.
   // Memoised for 60 s in the service, so a queue tick sending ten mails
   // reads the row once. Never throws; returns null when disabled.
   const signatureHtml = renderEmailSignature(
     await businessProfileService.getEmailSignature(),
-    { mutedTextColor, brandingCompanyName: companyName, language }
+    { mutedTextColor, brandingCompanyName: companyName, language, dividerColor }
   );
 
   const year = new Date().getFullYear();
@@ -480,8 +600,19 @@ async function wrapEmailHtml(htmlBody, subject, language = 'en') {
   // below is rebuilt as inline-styled tables with bgcolor attrs for the same
   // reason. The <style> block stays as progressive enhancement.
   const buttonInlineStyle = `background-color:${primaryColor};color:${buttonTextColor};display:inline-block;padding:12px 30px;text-decoration:none;border-radius:5px;font-weight:500;`;
-  const inlinedBody = (typeof htmlBody === 'string' ? htmlBody : '')
+  // Same for the info panel: inline its look on every <ul> the template did
+  // not style itself, so clients that strip <style> keep text and panel in
+  // one readable pair. A body that brings its own <style> (an admin-edited
+  // template, a newsletter's body_css) styles its lists there, and an inline
+  // style would beat every rule in it — those keep the panel in the wrapper's
+  // <style> only.
+  const listInlineStyle = `background-color:${listBgColor};color:${listTextColor};padding:20px 20px 20px 40px;border-radius:5px;margin:20px 0;`;
+  let inlinedBody = (typeof htmlBody === 'string' ? htmlBody : '')
     .replace(/class="button"/g, `class="button" style="${buttonInlineStyle}"`);
+  if (!/<style[\s>]/i.test(inlinedBody)) {
+    inlinedBody = inlinedBody
+      .replace(/<ul(?![^>]*[\s"']style\s*=)(\s[^>]*)?>/gi, (match, attrs = '') => `<ul style="${listInlineStyle}"${attrs}>`);
+  }
 
   return `
 <!DOCTYPE html>
@@ -535,6 +666,7 @@ async function wrapEmailHtml(htmlBody, subject, language = 'en') {
     }
     .email-content ul {
       background-color: ${listBgColor};
+      color: ${listTextColor};
       padding: 20px 20px 20px 40px;
       border-radius: 5px;
       margin: 20px 0;
@@ -559,7 +691,7 @@ async function wrapEmailHtml(htmlBody, subject, language = 'en') {
       background-color: ${secondaryColor};
       padding: 30px;
       text-align: center;
-      border-top: 1px solid #eee;
+      border-top: 1px solid ${dividerColor};
     }
     .email-footer img {
       max-width: 120px;
@@ -581,6 +713,13 @@ async function wrapEmailHtml(htmlBody, subject, language = 'en') {
     }
     strong {
       color: ${bodyTextColor};
+    }
+    .email-content ul strong {
+      color: ${listTextColor};
+    }
+    .email-content ul a,
+    .email-content ul a:hover {
+      color: ${listLinkColor};
     }
     @media only screen and (max-width: 600px) {
       .email-wrapper {
@@ -605,7 +744,7 @@ async function wrapEmailHtml(htmlBody, subject, language = 'en') {
         <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" class="email-container" style="width:100%;max-width:600px;background-color:${containerBgColor};border-radius:8px;overflow:hidden;">
           <tr>
             <td align="center" bgcolor="${primaryColor}" class="email-header" style="background-color:${primaryColor};padding:30px;text-align:center;">
-              <img src="${logoFullUrl}" alt="${companyName}" width="180" class="logo" style="max-width:180px;height:auto;display:inline-block;border:0;">
+              <img src="${logoSrc}" alt="${companyNameHtml}" width="180" class="logo" style="max-width:180px;height:auto;display:inline-block;border:0;">
             </td>
           </tr>
           <tr>
@@ -614,10 +753,10 @@ async function wrapEmailHtml(htmlBody, subject, language = 'en') {
             </td>
           </tr>
           <tr>
-            <td align="center" bgcolor="${secondaryColor}" class="email-footer" style="background-color:${secondaryColor};padding:30px;text-align:center;border-top:1px solid #eeeeee;">
-              <img src="${logoFullUrl}" alt="${companyName}" width="120" style="max-width:120px;height:auto;opacity:0.8;margin-bottom:15px;border:0;">
-              <p style="color:${mutedTextColor};font-size:14px;margin:5px 0;">${companyName}</p>${signatureHtml}
-              <p style="font-size:12px;color:#999999;margin:5px 0;">© ${year} ${companyName}. All rights reserved.</p>
+            <td align="center" bgcolor="${secondaryColor}" class="email-footer" style="background-color:${secondaryColor};padding:30px;text-align:center;border-top:1px solid ${dividerColor};">
+              <img src="${logoSrc}" alt="${companyNameHtml}" width="120" style="max-width:120px;height:auto;opacity:0.8;margin-bottom:15px;border:0;">
+              <p style="color:${mutedTextColor};font-size:14px;margin:5px 0;">${companyNameHtml}</p>${signatureHtml}
+              <p style="font-size:12px;color:#999999;margin:5px 0;">© ${year} ${companyNameHtml}. All rights reserved.</p>
             </td>
           </tr>
         </table>
@@ -715,6 +854,16 @@ async function processTemplate(template, variables, language = 'en') {
   // Import date formatter and text formatters
   const { formatDate } = require('../utils/dateFormatter');
   const { formatWelcomeMessage } = require('../utils/formatters');
+  const { getInstanceTimeZone, expiryCalendarDate } = require('../utils/galleryExpiry');
+  // An expiry instant prints as its day in the instance time zone, not the
+  // server's: a gallery open through the end of 24 Dec in New York is 05:00
+  // UTC on the 25th. A bare date, or text that is no timestamp, passes as is.
+  let expiryTimeZone = null;
+  const expiryDay = async (value) => {
+    if (!(value instanceof Date || typeof value === 'number' || /^\d{4}-\d{2}-\d{2}T|^\d{10,}$/.test(String(value)))) return value;
+    expiryTimeZone = expiryTimeZone || await getInstanceTimeZone();
+    return expiryCalendarDate(value, expiryTimeZone) || value;
+  };
 
   // Get translation from email_template_translations table with fallback chain
   let subject = '';
@@ -813,13 +962,17 @@ async function processTemplate(template, variables, language = 'en') {
     processedVariables.event_date = await formatDate(processedVariables.event_date, language);
   }
   if (processedVariables.expiry_date) {
-    processedVariables.expiry_date = await formatDate(processedVariables.expiry_date, language);
+    processedVariables.expiry_date = await formatDate(await expiryDay(processedVariables.expiry_date), language);
   }
   if (processedVariables.archive_date) {
     processedVariables.archive_date = await formatDate(processedVariables.archive_date, language);
   }
   if (processedVariables.expires_at) {
-    processedVariables.expires_at = await formatDate(processedVariables.expires_at, language);
+    processedVariables.expires_at = await formatDate(await expiryDay(processedVariables.expires_at), language);
+  }
+  // Promised completion date of a two-stage delivery (delivery_due_reminder).
+  if (processedVariables.due_date) {
+    processedVariables.due_date = await formatDate(processedVariables.due_date, language);
   }
 
   // Format welcome message for HTML display (preserve line breaks)
@@ -872,23 +1025,21 @@ async function processTemplate(template, variables, language = 'en') {
     };
     const ci18n = clientAccessI18n[language] || clientAccessI18n.en;
 
-    // The client-access CTA used to be a hard-coded #5C8762 fill; now it
-    // mirrors the configurable email_primary_color so the brand colour is
-    // consistent across every button in the email. Defaults match the
-    // historical literal so unchanged installs render identically.
-    let cli_primary = '#5C8762';
+    // The client-access CTA uses the email accent like every other button
+    // (resolveEmailAccent: Settings → Email, else Branding › Colours).
+    let cli_primary = LEGACY_EMAIL_GREEN;
     let cli_buttonText = '#ffffff';
     try {
       const rows = await db('app_settings')
         .whereIn('setting_key', ['email_primary_color', 'email_button_text_color'])
         .select('setting_key', 'setting_value');
-      rows.forEach((row) => {
-        if (!row.setting_value) return;
-        let parsed;
-        try { parsed = JSON.parse(row.setting_value); } catch (e) { parsed = row.setting_value; }
-        if (row.setting_key === 'email_primary_color') cli_primary = parsed || cli_primary;
-        if (row.setting_key === 'email_button_text_color') cli_buttonText = parsed || cli_buttonText;
-      });
+      const read = (key) => {
+        const row = rows.find((r) => r.setting_key === key);
+        if (!row || !row.setting_value) return null;
+        try { return JSON.parse(row.setting_value); } catch (e) { return row.setting_value; }
+      };
+      ({ primary: cli_primary, buttonText: cli_buttonText } = await resolveEmailAccent(
+        read('email_primary_color'), read('email_button_text_color')));
     } catch (e) {
       // Non-fatal — fall back to literals so the email still renders.
       logger.warn('Failed to read email colours for client-access block', { error: e.message });
@@ -913,7 +1064,7 @@ async function processTemplate(template, variables, language = 'en') {
   }
 
   // Wrap HTML body in styled template
-  const styledHtmlBody = await wrapEmailHtml(htmlBody, subject, language);
+  const styledHtmlBody = await wrapEmailHtml(htmlBody, subject, language, { seededTemplate: true });
 
   return { subject, htmlBody: styledHtmlBody, textBody };
 }
@@ -1096,13 +1247,13 @@ async function sendRawEmail({ to, cc, subject, html, text, attachments, accountK
     const acct = await db('mail_accounts').where({ account_key: accountKey }).first();
     if (acct && acct.smtp_host && (acct.smtp_user || acct.from_email)) {
       const nodemailer = require('nodemailer');
-      tx = nodemailer.createTransport({
+      tx = nodemailer.createTransport(smtpConnectionOptions({
         host: acct.smtp_host,
         port: parseInt(acct.smtp_port, 10) || 587,
         secure: acct.smtp_secure === true || acct.smtp_secure === 1,
         auth: acct.smtp_user && acct.smtp_pass ? { user: acct.smtp_user, pass: acct.smtp_pass } : undefined,
         tls: { rejectUnauthorized: true },
-      });
+      }));
       fromEmail = acct.from_email || acct.smtp_user;
       fromName = acct.from_name || '';
     }
@@ -1233,7 +1384,11 @@ const processorStatus = {
   lastRunAt: null,
   lastResult: null,
   lastError: null,
+  lastErrorCode: null,
 };
+// Why the transporter last failed to initialise, so a mail network-policy
+// refusal reaches System Health instead of a generic "check the settings".
+let transporterError = null;
 
 function getQueueProcessorStatus() {
   return {
@@ -1241,14 +1396,23 @@ function getQueueProcessorStatus() {
     lastRunAt: processorStatus.lastRunAt,
     lastResult: processorStatus.lastResult,
     lastError: processorStatus.lastError,
+    lastErrorCode: processorStatus.lastErrorCode,
   };
 }
 
-async function processEmailQueue({ ignoreSchedule = false, limit = 10, onlyId = null } = {}) {
+// The queue is a system job: it sends what was already authorised when it was
+// queued. Run under an admin's own CRM scope (the flush route, "send now"), it
+// could not see another owner's document and cancelled that mail as deleted.
+function processEmailQueue(options) {
+  return require('../database/crmAccess').withTrustedCrmAccess('email queue processor', () => processEmailQueueInternal(options));
+}
+
+async function processEmailQueueInternal({ ignoreSchedule = false, limit = 10, onlyId = null } = {}) {
   logger.info('Email queue processor: Checking for pending emails...');
   const result = { processed: 0, sent: 0, failed: 0 };
   processorStatus.lastRunAt = new Date().toISOString();
   processorStatus.lastError = null;
+  processorStatus.lastErrorCode = null;
 
   try {
     // Try to initialize transporter if it's null (in case it failed at startup).
@@ -1263,7 +1427,10 @@ async function processEmailQueue({ ignoreSchedule = false, limit = 10, onlyId = 
         logger.warn('Email transporter could not be initialized, skipping queue processing');
         // #1262 — the row stays pending with retry_count 0, so nothing in the
         // queue itself records that this pass did nothing. Say so here.
-        processorStatus.lastError = 'Email transporter could not be initialised — check the SMTP settings';
+        const refused = ['MAIL_HOST_FORBIDDEN', 'MAIL_CONFIG_INVALID'].includes(transporterError?.code);
+        processorStatus.lastError = refused ? transporterError.message
+          : 'Email transporter could not be initialised — check the SMTP settings';
+        processorStatus.lastErrorCode = refused ? transporterError.code : null;
         processorStatus.lastResult = result;
         return result;
       }
@@ -1276,7 +1443,7 @@ async function processEmailQueue({ ignoreSchedule = false, limit = 10, onlyId = 
       // queue split-payment emails relative to the event date.
       const now = new Date();
       const query = db('email_queue')
-        .where('status', 'pending');
+        .whereIn('status', ['pending', PROTECTED_PENDING_STATUS]);
       // Targeted single-email flush (cockpit "send now"): scope to that row
       // only, so we never force-retry other dead-lettered emails.
       if (onlyId != null) query.where('id', onlyId);
@@ -1327,6 +1494,10 @@ async function processEmailQueue({ ignoreSchedule = false, limit = 10, onlyId = 
         emailData = typeof email.email_data === 'string'
           ? JSON.parse(email.email_data || '{}')
           : email.email_data || {};
+        // Account-recovery variables are ciphertext while they wait in the
+        // database. Only the delivery worker opens them, immediately before
+        // template rendering; tamper or a missing/rotated key fails closed.
+        emailData = decryptEmailData(email.email_type, emailData, email.recipient_email);
         // A re-queued row (Messages resend / retry / send now) may carry the
         // archive mask where its passwords used to be; the sentinel makes
         // the template say "not shown" instead of mailing the mask.
@@ -1338,7 +1509,7 @@ async function processEmailQueue({ ignoreSchedule = false, limit = 10, onlyId = 
         if (hasMaskedRecoveryLink(emailData)) {
           // Status-guarded: a row cancelled since the batch was fetched
           // (e.g. a customer erasure, issue 1593) must stay cancelled.
-          await db('email_queue').where({ id: email.id, status: 'pending' }).update({
+          await db('email_queue').where({ id: email.id, status: email.status }).update({
             status: 'failed',
             error_message: 'This invitation or password-reset email cannot be sent again: its link is not kept after sending. Send a new invitation or password reset instead.',
           });
@@ -1362,7 +1533,11 @@ async function processEmailQueue({ ignoreSchedule = false, limit = 10, onlyId = 
         // this row. Cancelled here, the same way a newsletter opt-out is
         // below — not an error, so it neither counts against retries nor
         // logs at error level.
-        const staleDocumentReason = await staleDocumentNotificationReason(email.email_type, emailData);
+        // The "your download is ready" mail (issue 1733) gets the same
+        // re-check: the archive can be gone by the time the queue is here.
+        const staleDocumentReason = await staleDocumentNotificationReason(email.email_type, emailData)
+          || (email.email_type === 'download_ready'
+            ? await require('./downloadJobNotifier').staleMailReason(emailData, email.recipient_email) : null);
         if (staleDocumentReason) {
           await db('email_queue').where('id', email.id).update({
             status: 'cancelled',
@@ -1385,7 +1560,7 @@ async function processEmailQueue({ ignoreSchedule = false, limit = 10, onlyId = 
           // a full batch goes out after the UI says the campaign is
           // cancelled. Re-check the row still exists and is still pending.
           const stillPending = await db('email_queue')
-            .where({ id: email.id, status: 'pending' })
+            .where({ id: email.id, status: email.status })
             .first('id');
           if (!stillPending) {
             logger.info(`Email ${email.id} skipped — cancelled after the batch was fetched`);
@@ -1405,7 +1580,7 @@ async function processEmailQueue({ ignoreSchedule = false, limit = 10, onlyId = 
           // the row back to 'sent' with the pre-erasure, unredacted data.
           // Re-check the row is still pending immediately before sending.
           const stillPending = await db('email_queue')
-            .where({ id: email.id, status: 'pending' })
+            .where({ id: email.id, status: email.status })
             .first('id');
           if (!stillPending) {
             logger.info(`Email ${email.id} skipped — cancelled after the batch was fetched`);
@@ -1441,7 +1616,7 @@ async function processEmailQueue({ ignoreSchedule = false, limit = 10, onlyId = 
         // and redacts this row (issue 1593); an unguarded update would flip
         // it back to 'sent' and restore the pre-erasure data + HTML.
         const markedSent = await db('email_queue')
-          .where({ id: email.id, status: 'pending' })
+          .where({ id: email.id, status: email.status })
           .update(sentUpdate);
         if (!markedSent) {
           logger.info(`Email ${email.id} was sent but cancelled mid-send — leaving the cancelled row as is`);
@@ -1476,10 +1651,11 @@ async function processEmailQueue({ ignoreSchedule = false, limit = 10, onlyId = 
           logger.error(`Email ${email.id} not sent: ${error.message}`);
           continue;
         }
-        // Increment retry count. The variables stay in the clear on
-        // failure: a row past the cap can still be re-queued (Messages
-        // "retry" resets retry_count, ignoreSchedule skips the cap) and a
-        // masked password would then be mailed out as the real one.
+        // Increment retry count without rewriting email_data. Protected
+        // account-recovery rows therefore remain encrypted, and so do the
+        // password fields of ordinary rows; those keep their variables
+        // because a row past the cap can still be re-queued (Messages
+        // "retry" resets retry_count, ignoreSchedule skips the cap).
         try {
           await db('email_queue')
             .where('id', email.id)
@@ -1595,18 +1771,29 @@ async function getScheduledEmailConfig() {
 // Attachments + cc travel inside `emailData` (keys: attachments, cc)
 // so callers don't need a new signature for every email shape.
 async function queueEmail(eventId, recipientEmail, emailType, emailData, options = {}) {
+  // Callers pass `customer_email || host_email`, and an event may have
+  // neither (issue 1733). A row without a recipient can never be sent, so
+  // nothing is queued; this is not thrown because the automated callers
+  // (expiry warnings, reminders) run inside loops that must carry on.
+  if (typeof recipientEmail !== 'string' || !recipientEmail.trim()) {
+    logger.warn(`Email not queued: ${emailType} has no recipient`, { eventId });
+    return false;
+  }
   try {
     // Add eventId to emailData for language detection
     emailData.eventId = eventId;
     // An explicit test message (dev tools' send-test-email) must not count as
     // template delivery when the queue processor sends it later.
     if (options.usageEligible === false) emailData.__usageEligible = false;
+    // The document's customer, for the "no administrative emails" decision
+    // (migration 300). Kept on the row so a resend / retry can ask again.
+    if (options.customerAccountId != null) emailData.__customerAccountId = Number(options.customerAccountId);
     const row = {
       event_id: eventId,
       recipient_email: recipientEmail,
       email_type: emailType,
-      email_data: JSON.stringify(emailData),
-      status: 'pending',
+      email_data: JSON.stringify(encryptEmailData(emailType, emailData, recipientEmail)),
+      status: isProtectedEmailType(emailType) ? PROTECTED_PENDING_STATUS : 'pending',
       retry_count: 0,
       created_at: new Date(),
       // Explicit NULL, never the column default. The default is
@@ -1616,6 +1803,19 @@ async function queueEmail(eventId, recipientEmail, emailType, emailData, options
       // (issue 1670). NULL is what the processor's whereNull() looks for.
       scheduled_at: null,
     };
+    // Customer opted out of administrative mail (migration 300): keep the row
+    // in the email log as `suppressed` so the admin can see what was held
+    // back, but never hand it to the processor (it only picks up pending).
+    // Decided here, once, for the document's customer: the caller's Issue
+    // button and the late fee read the same customer flag. Returns
+    // 'suppressed' (truthy, so `if (queued)` callers carry on) for callers
+    // that report what happened.
+    if (await require('./_adminEmailOptOut').isSuppressedForRecipient(recipientEmail, emailType, options.customerAccountId)) {
+      row.status = 'suppressed';
+      await db('email_queue').insert(row);
+      logger.info(`Email suppressed: ${emailType} (customer opted out of administrative emails)`);
+      return 'suppressed';
+    }
     let snappedFrom = null;
     // Base time to schedule from:
     //   - explicit options.scheduledAt (CRM split-payment invoices), OR
@@ -1640,13 +1840,16 @@ async function queueEmail(eventId, recipientEmail, emailType, emailData, options
       // time forward (inside hours → stays null → processor sends at once).
       if (options.scheduledAt || snappedFrom) row.scheduled_at = snapped;
     }
-    await db('email_queue').insert(row);
+    // options.trx: the caller's transaction, when the row must commit or roll
+    // back together with its own write (downloadJobNotifier's claim).
+    await (options.trx || db)('email_queue').insert(row);
 
     logger.info(`Email queued: ${emailType} to ${recipientEmail}${
       row.scheduled_at ? ` (scheduled ${row.scheduled_at.toISOString()}${
         snappedFrom ? `, floored from ${snappedFrom.toISOString()}` : ''
       })` : ''
     }`);
+    return true;
   } catch (error) {
     logger.error('Error queueing email:', error);
     throw error;

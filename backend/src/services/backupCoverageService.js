@@ -66,10 +66,15 @@ const STORAGE_ROOT = () => getStoragePath();
  * `tmp`        — short-lived scratch space (e.g. PDF render staging,
  *                S3 multipart uploads). Re-created on demand, never
  *                holds the only copy of anything.
+ *
+ * `hls`        — adaptive streaming ladders (issue 1733). Transcoded from
+ *                the originals, as large again as the videos, and rebuilt
+ *                by the queue when a restore leaves a row without one.
  */
 const EXPECTED_NON_BACKUP_DIRS = new Set([
   'backups',
   'tmp',
+  'hls',
 ]);
 
 /**
@@ -308,6 +313,7 @@ async function getCoverageReport() {
     { path: 'heroes',           include_in_default: true,  feature_flag: null,                       display_order: 50, description: 'Legacy fallback (backup_paths missing)' },
     { path: 'uploads',          include_in_default: true,  feature_flag: null,                       display_order: 60, description: 'Legacy fallback (backup_paths missing)' },
     { path: 'business-docs',    include_in_default: true,  feature_flag: null,                       display_order: 70, description: 'Legacy fallback (backup_paths missing)' },
+    { path: 'videos',           include_in_default: true,  feature_flag: null,                       display_order: 80, description: 'Legacy fallback (backup_paths missing)' },
   ];
 
   const [database, paths] = await Promise.all([

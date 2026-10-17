@@ -8,7 +8,7 @@
  * expiry date and can't be opened.
  */
 import React, { useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { ArrowLeft, Calendar, Clock, Download, ExternalLink } from 'lucide-react';
@@ -20,6 +20,7 @@ import { formatMoneyMinor } from '../../utils/money';
 import { customerService } from '../../services/customer.service';
 import { storeGalleryToken, setActiveGallerySlug } from '../../utils/galleryAuthStorage';
 import { CustomerDocumentList } from './CustomerDocumentsPage';
+import { DOWNLOAD_JOB_QUERY_PARAM, readDownloadJobParam } from '../../components/gallery/downloadJobLink';
 
 /** Open a blob URL produced by `load` in a new tab, keeping the click gesture. */
 async function openPdf(load: () => Promise<string>, blockedMessage: string, failedMessage: string) {
@@ -46,8 +47,9 @@ const Section: React.FC<{ title: string; children: React.ReactNode }> = ({ title
 export const CustomerEventPage: React.FC = () => {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const location = useLocation();
   const { slug = '' } = useParams<{ slug: string }>();
-  const { format: fmtDate } = useLocalizedDate();
+  const { format: fmtDate, formatExpiry: fmtExpiry } = useLocalizedDate();
   const [opening, setOpening] = useState(false);
 
   const { data, isLoading, isError } = useQuery({
@@ -82,7 +84,11 @@ export const CustomerEventPage: React.FC = () => {
       const { token } = await customerService.getEventAccessToken(event.slug);
       storeGalleryToken(event.slug, token);
       setActiveGallerySlug(event.slug);
-      navigate(`/gallery/${encodeURIComponent(event.slug)}`);
+      // A "your download is ready" mail links here for an account (issue
+      // 1733); the gallery is what offers the job, so hand the token on.
+      const downloadJob = readDownloadJobParam(location.search);
+      navigate(`/gallery/${encodeURIComponent(event.slug)}${
+        downloadJob ? `?${DOWNLOAD_JOB_QUERY_PARAM}=${downloadJob}` : ''}`);
     } catch {
       toast.error(t('customer.dashboard.openError', 'Could not open this gallery. Please try again.'));
     } finally {
@@ -111,8 +117,8 @@ export const CustomerEventPage: React.FC = () => {
           <span className="inline-flex items-center gap-1.5">
             <Clock className="w-4 h-4" />
             {event.availability === 'expired'
-              ? t('customer.dashboard.expiredOn', 'Expired {{date}}', { date: fmtDate(event.expiresAt) })
-              : t('customer.dashboard.expiresOn', 'Expires {{date}}', { date: fmtDate(event.expiresAt) })}
+              ? t('customer.dashboard.expiredOn', 'Expired {{date}}', { date: fmtExpiry(event.expiresAt) })
+              : t('customer.dashboard.expiresOn', 'Expires {{date}}', { date: fmtExpiry(event.expiresAt) })}
           </span>
         )}
       </div>
@@ -133,7 +139,7 @@ export const CustomerEventPage: React.FC = () => {
         ) : event.availability === 'expired' ? (
           <p className="text-sm text-muted-theme">
             {t('customer.event.galleryExpired', 'This gallery expired on {{date}} and can no longer be opened. Contact your photographer if you still need the photos.', {
-              date: event.expiresAt ? fmtDate(event.expiresAt) : '',
+              date: event.expiresAt ? fmtExpiry(event.expiresAt) : '',
             })}
           </p>
         ) : (
@@ -145,7 +151,7 @@ export const CustomerEventPage: React.FC = () => {
 
       {sections.quotes && data.quotes.length > 0 && (
         <Section title={t('customer.nav.quotes', 'Quotes')}>
-          <ul className="divide-y" style={{ borderColor: 'var(--color-surface-border)' }}>
+          <ul className="divide-y divide-border-token">
             {data.quotes.map((q) => (
               <li key={q.id} className="p-4 flex items-center justify-between gap-3 flex-wrap">
                 <div className="min-w-0">
@@ -167,7 +173,7 @@ export const CustomerEventPage: React.FC = () => {
 
       {sections.contracts && data.contracts.length > 0 && (
         <Section title={t('customer.nav.contracts', 'Contracts')}>
-          <ul className="divide-y" style={{ borderColor: 'var(--color-surface-border)' }}>
+          <ul className="divide-y divide-border-token">
             {data.contracts.map((c) => (
               <li key={c.id} className="p-4 flex items-center justify-between gap-3 flex-wrap">
                 <div className="min-w-0">
@@ -189,7 +195,7 @@ export const CustomerEventPage: React.FC = () => {
 
       {sections.invoices && data.invoices.length > 0 && (
         <Section title={t('customer.nav.bills', 'Invoices')}>
-          <ul className="divide-y" style={{ borderColor: 'var(--color-surface-border)' }}>
+          <ul className="divide-y divide-border-token">
             {data.invoices.map((i) => (
               <li key={i.id} className="p-4 flex items-center justify-between gap-3 flex-wrap">
                 <div className="min-w-0">

@@ -21,6 +21,11 @@
 const { db } = require('../database/db');
 const logger = require('../utils/logger');
 const { sendWhatsAppMessage } = require('./whatsappService');
+const { getInstanceTimeZone, expiryCalendarDate } = require('../utils/galleryExpiry');
+const {
+  encryptEmailData, decryptEmailData, maskSecretFields, whatsappSealType,
+} = require('../utils/emailQueueEncryption');
+const { redactEmailData, MASK } = require('../utils/emailSecretRedaction');
 
 // IETF language tag (with hyphen or underscore) → Meta template language code.
 // Meta template languages: https://developers.facebook.com/docs/whatsapp/business-management-api/message-templates/supported-languages
@@ -66,6 +71,11 @@ const INTL_LOCALE_MAP = {
 const POLL_INTERVAL_MS = parseInt(process.env.WHATSAPP_QUEUE_POLL_MS || '30000', 10);
 const CYCLE_BATCH_SIZE = parseInt(process.env.WHATSAPP_QUEUE_BATCH || '10', 10);
 const MAX_RETRIES = 3;
+
+// The gallery password rides in message_data. It is sealed like a queued
+// email's password (emailQueueEncryption) while the row waits, and replaced
+// by the archive mask once the row is final; no queued WhatsApp is retried.
+const archivedData = (stored) => JSON.stringify(redactEmailData(maskSecretFields(stored, MASK)));
 
 
 
@@ -117,10 +127,14 @@ async function getSystemDefaultLanguageCode() {
 function formatDate(raw, metaLangCode) {
   if (!raw) return '';
   try {
-    const d = new Date(raw);
+    // A bare date is that day wherever the server runs.
+    const dateOnly = typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw);
+    const d = new Date(dateOnly ? `${raw}T00:00:00.000Z` : raw);
     if (Number.isNaN(d.getTime())) return '';
     const intlLocale = INTL_LOCALE_MAP[metaLangCode] || 'en-US';
-    return d.toLocaleDateString(intlLocale, { day: '2-digit', month: '2-digit', year: 'numeric' });
+    return d.toLocaleDateString(intlLocale, {
+      day: '2-digit', month: '2-digit', year: 'numeric', ...(dateOnly ? { timeZone: 'UTC' } : {}),
+    });
   } catch {
     return '';
   }
@@ -213,7 +227,7 @@ async function queueWhatsapp(eventId, recipientPhone, messageType, messageData) 
       event_id: eventId,
       recipient_phone: recipientPhone,
       message_type: messageType,
-      message_data: JSON.stringify(messageData || {}),
+      message_data: JSON.stringify(encryptEmailData(whatsappSealType(messageType), messageData || {}, recipientPhone)),
       status: 'pending',
       retry_count: 0,
       created_at: new Date(),
@@ -269,10 +283,18 @@ async function processWhatsAppQueue() {
   logger.info(`WhatsApp queue: processing ${pending.length} message(s)`);
 
   for (const item of pending) {
+    let stored = {};
     try {
-      const data = typeof item.message_data === 'string'
+      stored = typeof item.message_data === 'string'
         ? JSON.parse(item.message_data || '{}')
         : item.message_data || {};
+      const data = { ...decryptEmailData(whatsappSealType(item.message_type), stored, item.recipient_phone) };
+
+      // The gallery expiry as its day in the instance time zone (see
+      // utils/galleryExpiry), not the server's.
+      if (data.expiry_date) {
+        data.expiry_date = expiryCalendarDate(data.expiry_date, await getInstanceTimeZone()) || data.expiry_date;
+      }
 
       const requestedLang = resolveLanguageCode(data.language);
       const metaLang = requestedLang || defaultLanguage;
@@ -282,7 +304,9 @@ async function processWhatsAppQueue() {
 
       await db('whatsapp_queue')
         .where('id', item.id)
-        .update({ status: 'sent', sent_at: new Date(), error_message: null });
+        .update({
+          status: 'sent', sent_at: new Date(), error_message: null, message_data: archivedData(stored),
+        });
     } catch (error) {
       const newRetryCount = (item.retry_count || 0) + 1;
       const exhausted = newRetryCount >= MAX_RETRIES;
@@ -291,7 +315,7 @@ async function processWhatsAppQueue() {
         .update({
           retry_count: newRetryCount,
           error_message: String(error.message).slice(0, 2000),
-          ...(exhausted ? { status: 'failed' } : {}),
+          ...(exhausted ? { status: 'failed', message_data: archivedData(stored) } : {}),
         });
       logger.error(
         `WhatsApp message ${item.id} ${exhausted ? 'failed (permanent)' : `retry ${newRetryCount}/${MAX_RETRIES}`}:`,

@@ -8,6 +8,7 @@ const { capabilityEvidence } = require('../usage/capabilityEvidence');
 const router = express.Router();
 const { body, query, validationResult } = require('express-validator');
 const { db, withRetry } = require('../database/db');
+const { livePhotos } = require('../utils/photoVisibility');
 const { adminAuth } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const { requireEventOwnership } = require('../middleware/ownership');
@@ -34,6 +35,7 @@ router.get('/:eventId/filtered', adminAuth, requirePermission('photos.view'), re
   query('has_comments').optional().isBoolean(),
   query('color_labels').optional().isString(),
   query('my_color_labels').optional().isString(),
+  query('decisions').optional().isString(),
   query('category_id').optional().isInt(),
   query('logic').optional().isIn(['AND', 'OR']),
   query('sort').optional().isIn(['rating', 'likes', 'favorites', 'date', 'filename']),
@@ -69,6 +71,7 @@ router.get('/:eventId/filtered', adminAuth, requirePermission('photos.view'), re
       has_comments: req.query.has_comments,
       color_labels: req.query.color_labels,
       my_color_labels: req.query.my_color_labels,
+      decisions: req.query.decisions,
       admin_id: req.admin.id,
       category_id: req.query.category_id ? parseInt(req.query.category_id) : undefined,
       logic: req.query.logic || 'AND'
@@ -85,7 +88,7 @@ router.get('/:eventId/filtered', adminAuth, requirePermission('photos.view'), re
 
     // Build filtered query
     const filterBuilder = new PhotoFilterBuilder(
-      db('photos')
+      livePhotos(db)
         .leftJoin('photo_categories', 'photos.category_id', 'photo_categories.id')
         .select(
           'photos.id',
@@ -98,6 +101,8 @@ router.get('/:eventId/filtered', adminAuth, requirePermission('photos.view'), re
           'photos.favorite_count',
           'photos.comment_count',
           'photos.color_label_count',
+          'photos.approved_count',
+          'photos.rejected_count',
           'photos.width',
           'photos.height',
           'photos.uploaded_at',
@@ -212,7 +217,7 @@ router.post('/:eventId/export', adminAuth, requirePermission('photos.download'),
       const { identity_mode: identityMode } =
         await feedbackService.getEventFeedbackSettings(eventId);
       const filterBuilder = new PhotoFilterBuilder(
-        db('photos').select('id'),
+        livePhotos(db).select('id'),
         eventId,
         identityMode
       );

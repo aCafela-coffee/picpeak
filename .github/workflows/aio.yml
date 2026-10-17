@@ -30,7 +30,7 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Fetch the pinned official source (never follows main)
-        run: git fetch --no-tags --depth=1 https://github.com/PicPeak/picpeak.git 76492c11836fdf0e79e8cecfbc18e004e0cde9cc
+        run: git fetch --no-tags --depth=1 https://github.com/PicPeak/picpeak.git ec7b22354fd6b5a66aec9e2a965e22fbcf7334f2
       - name: Official backend and accounting source integrity
         run: node scripts/ci/check-official-source.cjs
       - run: npm ci
@@ -39,11 +39,12 @@ jobs:
         working-directory: frontend
       - name: Translation integrity
         run: node scripts/check-korean-locales.cjs
-      - name: Frontend types, build and screen-language regressions
+      - name: Frontend types, build, lint and full test suite
         working-directory: frontend
         run: |
           npm run build:check
-          npx vitest run src/i18n/__tests__/screenLanguage.test.tsx src/features/settings/__tests__/GeneralTab.language.test.tsx src/contexts/__tests__/CustomerAuthContext.cacheClear.test.tsx src/utils/__tests__/moneyFormatting.test.ts
+          npm run lint
+          npm test -- --run
       - uses: docker/setup-buildx-action@v3
       - name: Build native AIO without publishing
         uses: docker/build-push-action@v6
@@ -59,7 +60,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=aio-${{ matrix.arch }}
       - name: Backend, migrations and inherited runtime invariant
         run: python3 scripts/ci/image-invariants.py picpeak-aio:verified-${{ matrix.arch }}
-      - name: Official to Korean to official SQLite rollback verification
+      - name: Previous official to new official to Korean to same official verification
         run: node scripts/ci/aio-smoke.cjs picpeak-aio:verified-${{ matrix.arch }} linux/${{ matrix.arch }}
       - uses: actions/upload-artifact@v4
         if: always()
@@ -119,3 +120,8 @@ jobs:
           node scripts/ci/package-visibility.cjs after
           docker buildx imagetools create --tag "${IMAGE}:main" "${IMAGE}:${GITHUB_SHA}"
           docker buildx imagetools inspect "${IMAGE}:main"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify SHA and main manifests and anonymous downloads
+        run: node scripts/ci/check-published-image.cjs

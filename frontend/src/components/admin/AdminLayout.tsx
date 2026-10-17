@@ -1,5 +1,6 @@
 import React, { lazy, Suspense, useEffect, useState } from 'react';
 import { Outlet, Navigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 
 import { useAdminAuth } from '../../contexts';
 import { FeatureFlagsProvider } from '../../contexts/FeatureFlagsContext';
@@ -12,6 +13,9 @@ import { AdminHeader } from './AdminHeader';
 import { MaintenanceBanner } from './MaintenanceBanner';
 import { MandatoryPasswordChangeModal } from './MandatoryPasswordChangeModal';
 import { CommandPalette } from './CommandPalette';
+import { BottomBarSlotContext } from './bottomBarSlot';
+import { FillViewportContext, useFillViewportCounter } from './fillViewport';
+import { useEscapeClose } from '../common/useEscapeClose';
 
 const SIDEBAR_COLLAPSED_KEY = 'admin-sidebar-collapsed';
 const ProductUsageNotice = lazy(() => import('./ProductUsageNotice'));
@@ -40,7 +44,7 @@ export const AdminLayout: React.FC = () => {
       <div className="min-h-screen bg-canvas flex items-center justify-center">
         <div className="text-center">
           <div className="w-16 h-16 border-4 border-accent-dark border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-          <p className="text-neutral-600">Loading...</p>
+          <p className="text-soft">Loading...</p>
         </div>
       </div>
     );
@@ -85,7 +89,13 @@ interface AdminLayoutInnerProps {
 }
 
 const AdminLayoutInner: React.FC<AdminLayoutInnerProps> = ({ sidebarOpen, setSidebarOpen, sidebarCollapsed, setSidebarCollapsed, mustChangePassword }) => {
+  // The phone drawer closes with Escape like any overlay (UX.md § 8).
+  useEscapeClose(sidebarOpen, () => setSidebarOpen(false));
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [bottomBarSlot, setBottomBarSlot] = useState<HTMLDivElement | null>(null);
+  // Pages that give their panes their own scrollbars (useFillViewport).
+  const [fillViewport, setFillViewport] = useFillViewportCounter();
+  const { t } = useTranslation();
 
   // Cmd+K on a Mac, Ctrl+K everywhere else. NOT "either modifier": Ctrl+K on
   // macOS is kill-to-end-of-line in every text field, and claiming it would
@@ -135,8 +145,13 @@ const AdminLayoutInner: React.FC<AdminLayoutInnerProps> = ({ sidebarOpen, setSid
         />
       )}
 
-      {/* Sidebar - disabled when password change required */}
-      <div className={mustChangePassword ? 'pointer-events-none opacity-50' : ''}>
+      {/* Sidebar - disabled when password change required. Inert as well:
+          pointer-events-none leaves the keyboard in, and the drawer's focus
+          trap would then hold focus in a sidebar that cannot be used. */}
+      <div
+        className={mustChangePassword ? 'pointer-events-none opacity-50' : ''}
+        {...(mustChangePassword ? { inert: '' } : {})}
+      >
         <AdminSidebar
           isOpen={sidebarOpen}
           onClose={() => setSidebarOpen(false)}
@@ -176,9 +191,28 @@ const AdminLayoutInner: React.FC<AdminLayoutInnerProps> = ({ sidebarOpen, setSid
             overflow moved up to the column so the scrollbar gutter is
             reserved once at the column level (see above). main now
             just contributes its content + padding. */}
-        <main id="main-content" className={`flex-1 px-4 sm:px-6 lg:px-8 py-8 ${mustChangePassword ? 'opacity-50 pointer-events-none' : ''}`}>
-          <Outlet />
-        </main>
+        <BottomBarSlotContext.Provider value={bottomBarSlot}>
+          <FillViewportContext.Provider value={setFillViewport}>
+            {/* Filling the column, <main> may shrink to the space left (min-h-0)
+                and drops its bottom padding: the page's panes scroll down to
+                the bottom bar, and pad their own content. */}
+            <main
+              id="main-content"
+              className={`flex-1 px-4 sm:px-6 lg:px-8 py-8 ${fillViewport ? 'lg:min-h-0 lg:flex lg:flex-col lg:pb-0' : ''} ${mustChangePassword ? 'opacity-50 pointer-events-none' : ''}`}
+            >
+              <Outlet />
+            </main>
+          </FillViewportContext.Provider>
+        </BottomBarSlotContext.Provider>
+        {/* Bottom bars (SettingsSaveBar) render here: after a <main> that
+            fills the column, so they sit at the bottom of the window even
+            when the page is shorter than it. */}
+        <div
+          ref={setBottomBarSlot}
+          role="region"
+          aria-label={t('settings.saveBar.region', 'Save or discard changes')}
+          className={`sticky bottom-0 z-20 empty:hidden ${mustChangePassword ? 'opacity-50 pointer-events-none' : ''}`}
+        />
       </div>
     </div>
   );

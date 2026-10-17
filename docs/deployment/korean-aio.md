@@ -6,11 +6,14 @@
 
 ## 고정 기준
 
-- 공식 소스 커밋: `76492c11836fdf0e79e8cecfbc18e004e0cde9cc`
-- 공식 AIO: `ghcr.io/picpeak/picpeak/aio@sha256:dde09c55e29bc40065f33d94a18f2cc90a604e5c02c4b62bd1dcd1a504226588`
+- 공식 버전: `3.175.1-beta.0`
+- 공식 소스 커밋: `ec7b22354fd6b5a66aec9e2a965e22fbcf7334f2`
+- 공식 AIO: `ghcr.io/picpeak/picpeak/aio@sha256:efd3fa3473e6ac6f518fdead86c43deaa3eca5ce28abec22928e8e2f6cdca4bc`
 
 아키텍처별 검증에서는 이 고정 manifest index에 속하는 AMD64·ARM64 digest를
-확인하고 해당 이미지를 사용합니다. 두 기준은 루트의 `aio-baseline.json`에 함께 기록합니다. 빌드가 최신 공식
+확인하고 해당 이미지를 사용합니다. 소스와 이미지 기준은 루트의 `aio-baseline.json`에 함께 기록합니다.
+이전 공식 기준(`76492c11`, `3.155.1-beta.0`)도 `previousBaseline`에 보관하여
+기존 데이터의 공식 업그레이드를 별도로 검증합니다. 빌드가 최신 공식
 `main`을 자동으로 따라가지 않습니다. `Dockerfile.aio`는 위 공식 이미지의
 프런트엔드 빌드 결과만 교체합니다. 백엔드, 의존성, 마이그레이션, 시작 명령,
 환경 기본값, 볼륨, healthcheck는 공식 이미지에서 상속합니다.
@@ -48,9 +51,9 @@
 
 - 공식 소스와 백엔드·마이그레이션·금액 함수의 동일성
 - 영어·한국어 키 일치, 빈 문자열, 변수 및 복수형 보존
-- 프런트엔드 타입·빌드, 화면 언어 유지 및 저장 범위 회귀 테스트
+- 프런트엔드 타입·빌드·lint·전체 테스트, 화면 언어 유지 및 저장 범위 회귀 검사
 - 공식 이미지와 런타임 설정·파일·의존성 비교 (프런트엔드 dist만 제외)
-- 임시 SQLite 볼륨을 공식 이미지로 초기화·재생성해 공식 이력을 확정한 뒤 공식 → 한국어 → 컨테이너 재생성 → 같은 공식 digest 복귀
+- 이전 고정 공식 이미지로 임시 SQLite 볼륨을 초기화·재생성하고 합성 데이터를 만든 뒤 이전 공식 → 새 공식 → 한국어 → 컨테이너 재생성 → 같은 새 공식 digest 복귀
 - 각 단계에서 스키마·마이그레이션 이력·저장 언어·금액·JWT 비밀키 유지와
   로그인·이벤트·공유 링크·원본 사진 다운로드
 - 실제 Chromium에서 관리자·고객·갤러리의 한국어 선택·로그인·새로고침·페이지 이동,
@@ -58,18 +61,21 @@
 
 두 아키텍처의 모든 검사가 성공해야 검증한 이미지 자체를 게시합니다. PR은
 게시하지 않습니다. 공개 패키지 `ghcr.io/acafela-coffee/picpeak/aio` 상태와 현재
-`main` 커밋을 확인한 뒤 전체 커밋 SHA와 `main` 태그를 갱신합니다. 실패하면 기존
-`main`을 유지합니다. 상속받은 Docker·릴리스 자동화는 `.yml.disabled`로 보관합니다.
+`main` 커밋을 확인한 뒤 전체 커밋 SHA와 `main` 태그를 갱신합니다. 검증·후보 게시가 실패하면 기존
+`main`을 유지합니다. 게시 후에는 SHA와 `main`의 manifest 일치, 두 아키텍처의
+revision·기준 이미지 라벨 및 인증 없는 manifest·설정·레이어 접근을 재검사합니다. 상속받은 Docker·릴리스·updater 이미지 게시 자동화는 `.yml.disabled`로 보관합니다.
 
 로컬 검증은 다음 순서로 실행합니다. 운영 볼륨을 사용하지 않습니다.
 
 ```sh
-git fetch https://github.com/PicPeak/picpeak.git 76492c11836fdf0e79e8cecfbc18e004e0cde9cc
+git fetch https://github.com/PicPeak/picpeak.git ec7b22354fd6b5a66aec9e2a965e22fbcf7334f2
 node scripts/ci/check-official-source.cjs
 node scripts/check-korean-locales.cjs
 npm ci
 npm ci --legacy-peer-deps --prefix frontend
 npm run build:check --prefix frontend
+npm run lint --prefix frontend
+npm test --prefix frontend -- --run
 # 예: ARM64. AMD64는 플랫폼과 태그의 arm64를 amd64로 바꿉니다.
 docker build --platform linux/arm64 -f Dockerfile.aio -t picpeak-aio:verified-arm64 .
 python3 scripts/ci/image-invariants.py picpeak-aio:verified-arm64
@@ -104,7 +110,7 @@ node scripts/ci/aio-smoke.cjs picpeak-aio:verified-arm64 linux/arm64
    바꾸고 기존 볼륨을 그대로 연결합니다.
 
    ```yaml
-   image: ghcr.io/picpeak/picpeak/aio@sha256:dde09c55e29bc40065f33d94a18f2cc90a604e5c02c4b62bd1dcd1a504226588
+   image: ghcr.io/picpeak/picpeak/aio@sha256:efd3fa3473e6ac6f518fdead86c43deaa3eca5ce28abec22928e8e2f6cdca4bc
    ```
 
 복귀 보장은 위 고정 digest에 한정합니다. 이후 내용이 달라질 공식 `main`이나

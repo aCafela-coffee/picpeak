@@ -1,32 +1,88 @@
-import React, { useState, useRef, useMemo } from 'react';
-import { Upload, X, Image, Info } from 'lucide-react';
-import { Button } from '../common';
+import React, { useState, useRef, useMemo, useEffect } from 'react';
+import { Upload, X, Image, FolderUp, FilePlus } from 'lucide-react';
+import { Button, Notice } from '../common';
 import { clsx } from 'clsx';
 import { toast } from 'react-toastify';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { categoriesService } from '../../services/categories.service';
+import { folderQueryKey, foldersService, MAX_RESOLVE_PATHS } from '../../services/folders.service';
 import { settingsService } from '../../services/settings.service';
 import { useTranslation } from 'react-i18next';
-import { extensionsToMimeTypes, extensionsToAcceptString, extensionsToLabel, normalizeFileMimeType } from '../../utils/fileTypes';
-import { useUploadSession } from '../../contexts/UploadSessionContext';
+import { extensionsToMimeTypes, extensionsToAcceptString, extensionsToLabel, isAllowedUploadFile } from '../../utils/fileTypes';
+import { useUploadSession, type UploadBatch } from '../../contexts/UploadSessionContext';
+import { collectDroppedEntries, pickedFromInput, type PickedFile } from '../../utils/droppedFiles';
+import { buildUploadPreview, groupFilesByPlacement, hasDirectories, uniqueDirectories } from '../../utils/uploadStructure';
+import { childFolders, folderPathLabel } from '../../utils/folderTree';
+import { UploadStructurePreview } from './UploadStructurePreview';
+import { folderErrorMessage } from './folders/folderQueries';
 
 interface PhotoUploadProps {
   eventId: number;
   /** Fired the moment the upload is handed to the session. The host (modal)
    *  closes on it; progress and the failure report live in UploadProgressBar. */
   onUploadStarted?: () => void;
+  /** The event's folder_structure setting: the default of "Keep folder structure" (issue 1786). */
+  folderStructureDefault?: boolean;
+  /** Folder loose files go to at first (the folder open on the Photos tab); null = root. */
+  defaultFolderId?: number | null;
 }
 
-const DEFAULT_MAX_FILES_PER_UPLOAD = 500;
-const MAX_FILES_PER_UPLOAD_LIMIT = 2000;
+// Wait this long after the last change before asking the server for the
+// structure preview, so a folder walk landing in pieces asks once.
+const PREVIEW_DEBOUNCE_MS = 300;
 
-export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStarted }) => {
+const DEFAULT_MAX_FILES_PER_UPLOAD = 500;
+// Largest value general_max_files_per_upload can take; mirrors
+// MAX_ALLOWED_FILES_PER_UPLOAD in backend/src/services/uploadSettings.js.
+const MAX_FILES_PER_UPLOAD_LIMIT = 2000;
+// How many admissible files a folder walk collects at most. Fixed, not the
+// capacity at drop time: the cap can be raised and files can be removed
+// while a walk is pending, and addFiles applies the live cap when it lands.
+// One above the largest possible cap, so its "some files skipped" notice
+// still fires for a tree that exceeds even that.
+const FOLDER_WALK_CEILING = MAX_FILES_PER_UPLOAD_LIMIT + 1;
+
+export const PhotoUpload: React.FC<PhotoUploadProps> = ({
+  eventId,
+  onUploadStarted,
+  folderStructureDefault = false,
+  defaultFolderId = null,
+}) => {
   const { t } = useTranslation();
   const { startUpload, isUploading } = useUploadSession();
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  // Each file with its directory relative to the drop or folder pick (issue
+  // 1786); '' for loose files.
+  const [selectedFiles, setSelectedFiles] = useState<PickedFile[]>([]);
+  // Folder walks still resolving. Upload stays disabled while any is pending:
+  // otherwise a click sends the current selection, clears it, and the walk's
+  // files arrive in a modal that has already unmounted.
+  const [pendingWalks, setPendingWalks] = useState(0);
+  // The selection as of the last add/remove, written synchronously. A folder
+  // walk resolves asynchronously, so `addFiles` may run from a render that
+  // predates another drop or pick; reading the cap against `selectedFiles`
+  // from that render let two concurrent additions exceed maxFilesPerUpload.
+  const selectedFilesRef = useRef<PickedFile[]>([]);
+  const commitSelection = (next: PickedFile[]) => {
+    selectedFilesRef.current = next;
+    setSelectedFiles(next);
+  };
   const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(null);
   const [replaceByName, setReplaceByName] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  // Folder uploads (issue 1786).
+  const [keepStructure, setKeepStructure] = useState(folderStructureDefault);
+  // Only applies when the dry run reports a single outer folder; checked by
+  // default there, as the mockup asks.
+  const [skipOuter, setSkipOuter] = useState(true);
+  const [looseFolderId, setLooseFolderId] = useState<number | null>(defaultFolderId);
+  // The real (not dry-run) resolve call between the click and the upload.
+  const [resolving, setResolving] = useState(false);
+
+  // React has no typed prop for webkitdirectory, so it is set on the node.
+  useEffect(() => {
+    folderInputRef.current?.setAttribute('webkitdirectory', '');
+  }, []);
 
   // Fetch categories for this event
   const { data: categories = [] } = useQuery({
@@ -34,7 +90,31 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
     queryFn: () => categoriesService.getEventCategories(eventId),
   });
 
-  const { data: settings } = useQuery({
+  // Folders for the "Upload into" select. Upload-only roles can read them
+  // too (photos.view); the select is hidden while there are none.
+  const { data: folderTree } = useQuery({
+    queryKey: folderQueryKey(eventId),
+    queryFn: () => foldersService.list(eventId),
+  });
+  const folders = folderTree?.folders ?? [];
+  // Depth-first, so the select reads like the tree.
+  const folderOptions = useMemo(() => {
+    const list = folderTree?.folders ?? [];
+    const out: Array<{ id: number; label: string; depth: number }> = [];
+    const walk = (parentId: number | null, depth: number) => {
+      for (const f of childFolders(list, parentId)) {
+        out.push({ id: f.id, label: f.name, depth });
+        walk(f.id, depth + 1);
+      }
+    };
+    walk(null, 0);
+    return out;
+  }, [folderTree]);
+  // Folders are no categories any more (issue 1786): only filter categories
+  // are offered as the upload's category.
+  const filterCategories = useMemo(() => categories.filter((c) => !c.is_folder), [categories]);
+
+  const { data: settings, isPending: settingsPending } = useQuery({
     queryKey: ['admin-settings'],
     queryFn: () => settingsService.getAllSettings(),
   });
@@ -85,23 +165,54 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
   // change handler and the drop handler. #504 — without the drop handler
   // the dashed-border zone looked draggable but silently fell through to
   // the browser's default "open the file in a new tab" behaviour.
-  const addFiles = (incoming: File[]) => {
-    const imageFiles = incoming.filter((file) => {
-      if (!allowedMimeTypes.includes(normalizeFileMimeType(file.name, file.type))) return false;
-      // Pre-flight size check, mirroring the guest uploader: without it the
-      // admin streams the whole oversized file before the backend 400s it.
-      const limitMb = sizeLimitMbFor(file);
-      if (file.size > limitMb * 1024 * 1024) {
-        toast.error(t('upload.fileTooLarge', { name: file.name, limit: limitMb }));
-        return false;
-      }
-      return true;
-    });
+  // One admission rule for picked and dropped files: allowed type, and the
+  // pre-flight size check mirroring the guest uploader (without it the admin
+  // streams the whole oversized file before the backend 400s it). The folder
+  // walk applies it too, so sidecars and oversized files do not use up the
+  // per-upload budget before the photos behind them are reached.
+  const admitFile = (file: File, rejected?: string[]): boolean => {
+    // Matches on the extension when the browser reports no type, which is
+    // what it does for camera RAW on macOS and Windows. A rejection is
+    // silent and its name goes on `rejected` if the caller passed a list,
+    // because a file chosen by hand is worth naming and a sidecar found
+    // inside a dropped folder is not.
+    if (!isAllowedUploadFile(file, allowedMimeTypes)) {
+      rejected?.push(file.name);
+      return false;
+    }
+    const limitMb = sizeLimitMbFor(file);
+    if (file.size > limitMb * 1024 * 1024) {
+      toast.error(t('upload.fileTooLarge', { name: file.name, limit: limitMb }));
+      return false;
+    }
+    return true;
+  };
+
+  // Picking or dropping a file of the wrong type used to produce nothing at
+  // all: no toast, no log, no request. The zone simply did not react, which
+  // reads as a broken page rather than a rejected format.
+  const reportRejectedTypes = (rejected: string[]) => {
+    if (rejected.length === 0) return;
+    toast.error(t('upload.invalidFileType', { names: rejected.join(', ') }));
+  };
+
+  // `moreUnread`: the folder walk stopped at its ceiling or ran out of its
+  // scan budget, so `incoming` is only the first part of what was dropped
+  // and its length a lower bound.
+  const addFiles = (incoming: PickedFile[], moreUnread = false) => {
+    // Only loose files (chosen or dropped by hand, dir '') are named when
+    // rejected: a picked folder of RAW plus XMP sidecars would otherwise put
+    // every sidecar in one toast. The folder input has no `accept` to
+    // prefilter it.
+    const rejected: string[] = [];
+    const imageFiles = incoming.filter((picked) => admitFile(picked.file, picked.dir === '' ? rejected : undefined));
+    reportRejectedTypes(rejected);
     if (imageFiles.length === 0) return;
 
-    const totalFiles = selectedFiles.length + imageFiles.length;
+    const current = selectedFilesRef.current;
+    const totalFiles = current.length + imageFiles.length;
     if (totalFiles > maxFilesPerUpload) {
-      const allowedNewFiles = maxFilesPerUpload - selectedFiles.length;
+      const allowedNewFiles = maxFilesPerUpload - current.length;
       if (allowedNewFiles <= 0) {
         toast.error(
           t('upload.maxFilesReached', { limit: maxFilesPerUpload }) ||
@@ -109,19 +220,50 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
         );
         return;
       }
-      toast.warning(
-        t('upload.someFilesSkipped', { allowed: allowedNewFiles, limit: maxFilesPerUpload }) ||
-        `Only ${allowedNewFiles} more files can be added (limit ${maxFilesPerUpload})`
-      );
-      setSelectedFiles((prev) => [...prev, ...imageFiles.slice(0, allowedNewFiles)]);
+      // Dropped vs accepted (issue 1733, C1): a folder over the cap is cut
+      // at the tail, which with "Keep folder structure" means whole folders
+      // are missing, so the notice names both numbers.
+      toast.warning(t('upload.filesOverLimit', {
+        allowed: allowedNewFiles,
+        found: moreUnread ? `${imageFiles.length}+` : imageFiles.length,
+        limit: maxFilesPerUpload,
+      }));
+      commitSelection([...current, ...imageFiles.slice(0, allowedNewFiles)]);
       return;
     }
 
-    setSelectedFiles((prev) => [...prev, ...imageFiles]);
+    commitSelection([...current, ...imageFiles]);
   };
 
+  // A folder walk settles in a later render; it must validate with the
+  // limits of that render (admin-settings may have resolved or refreshed
+  // meanwhile), not with the addFiles closure of the drop.
+  const addFilesRef = useRef(addFiles);
+  addFilesRef.current = addFiles;
+  const admitFileRef = useRef(admitFile);
+  admitFileRef.current = admitFile;
+  // Whether the limits above come from the server yet. Until admin-settings
+  // has resolved, admitFile judges by the defaults (no video, 50 MB), which
+  // must not decide what a folder walk keeps.
+  const settingsLoadedRef = useRef(false);
+  settingsLoadedRef.current = settings !== undefined;
+  // Dropped files are admitted only once admin-settings has settled (loaded
+  // or failed): a walk that finishes earlier waits here, or addFiles would
+  // discard a server-allowed video or larger photo under the defaults for
+  // good. The walk stays counted in pendingWalks, so Upload is held too.
+  const settingsSettledRef = useRef(false);
+  settingsSettledRef.current = !settingsPending;
+  const settledWaiters = useRef<Array<() => void>>([]);
+  useEffect(() => {
+    if (!settingsPending) settledWaiters.current.splice(0).forEach((resume) => resume());
+  }, [settingsPending]);
+  const whenSettingsSettled = () => (settingsSettledRef.current
+    ? Promise.resolve()
+    : new Promise<void>((resume) => { settledWaiters.current.push(resume); }));
+
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    addFiles(Array.from(e.target.files || []));
+    // A folder pick carries webkitRelativePath; a plain pick does not.
+    addFiles(pickedFromInput(Array.from(e.target.files || [])));
     // Reset the input so picking the same files again still fires onChange.
     if (e.target.value) e.target.value = '';
   };
@@ -149,16 +291,100 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
     e.preventDefault();
     e.stopPropagation();
     setIsDragOver(false);
-    const files = Array.from(e.dataTransfer.files || []);
-    addFiles(files);
+    // Dropped folders are walked recursively (issue 1733, C1); the result
+    // goes through the same filter and per-upload cap as picked files.
+    setPendingWalks((n) => n + 1);
+    // The walk stops at a fixed ceiling instead of reading a whole archive;
+    // the cap itself is applied by addFiles against the selection and the
+    // settings as they are when the walk lands.
+    // The prefilter only keeps sidecars and oversized files from using up
+    // the ceiling, and only once the real limits are known: a file read
+    // before admin-settings resolved is collected as it is and judged by
+    // addFiles when the walk lands. A file it rejects is not collected, so
+    // its size toast fires here or in addFiles, never in both.
+    // Same for the wrong-type toast, which is why the names are gathered
+    // here rather than inside the admission rule. Only the items dropped by
+    // hand, depth 0: a folder of RAW next to its XMP sidecars would
+    // otherwise name every sidecar in it.
+    const rejected: string[] = [];
+    const accept = (file: File, depth: number) => !settingsLoadedRef.current
+      || admitFileRef.current(file, depth === 0 ? rejected : undefined);
+    // The walk also stops after examining a multiple of the ceiling (a tree
+    // of mostly unsupported files); say so rather than omit the rest silently.
+    let truncated = false;
+    const onTruncated = () => {
+      truncated = true;
+      toast.warning(t('upload.folderTooLarge'));
+    };
+    void collectDroppedEntries(e.dataTransfer, { limit: FOLDER_WALK_CEILING, accept, onTruncated })
+      .then(async (files) => {
+        await whenSettingsSettled();
+        reportRejectedTypes(rejected);
+        addFilesRef.current(files, truncated || files.length >= FOLDER_WALK_CEILING);
+      })
+      .finally(() => setPendingWalks((n) => n - 1));
   };
 
   const removeFile = (index: number) => {
-    setSelectedFiles(prev => prev.filter((_, i) => i !== index));
+    commitSelection(selectedFilesRef.current.filter((_, i) => i !== index));
   };
 
-  const handleUpload = () => {
-    if (selectedFiles.length === 0 || isUploading) return;
+  // --- Structure preview (issues 1786 + 1562) ---------------------------
+  const withFolders = hasDirectories(selectedFiles);
+  const directories = useMemo(() => uniqueDirectories(selectedFiles), [selectedFiles]);
+  const directoriesKey = directories.join('\n');
+  const [debouncedKey, setDebouncedKey] = useState(directoriesKey);
+  useEffect(() => {
+    const handle = setTimeout(() => setDebouncedKey(directoriesKey), PREVIEW_DEBOUNCE_MS);
+    return () => clearTimeout(handle);
+  }, [directoriesKey]);
+  const tooManyDirectories = directories.length > MAX_RESOLVE_PATHS;
+  const previewQuery = useQuery({
+    queryKey: ['folder-resolve-preview', eventId, debouncedKey, skipOuter, keepStructure],
+    queryFn: () => foldersService.resolve(eventId, {
+      paths: debouncedKey.split('\n'),
+      skipOuter,
+      keepStructure,
+      dryRun: true,
+    }),
+    enabled: withFolders && !tooManyDirectories && debouncedKey === directoriesKey,
+    placeholderData: keepPreviousData,
+    staleTime: 10_000,
+  });
+  const resolved = withFolders ? previewQuery.data : undefined;
+  // The upload would go past the folder or request limit: the real resolve
+  // would create what fits and then refuse, so say it now and hold the button.
+  const overLimit = keepStructure ? resolved?.limit ?? null : null;
+  // While a new preview loads the previous answer is still shown; it may be
+  // for another selection or toggle, so the button waits for the new one.
+  const limitUnknown = withFolders && keepStructure && previewQuery.isPlaceholderData;
+  const preview = useMemo(
+    () => (resolved ? buildUploadPreview(selectedFiles, resolved, { skipOuter, keepStructure }) : null),
+    [resolved, selectedFiles, skipOuter, keepStructure]
+  );
+  // Unknown until the folder list loads: assume the narrower role so an
+  // upload-only admin never sees "create folders" wording first.
+  const canManageFolders = resolved?.can_manage ?? folderTree?.can_manage ?? false;
+  const looseTargetLabel = looseFolderId
+    ? folderPathLabel(folders, looseFolderId) || t('upload.structure.galleryRoot', 'gallery root')
+    : t('upload.structure.galleryRoot', 'gallery root');
+
+  const uploadLabel = (() => {
+    const count = selectedFiles.length;
+    if (withFolders && preview && keepStructure && preview.folderCount > 0) {
+      const requesting = !canManageFolders && preview.requestedFolders > 0;
+      const folderText = t('upload.structure.folderCount', '{{count}} folders', {
+        count: requesting ? preview.requestedFolders : preview.folderCount,
+      });
+      return requesting
+        ? t('upload.structure.uploadRequesting', 'Upload {{count}} files · request {{folders}}', { count, folders: folderText })
+        : t('upload.structure.uploadIntoFolders', 'Upload {{count}} files into {{folders}}', { count, folders: folderText });
+    }
+    return t('common.upload') + ` ${count} ${t(count === 1 ? 'common.photo' : 'common.photos')}`;
+  })();
+
+  const handleUpload = async () => {
+    if (selectedFiles.length === 0 || isUploading || pendingWalks > 0 || resolving) return;
 
     // Validate file count
     if (selectedFiles.length > maxFilesPerUpload) {
@@ -175,18 +401,71 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
     // the value the migration seeds and is what worked in #208's resolution.
     const maxBatchSizeMb = Number(settings?.general_max_upload_batch_size_mb) || 95;
 
+    // Files from folders: resolve their directories for real (creates the
+    // folders, or opens folder requests for an upload-only role), then send
+    // one batch per placement. Loose files keep the old single batch.
+    // What this click sends. Files dropped while the folders below resolve
+    // are not part of it: they stay selected for the next upload instead of
+    // being cleared unsent (review of PR 1826, concern 14).
+    const sending = selectedFilesRef.current;
+    let batches: UploadBatch[] = [{
+      files: sending.map((picked) => picked.file),
+      placement: { categoryId: selectedCategoryId, folderId: looseFolderId },
+    }];
+    if (withFolders) {
+      if (tooManyDirectories) {
+        toast.error(t('upload.structure.tooManyFolders', 'This selection has more than {{limit}} folders. Upload it in parts.', { limit: MAX_RESOLVE_PATHS }));
+        return;
+      }
+      setResolving(true);
+      try {
+        const result = await foldersService.resolve(eventId, {
+          paths: directories,
+          skipOuter,
+          keepStructure,
+          dryRun: false,
+        });
+        batches = groupFilesByPlacement(sending, result.results, {
+          categoryId: selectedCategoryId,
+          looseFolderId,
+        }).groups;
+      } catch (error: unknown) {
+        toast.error(folderErrorMessage(error, t) || t('upload.structure.resolveFailed', 'The folders for this upload could not be prepared. Nothing was uploaded.'));
+        return;
+      } finally {
+        setResolving(false);
+      }
+    }
+
+    batches = batches.filter((batch) => batch.files.length > 0);
+    if (batches.length === 0) {
+      // Everything sat in hidden or skipped folders: say so instead of
+      // closing the dialog as if an upload had started.
+      toast.warning(t('upload.structure.nothingToUpload', 'None of the selected files can be uploaded: they are all in hidden or skipped folders.'));
+      return;
+    }
+
     startUpload({
       eventId,
-      files: selectedFiles,
-      categoryId: selectedCategoryId,
+      batches,
       replaceByName,
       maxFilesPerChunk: Math.max(1, Math.min(50, maxFilesPerUpload)), // Max 50 files per chunk
       maxBytesPerChunk: maxBatchSizeMb * 1024 * 1024,
     });
 
-    setSelectedFiles([]);
+    const sentSet = new Set(sending);
+    const leftOver = selectedFilesRef.current.filter((picked) => !sentSet.has(picked));
+    commitSelection(leftOver);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
+    }
+    if (folderInputRef.current) {
+      folderInputRef.current.value = '';
+    }
+    if (leftOver.length > 0) {
+      // Keep the dialog open with what arrived while preparing.
+      toast.info(t('upload.structure.keptForNext', 'Files added while the folders were prepared are still selected: {{count}}.', { count: leftOver.length }));
+      return;
     }
     onUploadStarted?.();
   };
@@ -202,12 +481,33 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
       {/* One session at a time: the bar tracks a single upload, so a second
           one waits until it is through. */}
       {isUploading && (
-        <div
-          role="status"
-          className="flex items-start gap-2 rounded-lg border border-line bg-neutral-50 dark:bg-neutral-800/60 p-3 text-sm text-body"
-        >
-          <Info className="w-4 h-4 mt-0.5 flex-shrink-0 text-neutral-500" />
-          <p>{t('upload.alreadyRunning', 'An upload is already running. It has to finish before the next one can start.')}</p>
+        <Notice tone="neutral">
+          {t('upload.alreadyRunning', 'An upload is already running. It has to finish before the next one can start.')}
+        </Notice>
+      )}
+
+      {/* Target folder (issue 1786): where files without a folder of their
+          own land. Shown once the event has folders. */}
+      {folderOptions.length > 0 && (
+        <div>
+          <label htmlFor="upload-target-folder" className="block text-sm font-medium text-body mb-2">
+            {withFolders
+              ? t('upload.structure.looseFilesGoTo', 'Loose files go to')
+              : t('upload.structure.uploadInto', 'Upload into')}
+          </label>
+          <select
+            id="upload-target-folder"
+            value={looseFolderId ?? ''}
+            onChange={(e) => setLooseFolderId(e.target.value ? Number(e.target.value) : null)}
+            className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-accent"
+          >
+            <option value="">{t('photos.folders.galleryRoot', 'Gallery root')}</option>
+            {folderOptions.map((option) => (
+              <option key={option.id} value={option.id}>
+                {'\u00a0\u00a0'.repeat(option.depth + 1)}{option.label}
+              </option>
+            ))}
+          </select>
         </div>
       )}
 
@@ -219,10 +519,10 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
         <select
           value={selectedCategoryId || ''}
           onChange={(e) => setSelectedCategoryId(e.target.value ? Number(e.target.value) : null)}
-          className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-primary-500"
+          className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-accent"
         >
           <option value="">{t('upload.noCategory')}</option>
-          {categories.map((category) => (
+          {filterCategories.map((category) => (
             <option key={category.id} value={category.id}>
               {category.name} {!category.is_global && t('upload.eventSpecific')}
             </option>
@@ -237,7 +537,7 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
           id="replace-by-name"
           checked={replaceByName}
           onChange={(e) => setReplaceByName(e.target.checked)}
-          className="rounded border-neutral-300 text-accent focus:ring-primary-500"
+          className="rounded border-line-strong text-accent focus:ring-accent"
         />
         <label htmlFor="replace-by-name" className="text-sm text-body">
           {t('upload.replaceByName', 'Replace existing photos with same name')}
@@ -263,7 +563,7 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
       >
         <Upload className="w-12 h-12 mx-auto text-faint mb-4" />
         <p className="text-body font-medium mb-1">
-          {t('upload.clickToUpload')}
+          {t('upload.clickToUploadOrDropFolder')}
         </p>
         <p className="text-sm text-muted">
           {t('upload.fileRequirements', { formats: formatsLabel, limit: maxFilesPerUpload, sizeLimit: maxFileSizeMb })}
@@ -276,7 +576,7 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
         <p
           className={clsx(
             "text-xs mt-2",
-            remainingSlots === 0 ? "text-red-600" : "text-muted"
+            remainingSlots === 0 ? "text-danger-text" : "text-muted"
           )}
         >
           {remainingSlots === 0
@@ -295,7 +595,58 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
           onChange={handleFileSelect}
           className="hidden"
         />
+        {/* Folder pick (issue 1786): webkitdirectory is set in an effect. */}
+        <input
+          ref={folderInputRef}
+          type="file"
+          multiple
+          onChange={handleFileSelect}
+          className="hidden"
+          data-testid="folder-input"
+        />
       </div>
+
+      <div className="flex flex-wrap justify-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => fileInputRef.current?.click()}
+          leftIcon={<FilePlus className="w-4 h-4" />}
+        >
+          {t('upload.addFiles', 'Add files')}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => folderInputRef.current?.click()}
+          leftIcon={<FolderUp className="w-4 h-4" />}
+        >
+          {t('upload.chooseFolder', 'Choose folder')}
+        </Button>
+      </div>
+
+      {withFolders && (
+        <UploadStructurePreview
+          preview={preview}
+          isLoading={previewQuery.isFetching}
+          isError={previewQuery.isError || tooManyDirectories}
+          keepStructure={keepStructure}
+          onKeepStructureChange={setKeepStructure}
+          singleRoot={resolved?.single_root ?? null}
+          skipOuter={skipOuter}
+          onSkipOuterChange={setSkipOuter}
+          canManage={canManageFolders}
+          maxDepth={resolved?.max_depth ?? folderTree?.max_depth ?? 3}
+          looseTargetLabel={looseTargetLabel}
+        />
+      )}
+      {withFolders && overLimit && !limitUnknown && (
+        <Notice tone="warning">
+          {overLimit.code === 'FOLDER_REQUEST_LIMIT_REACHED'
+            ? t('upload.structure.overRequestLimit', 'This upload would open {{adding}} folder requests, but the gallery already has {{current}} of at most {{limit}} open. Ask an administrator to approve or reject some first, or turn off “Keep folder structure”.', { count: overLimit.adding, adding: overLimit.adding, current: overLimit.current, limit: overLimit.limit })
+            : t('upload.structure.overFolderLimit', 'This upload would add {{adding}} folders, but the gallery already has {{current}} of at most {{limit}}. Turn off “Keep folder structure” or remove folders first.', { count: overLimit.adding, adding: overLimit.adding, current: overLimit.current, limit: overLimit.limit })}
+        </Notice>
+      )}
 
       {/* Selected Files */}
       {selectedFiles.length > 0 && (
@@ -304,17 +655,18 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
             {t('upload.selectedFiles')} ({selectedFiles.length})
           </p>
           <div className="max-h-48 overflow-y-auto space-y-2">
-            {selectedFiles.map((file, index) => (
+            {selectedFiles.map(({ file, dir }, index) => (
               <div
                 key={index}
                 className="flex items-center justify-between p-2 bg-subtle rounded-lg"
               >
                 <div className="flex items-center gap-3">
-                  <Image className="w-5 h-5 text-neutral-400" />
+                  <Image className="w-5 h-5 text-faint" />
                   <div>
                     <p className="text-sm font-medium text-body truncate max-w-xs">
                       {file.name}
                     </p>
+                    {dir && <p className="text-xs text-muted truncate max-w-xs">{dir}/</p>}
                     <p className="text-xs text-muted">
                       {formatFileSize(file.size)}
                     </p>
@@ -325,7 +677,7 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
                     e.stopPropagation();
                     removeFile(index);
                   }}
-                  className="p-1 hover:bg-neutral-200 dark:hover:bg-neutral-700 rounded"
+                  className="p-1 hover:bg-fill rounded"
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -340,10 +692,11 @@ export const PhotoUpload: React.FC<PhotoUploadProps> = ({ eventId, onUploadStart
         <Button
           variant="primary"
           onClick={handleUpload}
-          disabled={selectedFiles.length === 0 || isUploading}
+          disabled={selectedFiles.length === 0 || isUploading || pendingWalks > 0 || resolving || !!overLimit || limitUnknown}
+          isLoading={pendingWalks > 0 || resolving}
           leftIcon={<Upload className="w-4 h-4" />}
         >
-          {t('common.upload') + ` ${selectedFiles.length} ${t(selectedFiles.length === 1 ? 'common.photo' : 'common.photos')}`}
+          {uploadLabel}
         </Button>
       </div>
     </div>

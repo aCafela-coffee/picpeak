@@ -167,6 +167,49 @@ describe('admin thumbnail regeneration (#1129)', () => {
   });
 
   /**
+   * Issue 2113. A RAW photo's cached sizes are named through its processing
+   * attempt, so the row the sweep gets must carry it; and a tier that could
+   * not be deleted keeps being served, so the photo counts as failed.
+   */
+  describe('RAW tiers and failed tier deletes (issue 2113)', () => {
+    const completion = () => logInfo.mock.calls.map((c) => String(c[0])).find((m) => /regeneration complete/.test(m));
+    const raw = { source_origin: 'managed', filename: 'IMG_1.NEF', path: 'nas-wedding/IMG_1.NEF', processing_attempt_id: 'attempt-a1' };
+
+    it.each([
+      ['thumbnails', '/admin/thumbnails/regenerate', 'deleteThumbnailTiers'],
+      ['previews', '/admin/thumbnails/regenerate-previews', 'deletePreviewTiers'],
+    ])('hands the %s sweep the processing attempt, strictly', async (_kind, url, helper) => {
+      const eventId = await seedEvent();
+      await seedPhoto(eventId, raw);
+
+      await request(app).post(url).send({});
+      await drain();
+
+      const [photoArg, options] = imageProcessor[helper].mock.calls[0];
+      expect(photoArg).toMatchObject({ event_id: eventId, filename: 'IMG_1.NEF', processing_attempt_id: 'attempt-a1' });
+      expect(options).toEqual({ strict: true });
+      expect(completion()).toMatch(/1 success, 0 errors/);
+    });
+
+    it.each([
+      ['thumbnails', '/admin/thumbnails/regenerate', 'deleteThumbnailTiers', 'ensureThumbnail'],
+      ['previews', '/admin/thumbnails/regenerate-previews', 'deletePreviewTiers', 'ensurePreviewImage'],
+    ])('counts a photo whose %s tiers could not be deleted as failed', async (_kind, url, helper, ensure) => {
+      const eventId = await seedEvent();
+      await seedPhoto(eventId, raw);
+      await seedPhoto(eventId, { source_origin: 'managed', filename: 'fine.jpg' });
+      imageProcessor[helper].mockRejectedValueOnce(new Error('Could not delete 1 tier(s): AccessDenied'));
+
+      await request(app).post(url).send({});
+      await drain();
+
+      // The rebuild still runs for both; only the count changes.
+      expect(imageProcessor[ensure]).toHaveBeenCalledTimes(2);
+      expect(completion()).toMatch(/1 success, 1 errors/);
+    });
+  });
+
+  /**
    * Videos used to be filtered out of this query: ensureThumbnail had no video
    * branch, so each one only produced a Sharp error. It has one now (issue
    * 1414), and this button is what an admin with a galleryful of broken video
@@ -188,7 +231,7 @@ describe('admin thumbnail regeneration (#1129)', () => {
       const eventId = await seedEvent();
       await seedPhoto(eventId, {
         source_origin: 'managed', media_type: 'video', filename: 'clip.mp4',
-        thumbnail_path: 'thumbnails/thumb_clip.jpg',
+        thumbnail_path: 'thumbnails/thumb_clip.jpg', processing_status: 'complete',
       });
 
       const res = await request(app).post('/admin/thumbnails/regenerate').send({});
@@ -199,6 +242,9 @@ describe('admin thumbnail regeneration (#1129)', () => {
       const [photoArg, options] = imageProcessor.ensureThumbnail.mock.calls[0];
       expect(photoArg.filename).toBe('clip.mp4');
       expect(photoArg.thumbnail_path).toBe('thumbnails/thumb_clip.jpg');
+      // Without the status, ensureThumbnail could not keep the poster note in
+      // step with the rebuilt frame (issue 1430).
+      expect(photoArg.processing_status).toBe('complete');
       expect(options).toEqual({ boundVideoSource: false });
       expect(imageProcessor.deleteThumbnailTiers).not.toHaveBeenCalled();
     });
@@ -324,6 +370,155 @@ describe('admin thumbnail regeneration (#1129)', () => {
 
       // Losing the old object is untidy; the regeneration itself succeeded.
       expect(imageProcessor.ensureThumbnail).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * The preview endpoint nulls preview_path the same way, so the replaced
+   * preview is hidden from every cleanup once its key moves: a watch-folder
+   * photo's preview gets a per-photo name (PR 2038), an S3 source renders
+   * from a random temp name, an external row's name carries its version.
+   */
+  describe('superseded previews', () => {
+    it('removes the old preview when the key moved', async () => {
+      const eventId = await seedEvent();
+      const id = await seedPhoto(eventId, {
+        source_origin: 'managed', filename: 'IMG_1.jpg', source_filename: 'IMG_1.jpg',
+        preview_path: 'previews/preview_IMG_1.jpg',
+      });
+      // Publishes on the row, as a real generation does.
+      imageProcessor.ensurePreviewImage.mockImplementationOnce(async () => {
+        await db('photos').where({ id }).update({ preview_path: `previews/preview_p${id}_IMG_1.jpg` });
+        return `previews/preview_p${id}_IMG_1.jpg`;
+      });
+
+      await request(app).post('/admin/thumbnails/regenerate-previews').send({});
+      await drain();
+
+      expect(storage.delete).toHaveBeenCalledWith('previews/preview_IMG_1.jpg');
+    });
+
+    it.each([
+      ['a leading ./', './previews/preview_stable.jpg'],
+      ['an interior ./', 'previews/./preview_stable.jpg'],
+      ['a repeated leading ./', '././previews/preview_stable.jpg'],
+      ['a leading /./', '/./previews/preview_stable.jpg'],
+      ['a doubled separator before ./', 'previews//./preview_stable.jpg'],
+      ['a resolved ..', 'previews/x/../preview_stable.jpg'],
+    ])('keeps the old preview when the key is unchanged, spelled with %s', async (_name, stored) => {
+      const eventId = await seedEvent();
+      await seedPhoto(eventId, { source_origin: 'managed', preview_path: stored });
+      imageProcessor.ensurePreviewImage.mockResolvedValueOnce('previews/preview_stable.jpg');
+
+      await request(app).post('/admin/thumbnails/regenerate-previews').send({});
+      await drain();
+
+      expect(storage.delete).not.toHaveBeenCalled();
+    });
+
+    it('keeps the old preview when an older render published it on the row again', async () => {
+      const eventId = await seedEvent();
+      const id = await seedPhoto(eventId, { source_origin: 'managed', preview_path: 'previews/preview_K.jpg' });
+      // Our render publishes K.webp; another replica's older one then puts
+      // K.jpg back on the row before the cleanup looks.
+      imageProcessor.ensurePreviewImage.mockImplementationOnce(async () => {
+        await db('photos').where({ id }).update({ preview_path: 'previews/preview_K.jpg' });
+        return 'previews/preview_K.webp';
+      });
+
+      await request(app).post('/admin/thumbnails/regenerate-previews').send({});
+      await drain();
+
+      expect(storage.delete).not.toHaveBeenCalled();
+    });
+
+    it('deletes a preview two regenerated photos shared once, after both moved off it', async () => {
+      const eventId = await seedEvent();
+      await seedPhoto(eventId, { source_origin: 'managed', preview_path: 'previews/preview_IMG_1.jpg' });
+      await seedPhoto(eventId, { source_origin: 'managed', preview_path: 'previews/preview_IMG_1.jpg' });
+      // Publishes on the row, as a real generation does.
+      const publish = async (photo) => {
+        const key = `previews/preview_p${photo.id}_IMG_1.jpg`;
+        await db('photos').where({ id: photo.id }).update({ preview_path: key });
+        return key;
+      };
+      imageProcessor.ensurePreviewImage.mockImplementationOnce(publish).mockImplementationOnce(publish);
+
+      await request(app).post('/admin/thumbnails/regenerate-previews').send({});
+      await drain();
+
+      // Both moved off it during the run: deleted once, after the loop.
+      expect(storage.delete).toHaveBeenCalledTimes(1);
+      expect(storage.delete).toHaveBeenCalledWith('previews/preview_IMG_1.jpg');
+    });
+
+    it.each([
+      ['backslashes', '.\\previews\\preview_IMG_1.jpg'],
+      ['a repeated leading ./', '././previews/preview_IMG_1.jpg'],
+      ['a leading /./', '/./previews/preview_IMG_1.jpg'],
+    ])('keeps the old preview while another gallery stores it with %s', async (_name, stored) => {
+      const eventId = await seedEvent();
+      const id = await seedPhoto(eventId, { source_origin: 'managed', preview_path: 'previews/preview_IMG_1.jpg' });
+      const [other] = await db('events').insert({
+        slug: 'other', event_type: 'wedding', event_name: 'other', event_date: '2026-01-01',
+        host_email: 'h@example.com', admin_email: 'a@example.com', password_hash: 'x',
+        share_link: 'other-share', expires_at: new Date().toISOString(),
+      }).returning('id');
+      await seedPhoto(typeof other === 'object' ? other.id : other, {
+        source_origin: 'managed', preview_path: stored,
+      });
+      imageProcessor.ensurePreviewImage.mockImplementationOnce(async () => {
+        await db('photos').where({ id }).update({ preview_path: 'previews/preview_p1_IMG_1.jpg' });
+        return 'previews/preview_p1_IMG_1.jpg';
+      });
+
+      await request(app).post('/admin/thumbnails/regenerate-previews').send({ eventId });
+      await drain();
+
+      // Both backends fold the two spellings to one object.
+      expect(imageProcessor.ensurePreviewImage).toHaveBeenCalledTimes(1);
+      expect(storage.delete).not.toHaveBeenCalled();
+    });
+
+    it('checks the references once for the whole run, not once per moved preview', async () => {
+      const eventId = await seedEvent();
+      for (let i = 1; i <= 3; i++) {
+        await seedPhoto(eventId, { source_origin: 'managed', preview_path: `previews/preview_OLD${i}.jpg` });
+      }
+      // Kept: another photo, not regenerated here, still points at OLD3.
+      await seedPhoto(eventId, { source_origin: 'managed', media_type: 'video', preview_path: 'previews/preview_OLD3.jpg' });
+      imageProcessor.ensurePreviewImage.mockImplementation(async (photo) => {
+        const key = `previews/preview_NEW${photo.id}.jpg`;
+        await db('photos').where({ id: photo.id }).update({ preview_path: key });
+        return key;
+      });
+      const lookups = [];
+      const onQuery = (q) => { if (/preview_path. is not null/i.test(q.sql)) lookups.push(q.sql); };
+      db.on('query', onQuery);
+      try {
+        await request(app).post('/admin/thumbnails/regenerate-previews').send({});
+        await drain();
+      } finally {
+        db.removeListener('query', onQuery);
+        imageProcessor.ensurePreviewImage.mockReset();
+        imageProcessor.ensurePreviewImage.mockResolvedValue('previews/p.jpg');
+      }
+
+      expect(storage.delete.mock.calls.map((c) => c[0]).sort())
+        .toEqual(['previews/preview_OLD1.jpg', 'previews/preview_OLD2.jpg']);
+      // One paged pass for all three moves: a page, then the empty page.
+      expect(lookups).toHaveLength(2);
+    });
+
+    it('keeps the old preview when nothing was generated', async () => {
+      const eventId = await seedEvent();
+      await seedPhoto(eventId, { source_origin: 'managed', preview_path: 'previews/preview_old.jpg' });
+      imageProcessor.ensurePreviewImage.mockResolvedValueOnce(null);
+
+      await request(app).post('/admin/thumbnails/regenerate-previews').send({});
+      await drain();
+
+      expect(storage.delete).not.toHaveBeenCalled();
     });
   });
 

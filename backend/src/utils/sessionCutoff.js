@@ -57,8 +57,9 @@ async function getSessionsValidAfter() {
 }
 
 /** Persist a new cutoff (unix seconds) and refresh the in-process cache. */
-async function setSessionsValidAfter(unixSeconds) {
-  await db('app_settings')
+async function setSessionsValidAfter(unixSeconds, { executor = db, refreshCache = true } = {}) {
+  if (!Number.isSafeInteger(unixSeconds) || unixSeconds < 0) throw new Error('Invalid session cutoff');
+  await executor('app_settings')
     .insert({
       setting_key: CUTOFF_KEY,
       setting_value: JSON.stringify(unixSeconds),
@@ -67,7 +68,10 @@ async function setSessionsValidAfter(unixSeconds) {
     })
     .onConflict('setting_key')
     .merge({ setting_value: JSON.stringify(unixSeconds), setting_type: 'number', updated_at: new Date() });
-  cache = { value: unixSeconds, expiry: Date.now() + CACHE_MS };
+  // A maintenance restore records this on the SAME transaction as its
+  // identity rows and commit marker. Never publish an uncommitted cutoff in
+  // a process cache; the coordinated restart clears every replica's cache.
+  if (refreshCache) cache = { value: unixSeconds, expiry: Date.now() + CACHE_MS };
 }
 
 /**
@@ -89,12 +93,51 @@ async function isTokenBeforeCutoff(decoded) {
 }
 
 /** Test-only: drop the in-process cache. */
+/**
+ * Session cutoff for identity tables that were just replaced (restore,
+ * rollback, portable import). isTokenBeforeCutoff() rejects `iat < cutoff`
+ * and a JWT's iat is a whole second, so a cutoff of "now" would let a token
+ * minted earlier in the same second survive. The next second puts everything
+ * issued up to and including this one out.
+ */
+function nextSessionCutoff() {
+  return Math.floor(Date.now() / 1000) + 1;
+}
+
+/**
+ * Resolve once the wall clock has reached the cutoff. Until then a fresh
+ * login still gets `iat = cutoff - 1` and is rejected like a pre-restore
+ * token, so the operation that stamped the cutoff must not report success
+ * earlier: sessions created after a finished restore are valid. At most ~1 s.
+ */
+async function waitPastSessionCutoff(cutoff) {
+  for (;;) {
+    const remaining = cutoff * 1000 - Date.now();
+    if (remaining <= 0) return;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(remaining, 1000)));
+  }
+}
+
+/** Stamp the next-second cutoff and wait until it has passed. */
+async function invalidateSessionsIssuedSoFar() {
+  const cutoff = nextSessionCutoff();
+  await setSessionsValidAfter(cutoff);
+  await waitPastSessionCutoff(cutoff);
+  return cutoff;
+}
+
 function _resetCache() { cache = null; }
 
 module.exports = {
   CUTOFF_KEY,
+  // Uncached and throwing: for the rare check that must not trust a cutoff
+  // another replica may have replaced in the last CACHE_MS.
+  readSessionsValidAfter: readCutoffFromDb,
   getSessionsValidAfter,
   setSessionsValidAfter,
   isTokenBeforeCutoff,
+  nextSessionCutoff,
+  waitPastSessionCutoff,
+  invalidateSessionsIssuedSoFar,
   _resetCache,
 };

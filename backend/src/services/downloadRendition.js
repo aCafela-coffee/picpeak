@@ -16,14 +16,29 @@
 
 const { resolvePhotoStorageKey, resolvePhotoFilePath } = require('./photoResolver');
 const { withLocalCopy, resizeToBox, ensurePreviewImage } = require('./imageProcessor');
+const { isRawFilename } = require('../utils/rawFormats');
 const watermarkService = require('./watermarkService');
 const { getStorage } = require('./storage');
 const fs = require('fs');
+const { isPresentationRenditionKey } = require('./galleryAssetPolicy');
 
 /** Videos have no resize path — they always ship as stored. */
 function isVideo(photo) {
   return photo.media_type === 'video'
     || (photo.mime_type && String(photo.mime_type).startsWith('video/'));
+}
+
+/**
+ * Neither does camera RAW. A resolution choice is meaningless for a file the
+ * client is downloading precisely to edit at full size, and re-encoding one to
+ * JPEG under its own name would produce something no converter can open.
+ *
+ * That is already the behaviour, but by accident: sharp throws on the RAW and
+ * resizeToBox hands back what it was given, after the whole 55 MB original has
+ * been read into a Buffer for nothing.
+ */
+function shipsAsStored(photo) {
+  return isVideo(photo) || isRawFilename(photo.original_filename || photo.filename);
 }
 
 /**
@@ -34,7 +49,7 @@ function isVideo(photo) {
  * @returns {Promise<Buffer|null>}     null = serve the stored bytes unchanged
  */
 async function renderPhotoForDownload(event, photo, box, watermarkSettings) {
-  const wantsResize = !!box && !isVideo(photo);
+  const wantsResize = !!box && !shipsAsStored(photo);
   const wantsWatermark = !!(watermarkSettings && watermarkSettings.enabled);
   if (!wantsResize && !wantsWatermark) return null;
 
@@ -49,7 +64,9 @@ async function renderPhotoForDownload(event, photo, box, watermarkSettings) {
       // 1649); the gallery-view rendition the same function makes does not.
       return watermarkService.applyWatermark(localPath, watermarkSettings, { keepMetadata: true });
     }
-    const buffer = await resizeToBox(await fs.promises.readFile(localPath), box);
+    const buffer = await resizeToBox(await fs.promises.readFile(localPath), box, {
+      sourceName: photo.original_filename || photo.filename,
+    });
     return wantsWatermark
       ? watermarkService.applyWatermark(buffer, watermarkSettings, { keepMetadata: true })
       : buffer;
@@ -73,10 +90,10 @@ async function renderPhotoForDownload(event, photo, box, watermarkSettings) {
 async function renderPreviewForDownload(photo, watermarkSettings) {
   if (isVideo(photo)) return null;
   const previewKey = await ensurePreviewImage(photo);
-  if (!previewKey) return null;
+  if (!isPresentationRenditionKey(previewKey, 'preview')) return null;
   const wantsWatermark = !!(watermarkSettings && watermarkSettings.enabled);
   const buffer = await withLocalCopy(previewKey, (localPath) => (wantsWatermark
-    ? watermarkService.applyWatermark(localPath, watermarkSettings)
+    ? watermarkService.applyWatermark(localPath, watermarkSettings, { failClosed: true })
     : fs.promises.readFile(localPath)));
   const webp = previewKey.endsWith('.webp');
   return { buffer, contentType: webp ? 'image/webp' : 'image/jpeg', extension: webp ? '.webp' : '.jpg' };
@@ -98,9 +115,8 @@ async function resolveWatermarkSettings(event) {
   const shouldApply = (settings && settings.enabled) || eventEnabled;
   if (!shouldApply) return null;
   return {
-    ...settings,
+    ...watermarkService.forEvent(settings, event),
     enabled: true,
-    text: event.watermark_text || settings?.text || 'Protected',
   };
 }
 
@@ -110,5 +126,6 @@ module.exports = {
   previewDownloadName,
   resolveWatermarkSettings,
   isVideo,
+  shipsAsStored,
   getStorage,
 };

@@ -6,6 +6,7 @@ import { toast } from 'react-toastify';
 import { photosService, ExportOptions, FeedbackFilters } from '../../services/photos.service';
 import { ExportPreviewModal } from './ExportPreviewModal';
 import { useMutationWithToast, useModal } from '../../hooks';
+import { useEscapeClose } from '../common/useEscapeClose';
 
 // TXT + CSV render through the preview modal (with copy-to-clipboard and a
 // fallback download button). XMP is a ZIP archive — no textarea preview makes
@@ -55,6 +56,7 @@ export const PhotoExportMenu: React.FC<PhotoExportMenuProps> = ({
 }) => {
   const { t } = useTranslation();
   const menuModal = useModal();
+  useEscapeClose(menuModal.isOpen, menuModal.close);
   const [preview, setPreview] = useState<{
     format: 'txt' | 'csv';
     content: string;
@@ -123,6 +125,7 @@ export const PhotoExportMenu: React.FC<PhotoExportMenuProps> = ({
         // #1044 — lets "export only the greens" round-trip to Lightroom.
         color_labels: filters.colorLabels?.length ? filters.colorLabels : undefined,
         my_color_labels: filters.myColorLabels?.length ? filters.myColorLabels : undefined,
+        decisions: filters.decisions?.length ? filters.decisions : undefined,
         category_id: filters.categoryId,
         logic: filters.logic,
         sort: filters.sort,
@@ -144,7 +147,8 @@ export const PhotoExportMenu: React.FC<PhotoExportMenuProps> = ({
     filters.hasFavorites ||
     filters.hasComments ||
     (filters.colorLabels?.length || 0) > 0 ||
-    (filters.myColorLabels?.length || 0) > 0
+    (filters.myColorLabels?.length || 0) > 0 ||
+    (filters.decisions?.length || 0) > 0
   );
 
   const isDisabled = disabled || (!hasSelection && !hasFilters);
@@ -160,7 +164,7 @@ export const PhotoExportMenu: React.FC<PhotoExportMenuProps> = ({
           inline-flex items-center gap-2 px-4 py-2 rounded-lg border font-medium text-sm
           transition-colors
           ${isDisabled
-            ? 'bg-subtle text-neutral-400 border-line cursor-not-allowed'
+            ? 'bg-subtle text-faint border-line cursor-not-allowed'
             : 'bg-panel text-body border-line-strong hover:bg-hover'
           }
         `}

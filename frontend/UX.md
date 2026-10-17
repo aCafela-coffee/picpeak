@@ -21,10 +21,14 @@ same order.
 
 | Part | Contains | Example |
 |---|---|---|
-| Header | title, status badges, **one** primary action, a `⋯` menu for the rest, external "View" link | `EventDetailsHeader.tsx` |
-| Banners | state that blocks or warns: draft, expiring, archived | draft banner with Publish |
+| Header | title with a pen to rename it, status badges; action row in the order `⋯` menu (its dropdown anchored right), external "View" link, then the primary action of the moment (Publish on a draft, Send gallery email, Full gallery is ready). Usually one; a draft awaiting its full gallery can show two, Publish and Full gallery is ready. Below `sm` the `⋯` menu moves onto the title row, pinned right, so View and the primary action fit side by side | `EventDetailsHeader.tsx` |
+| Banners | state that blocks or warns: expiring, archived. A banner explains; the action it calls for lives in the header when the header has one. A state the header already shows as a pill gets no banner: the pill's tooltip explains it (a draft) | expiry banner with +7 days |
 | Tabs | `Overview` first, `Settings` last | `EventTabs.tsx` |
 | Tab body | see below | |
+
+A feature that is not plain stable shows its state next to the page title
+(New, Beta, Experimental), from the one feature-state list (STYLING.md ›
+Feature state): `SectionPageHeader feature=…`. Never in the sidebar.
 
 There is **no back link** on list and detail pages: they navigate by the
 sidebar, where the list is on screen (#1730). Only an **editor** — a page
@@ -39,7 +43,8 @@ relying on browser-back.
   and kept in step with back/forward. A copied URL opens the same view.
 - Map retired tab names to their new home instead of breaking old links
   (`?tab=categories` opens Photos with the categories panel).
-- Put secondary actions (rename, duplicate, invoice, archive) in the `⋯` menu.
+- Put secondary actions (duplicate, invoice, archive) in the `⋯` menu.
+  Renaming is a pen next to the title, where the thing it changes is.
   Only actions the role can use are listed; an empty menu is not rendered.
 
 **Don't**
@@ -53,9 +58,37 @@ relying on browser-back.
 
 - **Overview** answers "what is this and what do I do now?": links, status,
   counts, the next actions. Nothing on it needs saving.
-- **Settings** holds everything configurable, in sections listed on the left
-  (`event-details/settings/EventSettingsTab.tsx`). Order sections from most to least used; a
-  destructive section ("Danger zone") is always last and red.
+- **Settings** holds everything configurable, as a **split view**
+  (`event-details/settings/EventSettingsTab.tsx`, issue 1765):
+  - **Left, the overview:** every section as a row — icon, title, and one
+    line of what it is set to now ("Password on · expires 31 Dec 2026",
+    "External folder · watching"). Rows sit in small groups of two or three
+    under a heading (Basics · Access & downloads · Guests · Photos &
+    automation), so the list stays readable as it grows. A **Default** tag
+    marks a section that only follows the global setting.
+  - **Right, the open section,** edited in place: a header with its title and
+    one line on what it covers, then the fields. No window, no second Save —
+    the page draft and save bar stay as in § 2. Its card's top lines up with
+    the first row of the list, not with the group heading above it.
+  - **Side by side, the two halves scroll on their own,** under the tabs'
+    line: the page header, the tabs and the save bar stay where they are
+    (`useFillViewport` in `components/admin/fillViewport.ts`). On a display
+    tall enough for both, nothing scrolls. Below `lg` the page scrolls as a
+    whole, as everywhere else.
+  - Order sections from most to least used. The destructive section ("Danger
+    zone") is one full-width red row **after** the groups: it holds actions,
+    not settings.
+  - **Below `lg`** the overview is the page; tapping a row opens that section
+    full-screen with a back arrow. Opening it adds a history entry, so the
+    browser's Back returns to the overview as the arrow does, and focus goes
+    back to the row. The open section is in the URL (`?section=`): a link to
+    any section, General included, opens it; one the flags hide falls back to
+    the overview.
+  - Side by side, switching sections replaces the URL instead of adding to
+    history, like the tabs. Nothing opened means General there.
+  - This is not a second menu next to the sidebar (#1689): the rows describe
+    **this record's** state, they are not places in the app. Global Settings,
+    CRM and Accounting keep the sidebar.
 - Overview may *summarise* a setting and link to its section ("Photo source:
   External folder · watched" → Settings › Photo source).
 
@@ -86,8 +119,10 @@ migrate when they are touched — no big-bang rewrite.
 - Keep the draft at **page level**, so switching tabs never drops it, and
   register `useUnsavedChanges` there too (`EventDetailsPage.tsx`,
   `EventDetailsLoaded`).
-- Mark dirty sections (amber dot in the section list and on the Settings
-  tab) and name them in the save bar.
+- Mark dirty sections (amber dot and "not saved yet" on the section's row,
+  a dot on the Settings tab) and name them in the save bar. The open section
+  offers **Undo changes in this section**, which puts back only that
+  section's fields (`resetSection`); Discard in the bar drops everything.
 - Send **only what changed**. Build the request from the draft and from the
   server state the same way and send the difference (`settings/draft.ts`,
   `eventUpdatePayload`). Saving an untouched form writes nothing.
@@ -138,8 +173,8 @@ Every data view has five states. Design all of them.
 | State | Do | Reference |
 |---|---|---|
 | Loading | `Skeleton*` for lists/grids, `Loading` for a page; keep the layout's shape | `EventDetailsPage` |
-| Empty | say what is missing and offer the next step ("No photos yet — Upload") | |
-| Error | say it failed and offer **Retry**. Never fall through to the empty state — "couldn't load" and "there is nothing" are different messages | `PhotosTab.tsx` |
+| Empty | `EmptyState`: say what is missing and offer the next step ("No photos yet — Upload") | |
+| Error | `ErrorState`: say it failed and offer **Retry**. Never fall through to the empty state — "couldn't load" and "there is nothing" are different messages | `PhotosTab.tsx` |
 | Read-only | see §3 | `EventSettingsTab` |
 | Archived / expired | banner + read-only; actions that still make sense stay (restore, extend) | |
 
@@ -158,6 +193,8 @@ Every data view has five states. Design all of them.
 **Do**
 - Confirm with `useConfirm({ message, variant: 'danger' })`, and say what is
   lost in the message ("Delete "X" and all its photos? This cannot be undone.").
+  Its confirm button is `Button variant="danger"`; use the same variant for
+  a destructive button on a page.
 - Put delete and archive in the Danger zone (Settings) and/or the `⋯` menu,
   never next to the primary action.
 - Name the button after the action ("Delete gallery"), not "OK".
@@ -227,10 +264,32 @@ See STYLING.md › Layout and spacing for the rules. The checks:
 
 - German at 390 px and at desktop width: nothing overflows, every row wraps.
 - Dark mode via tokens: toggle it and look at every new surface.
-- Keyboard: every control reachable with Tab, menus close on Escape and on
-  outside click, icon-only buttons have `aria-label`.
+- Keyboard: every control reachable with Tab, menus and popups close on
+  Escape (popups without saving, below) and on outside click, icon-only
+  buttons have `aria-label`.
 - The admin sidebar is a drawer below `lg`; don't remove a control on the
   assumption that "it's in the sidebar".
+
+### Popups and dialogs close with Escape
+
+Every popup — dialog, confirm, prompt, sheet, the gallery's own dialogs —
+closes with **Escape, without saving**. Escape is Cancel: whatever was typed
+into the dialog is dropped and nothing is sent. Use the primitives, which do
+this already: `Modal`, `useConfirm`, `usePrompt` in the admin and portal,
+`useGalleryDialog` for the gallery's themed dialogs.
+
+- Escape closes only the **top** dialog. A confirm opened over a dialog
+  closes the confirm and leaves the dialog open (they share one stack,
+  `pushDialogLayer`).
+- **While a request runs**, closing waits: Escape, the backdrop and the X do
+  nothing until the save or upload has answered, so a half-sent change is
+  never abandoned behind the user's back. Say so in the dialog (a busy
+  button is enough).
+- **A dialog that must be answered** — the mandatory password change — has
+  no Escape, no X and no backdrop close. That is the only exception; it
+  needs a reason in the code and in the PR body.
+- Never make Escape save, and never put the only way out of a dialog
+  behind a button that saves.
 
 ## 9. Removing or moving things
 
@@ -255,9 +314,11 @@ Run before opening a PR that touches the admin UI.
 6. Destructive actions: `useConfirm` with `danger`, consequence in the text?
 7. Any removed control — where did its function go? Old URLs redirected?
 8. German at 390 px: does every row wrap? Dark mode: anything invisible?
+   Does every new popup close with Escape without saving (UX.md § 8)?
 9. New strings in `en.json` and `de.json`, inline fallbacks matching?
-10. `npm run lint` (UI tokens), `npm run build`, and before/after screenshots
-    on the `pr-assets` branch (CONTRIBUTING.md).
+10. `npm run lint` (UI tokens and palette colours: no raw `text-red-600`, no
+    hex in a style), `npm run build`, and before/after screenshots on the
+    `pr-assets` branch (CONTRIBUTING.md) in light and dark.
 11. **E2E selectors:** run the specs in `tests/e2e` that cover the page you
     changed. In specs, prefer `getByRole` and test ids over visible text —
     copy changes are what keep breaking the scheduled suite.

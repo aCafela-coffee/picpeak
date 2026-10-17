@@ -4,6 +4,7 @@ import { Button, Card, Input } from '../../../components/common';
 import { useTranslation } from 'react-i18next';
 import { SettingsSaveBar } from '../../../components/admin/SettingsSaveBar';
 import type { SeoSettings } from '../hooks/useSettingsState';
+import { isImeComposing } from '../../../utils/imeComposition';
 
 interface SEOTabProps {
   seoSettings: SeoSettings;
@@ -72,14 +73,17 @@ export const SEOTab: React.FC<SEOTabProps> = ({
 
     lines.push('# Protected paths');
     lines.push('User-agent: *');
-    lines.push('Disallow: /admin');
     lines.push('Disallow: /api');
     lines.push('');
 
     if (!seoSettings.allow_indexing) {
-      lines.push('# Indexing disabled');
+      lines.push('# Indexing disabled. Pages stay crawlable on purpose: each answers');
+      lines.push('# "X-Robots-Tag: noindex", which only takes effect if a crawler may fetch it.');
       lines.push('User-agent: *');
-      lines.push('Disallow: /');
+      lines.push('Disallow: /photos');
+      lines.push('Disallow: /thumbnails');
+      lines.push('Disallow: /uploads');
+      lines.push('Disallow: /og');
       lines.push('');
     }
 
@@ -124,7 +128,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
       {/* Search Engine Indexing */}
       <Card padding="md">
         <div className="flex items-center gap-2 mb-4">
-          <Globe className="w-5 h-5 text-primary-600" />
+          <Globe className="w-5 h-5 text-accent" />
           <h2 className="text-lg font-semibold text-heading">{t('settings.seo.indexingTitle', 'Search Engine Indexing')}</h2>
         </div>
 
@@ -134,11 +138,11 @@ export const SEOTab: React.FC<SEOTabProps> = ({
               type="checkbox"
               checked={seoSettings.allow_indexing}
               onChange={(e) => setSeoSettings(prev => ({ ...prev, allow_indexing: e.target.checked }))}
-              className="w-4 h-4 mt-0.5 text-primary-600 rounded focus:ring-primary-500"
+              className="w-4 h-4 mt-0.5 text-accent rounded focus:ring-accent"
             />
             <div>
               <span className="text-sm font-medium text-body">{t('settings.seo.allowIndexing', 'Allow search engine indexing')}</span>
-              <p className="text-sm text-muted mt-0.5">{t('settings.seo.allowIndexingHelp', 'When disabled, all crawlers are blocked via robots.txt. Recommended off for private photo platforms.')}</p>
+              <p className="text-sm text-muted mt-0.5">{t('settings.seo.allowIndexingHelp', 'When disabled, no page can appear in search results. When enabled, only the public landing page can. Galleries, share links and sign-in pages are never indexed.')}</p>
             </div>
           </label>
 
@@ -160,7 +164,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
       {/* AI & Bot Blocking */}
       <Card padding="md">
         <div className="flex items-center gap-2 mb-4">
-          <Bot className="w-5 h-5 text-primary-600" />
+          <Bot className="w-5 h-5 text-accent" />
           <h2 className="text-lg font-semibold text-heading">{t('settings.seo.aiBlockingTitle', 'AI & Bot Blocking')}</h2>
         </div>
 
@@ -170,7 +174,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
               type="checkbox"
               checked={seoSettings.block_ai_crawlers}
               onChange={(e) => setSeoSettings(prev => ({ ...prev, block_ai_crawlers: e.target.checked }))}
-              className="w-4 h-4 mt-0.5 text-primary-600 rounded focus:ring-primary-500"
+              className="w-4 h-4 mt-0.5 text-accent rounded focus:ring-accent"
             />
             <div>
               <span className="text-sm font-medium text-body">{t('settings.seo.blockAiCrawlers', 'Block AI/LLM crawlers')}</span>
@@ -189,7 +193,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
                     {agent}
                     <button
                       onClick={() => handleRemoveAgent(agent)}
-                      className="text-neutral-400 hover:text-red-500 transition-colors"
+                      className="text-faint hover:text-danger transition-colors"
                     >
                       <X className="w-3.5 h-3.5" />
                     </button>
@@ -202,7 +206,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
                   value={newAgent}
                   onChange={(e) => setNewAgent(e.target.value)}
                   placeholder={t('settings.seo.addAgentPlaceholder', 'Enter agent name...')}
-                  onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), handleAddAgent())}
+                  onKeyDown={(e) => e.key === 'Enter' && !isImeComposing(e) && (e.preventDefault(), handleAddAgent())}
                 />
                 <Button variant="outline" size="sm" onClick={handleAddAgent}>
                   <Plus className="w-4 h-4" />
@@ -216,7 +220,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
               type="checkbox"
               checked={seoSettings.block_social_bots}
               onChange={(e) => setSeoSettings(prev => ({ ...prev, block_social_bots: e.target.checked }))}
-              className="w-4 h-4 mt-0.5 text-primary-600 rounded focus:ring-primary-500"
+              className="w-4 h-4 mt-0.5 text-accent rounded focus:ring-accent"
             />
             <div>
               <span className="text-sm font-medium text-body">{t('settings.seo.blockSocialBots', 'Block social media preview bots')}</span>
@@ -229,7 +233,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
       {/* Meta Tags & Custom Rules */}
       <Card padding="md">
         <div className="flex items-center gap-2 mb-4">
-          <Shield className="w-5 h-5 text-primary-600" />
+          <Shield className="w-5 h-5 text-accent" />
           <h2 className="text-lg font-semibold text-heading">{t('settings.seo.metaTagsTitle', 'Meta Tags & Custom Rules')}</h2>
         </div>
 
@@ -240,7 +244,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
                 type="checkbox"
                 checked={seoSettings.meta_noindex}
                 onChange={(e) => setSeoSettings(prev => ({ ...prev, meta_noindex: e.target.checked }))}
-                className="w-4 h-4 mt-0.5 text-primary-600 rounded focus:ring-primary-500"
+                className="w-4 h-4 mt-0.5 text-accent rounded focus:ring-accent"
               />
               <div>
                 <span className="text-sm font-medium text-body">{t('settings.seo.metaNoindex', 'Add noindex meta tag')}</span>
@@ -253,7 +257,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
                 type="checkbox"
                 checked={seoSettings.meta_nofollow}
                 onChange={(e) => setSeoSettings(prev => ({ ...prev, meta_nofollow: e.target.checked }))}
-                className="w-4 h-4 mt-0.5 text-primary-600 rounded focus:ring-primary-500"
+                className="w-4 h-4 mt-0.5 text-accent rounded focus:ring-accent"
               />
               <div>
                 <span className="text-sm font-medium text-body">{t('settings.seo.metaNofollow', 'Add nofollow meta tag')}</span>
@@ -266,7 +270,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
                 type="checkbox"
                 checked={seoSettings.meta_noai}
                 onChange={(e) => setSeoSettings(prev => ({ ...prev, meta_noai: e.target.checked }))}
-                className="w-4 h-4 mt-0.5 text-primary-600 rounded focus:ring-primary-500"
+                className="w-4 h-4 mt-0.5 text-accent rounded focus:ring-accent"
               />
               <div>
                 <span className="text-sm font-medium text-body">{t('settings.seo.metaNoai', 'Add noai/noimageai meta tag')}</span>
@@ -288,7 +292,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
                     </code>
                     <button
                       onClick={() => handleRemoveCustomRule(index)}
-                      className="text-neutral-400 hover:text-red-500 transition-colors"
+                      className="text-faint hover:text-danger transition-colors"
                     >
                       <X className="w-4 h-4" />
                     </button>
@@ -320,7 +324,7 @@ export const SEOTab: React.FC<SEOTabProps> = ({
           <div className="border-t border-line pt-4">
             <button
               onClick={() => setShowPreview(!showPreview)}
-              className="flex items-center gap-2 text-sm font-medium text-primary-600 hover:text-primary-700 transition-colors"
+              className="flex items-center gap-2 text-sm font-medium text-accent transition-colors"
             >
               <Eye className="w-4 h-4" />
               {showPreview

@@ -7,6 +7,7 @@ import type { ThemeConfig } from '../../../../types/theme.types';
 import { api } from '../../../../config/api';
 import { eventsService } from '../../../../services/events.service';
 import { feedbackService, type FeedbackSettings } from '../../../../services/feedback.service';
+import { archiveInProgressError } from '../../../../utils/archiveErrors';
 import {
   INHERIT,
   DraftValidationError,
@@ -15,6 +16,7 @@ import {
   eventFieldsFromEvent,
   eventUpdatePayload,
   rebaseDraft,
+  resetSection,
   sameValue,
   slideshowFromEvent,
   slideshowPayload,
@@ -112,6 +114,10 @@ export function useEventSettingsDraft({
   const [isSaving, setIsSaving] = useState(false);
 
   const discard = useCallback(() => setDraft(baseRef.current), []);
+  const discardSection = useCallback(
+    (section: SettingsSectionKey) => setDraft((d) => resetSection(d, baseRef.current, section)),
+    [],
+  );
 
   const setEvent = useCallback(
     (update: (prev: EventSettingsDraft['event']) => EventSettingsDraft['event']) =>
@@ -142,7 +148,8 @@ export function useEventSettingsDraft({
         const e = error as { response?: { data?: { error?: string; errors?: Array<{ msg: string }> } } };
         failed.push({
           slice,
-          message: e.response?.data?.errors?.[0]?.msg || e.response?.data?.error || t('toast.saveError', 'Failed to save changes'),
+          message: archiveInProgressError(error, t)
+            ?? (e.response?.data?.errors?.[0]?.msg || e.response?.data?.error || t('toast.saveError', 'Failed to save changes')),
         });
       }
     };
@@ -180,6 +187,8 @@ export function useEventSettingsDraft({
       queryClient.invalidateQueries({ queryKey: ['admin-event', String(event.id)] }),
       queryClient.invalidateQueries({ queryKey: ['admin-event-feedback-settings', String(event.id)] }),
       queryClient.invalidateQueries({ queryKey: ['event-download-resolutions', event.id] }),
+      // Saving "partial" brings up the status card and "Full gallery is ready".
+      queryClient.invalidateQueries({ queryKey: ['event-delivery', event.id] }),
       queryClient.invalidateQueries({ queryKey: ['admin-events'] }),
     ]);
     setIsSaving(false);
@@ -202,6 +211,7 @@ export function useEventSettingsDraft({
     isSaving,
     save,
     discard,
+    discardSection,
     downloadsData,
   };
 }

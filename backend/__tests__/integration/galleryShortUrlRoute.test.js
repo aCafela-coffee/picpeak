@@ -57,7 +57,7 @@ beforeAll(async () => {
       }
 
       service.recordHit(row.id).catch(() => {});
-      return res.redirect(302, row.target_path);
+      return res.redirect(302, service.redirectTarget(await service.resolveTargetPath(row), req.originalUrl));
     } catch (err) {
       return res.status(500).type('text/plain').send(err.message);
     }
@@ -107,6 +107,29 @@ describe('GET /s/:shortSlug — browser (302 redirect)', () => {
     expect(res.headers.location).toMatch(/^\/gallery\//);
   });
 
+  // Issue 1733: a link to one photo goes through the shortener too.
+  it('carries the query string through to the target, re-encoded', async () => {
+    const { shortUrl } = await seedEventAndShortUrl({
+      slug: 'query-passthrough', shortSlug: 'with-query',
+    });
+    const res = await request(app)
+      .get('/s/with-query?photo=42&folder=ceremony-1&x=a%20b%3Cc')
+      .set('User-Agent', BROWSER_UA);
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe(`${shortUrl.target_path}?photo=42&folder=ceremony-1&x=a+b%3Cc`);
+  });
+
+  it('redirects to the bare target when there is no query', async () => {
+    const { shortUrl } = await seedEventAndShortUrl({
+      slug: 'no-query', shortSlug: 'without-query',
+    });
+    const res = await request(app)
+      .get('/s/without-query?')
+      .set('User-Agent', BROWSER_UA);
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe(shortUrl.target_path);
+  });
+
   it('increments hit_count on a browser hit (fire-and-forget — wait briefly)', async () => {
     await seedEventAndShortUrl({
       slug: 'hit-browser', shortSlug: 'hit-from-browser',
@@ -132,6 +155,14 @@ describe('GET /s/:shortSlug — social crawler (OG metadata)', () => {
     expect(res.text).toContain('<meta');
     expect(res.text).toMatch(/og:title/);
     expect(res.text).toMatch(/og:url/);
+  });
+
+  // Gallery and short links are crawlable (the app shell answers noindex),
+  // and a crawler that indexes may be served this preview instead of the shell.
+  it('the preview page refuses indexing in its own markup', async () => {
+    const { renderOgHtml } = require('../../src/services/galleryOgService');
+    const html = renderOgHtml({ title: 'T', description: 'D', image: 'https://x.test/i.jpg', url: 'https://x.test/s/a', siteName: 'S' });
+    expect(html).toContain('<meta name="robots" content="noindex" />');
   });
 
   it('og:url canonical points at /s/<slug>, not the underlying gallery URL', async () => {
@@ -213,6 +244,83 @@ describe('GET /s/:shortSlug — error states', () => {
       .get('/s/UPPER_CASE')
       .set('User-Agent', BROWSER_UA);
     expect(res.status).toBe(404);
+  });
+});
+
+// A short URL has to follow its gallery. The target used to be replayed from
+// the row as stored, so renaming the gallery (which rewrites the slug) left
+// /s/<slug> redirecting to a /gallery/<old-slug> nothing resolves any more.
+describe('GET /s/:shortSlug — follows the gallery after it changes', () => {
+  const hex = (c) => c.repeat(32);
+  // Required lazily: loading it at collection time would open db.js before
+  // bootCrmDb points it at the suite's own file.
+  const setShortGalleryUrls = (on) => require('../../src/utils/appSettings')
+    .upsertAppSetting('general_short_gallery_urls', JSON.stringify(on), 'system');
+
+  it('redirects to the new slug after the gallery is renamed', async () => {
+    const { eventId } = await seedEventAndShortUrl({
+      slug: 'wedding-test-event-2026-06-05', shortSlug: 'renamed-gallery',
+    });
+    const renameService = require('../../src/services/eventRenameService');
+    const result = await renameService.renameEvent(eventId, 'Brand New Name');
+    expect(result).toMatchObject({ success: true });
+    const { newSlug } = result.data;
+    expect(newSlug).not.toBe('wedding-test-event-2026-06-05');
+
+    const res = await request(app).get('/s/renamed-gallery?photo=7').set('User-Agent', BROWSER_UA);
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe(`/gallery/${newSlug}?photo=7`);
+
+    // The admin list shows where the link goes now, too.
+    const [listed] = await service.listForEvent(eventId);
+    expect(listed.target_path).toBe(`/gallery/${newSlug}`);
+    expect(listed.event_id).toBeUndefined();
+
+    // A rename does not bring a removed link back.
+    await service.softDelete(listed.id, null);
+    const gone = await request(app).get('/s/renamed-gallery').set('User-Agent', BROWSER_UA);
+    expect(gone.status).toBe(410);
+  });
+
+  it('keeps the token form and follows a rotated share token', async () => {
+    await setShortGalleryUrls(true);
+    let eventId; let shortUrl;
+    try {
+      ({ eventId, shortUrl } = await seedEventAndShortUrl({ slug: 'token-form', shortSlug: 'token-form-link' }));
+    } finally {
+      await setShortGalleryUrls(false);
+    }
+    expect(shortUrl.target_path).toMatch(/^\/gallery\/tok/);
+    // Generated tokens are 32 hex chars; give the row one, as created.
+    await db('events').where({ id: eventId }).update({ share_token: hex('a') });
+    await db('gallery_short_urls').where({ id: shortUrl.id }).update({ target_path: `/gallery/${hex('a')}` });
+
+    // Rotate it: the stored token no longer matches the event, so the token
+    // form is recognised by its shape and the current token is used.
+    await db('events').where({ id: eventId }).update({ share_token: hex('b') });
+    const res = await request(app).get('/s/token-form-link').set('User-Agent', BROWSER_UA);
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe(`/gallery/${hex('b')}`);
+  });
+
+  it('keeps the slug form when the global short-URL setting is turned on later', async () => {
+    const { eventId } = await seedEventAndShortUrl({ slug: 'slug-form', shortSlug: 'slug-form-link' });
+    await db('events').where({ id: eventId }).update({ slug: 'slug-form-renamed' });
+    await setShortGalleryUrls(true);
+    try {
+      const res = await request(app).get('/s/slug-form-link').set('User-Agent', BROWSER_UA);
+      expect(res.headers.location).toBe('/gallery/slug-form-renamed');
+    } finally {
+      await setShortGalleryUrls(false);
+    }
+  });
+
+  it('redirects to the stored target when the event row is gone', async () => {
+    const { eventId, shortUrl } = await seedEventAndShortUrl({ slug: 'gone-event', shortSlug: 'gone-event-link' });
+    await db('events').where({ id: eventId }).delete();
+    const res = await request(app).get('/s/gone-event-link').set('User-Agent', BROWSER_UA);
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe(shortUrl.target_path);
   });
 });
 

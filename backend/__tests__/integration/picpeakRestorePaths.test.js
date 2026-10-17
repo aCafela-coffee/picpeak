@@ -9,8 +9,8 @@
  * to open again and re-hash to the sha256 recorded when it was issued.
  *
  * SQLite by default. With PICPEAK_PG_TEST_URL set the same run goes against
- * Postgres: the export lists tables from the public schema, so the URL must
- * name a throwaway test database whose public schema this suite may drop.
+ * Postgres: the URL supplies a privileged fixture connection. This suite
+ * creates and drops its own uniquely named database, never the URL's database.
  */
 
 const crypto = require('crypto');
@@ -32,6 +32,10 @@ let db;
 let cleanup;
 let tmpDir;
 let owner;
+let ownedDatabase;
+let databaseCreated = false;
+const databaseEnvKeys = ['DATABASE_CLIENT', 'DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME'];
+const originalDatabaseEnv = Object.fromEntries(databaseEnvKeys.map(key => [key, process.env[key]]));
 let adminId;
 let customerEmail;
 let token;
@@ -40,11 +44,27 @@ let signingApp;
 const sentCodes = [];
 const auth = { get Authorization() { return `Bearer ${token}`; } };
 
-async function resetPublicSchema() {
-  const database = new URL(pgUrl).pathname.slice(1);
-  if (!/test/i.test(database)) throw new Error(`refusing to drop the public schema of "${database}"`);
-  await owner.raw('DROP SCHEMA IF EXISTS public CASCADE');
-  await owner.raw('CREATE SCHEMA public');
+async function createOwnedDatabase() {
+  const target = new URL(pgUrl);
+  ownedDatabase = `picpeak_owned_restore_paths_test_${crypto.randomBytes(8).toString('hex')}_main`;
+  // Identifier bindings quote the generated name; the privileged URL target
+  // is only an owner connection and is never wiped or restored.
+  await owner.raw('CREATE DATABASE ??', [ownedDatabase]);
+  databaseCreated = true;
+  target.pathname = `/${ownedDatabase}`;
+  const probe = knex({ client: 'pg', connection: target.href });
+  try {
+    const { rows } = await probe.raw('SELECT current_database() AS database, (SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname = ?)::integer AS tables', ['public']);
+    expect(rows).toEqual([{ database: ownedDatabase, tables: 0 }]);
+  } finally {
+    await probe.destroy();
+  }
+  // A genuine supervised worker inherits environment, not Jest module mocks.
+  Object.assign(process.env, {
+    DATABASE_CLIENT: 'pg', DB_HOST: target.hostname, DB_PORT: target.port || '5432',
+    DB_USER: decodeURIComponent(target.username), DB_PASSWORD: decodeURIComponent(target.password),
+    DB_NAME: ownedDatabase,
+  });
 }
 
 async function ok(req, status = [200, 201]) {
@@ -89,15 +109,18 @@ const pathRows = async (contractId) => ({
   documents: await db('generated_documents').where({ doc_type: 'contract', doc_id: contractId }).select('id', 'kind', 'path', 'sha256'),
 });
 
+// importFromPicpeak runs the coordinated portable restore, which needs a Linux
+// host (portableRestoreCapability); elsewhere it refuses before restoring.
+const linuxTest = process.platform === 'linux' ? test : test.skip;
+
 beforeAll(async () => {
   if (pgUrl) {
     owner = knex({ client: 'pg', connection: pgUrl });
-    await resetPublicSchema();
-    process.env.DATABASE_CLIENT = 'pg';
-    jest.doMock('../../knexfile', () => ({ client: 'pg', connection: pgUrl }));
+    await createOwnedDatabase();
   }
   ({ db, cleanup, tmpDir } = await bootCrmDb());
   expect(db.client.config.client).toBe(pgUrl ? 'pg' : 'sqlite3');
+  if (pgUrl) expect((await db.raw('SELECT current_database() AS database')).rows[0].database).toBe(ownedDatabase);
   const emailProcessor = require('../../src/services/emailProcessor');
   jest.spyOn(emailProcessor, 'sendTemplateEmail').mockImplementation(async (to, templateKey, variables) => {
     sentCodes.push({ to, templateKey, code: variables.code });
@@ -117,14 +140,25 @@ beforeAll(async () => {
 }, 180000);
 
 afterAll(async () => {
-  if (cleanup) await cleanup();
-  if (owner) {
-    await resetPublicSchema();
-    await owner.destroy();
+  try {
+    await require('../../src/services/serviceShutdown').stopServices();
+    if (cleanup) await cleanup();
+    if (owner && databaseCreated) {
+      if (!/^picpeak_owned_restore_paths_test_[0-9a-f]{16}_(main|stable)$/.test(ownedDatabase)) throw new Error('Refusing to drop an unowned database');
+      // No FORCE or connection termination: every genuine worker must already
+      // be terminal and every owned pool closed before the database is dropped.
+      await owner.raw('DROP DATABASE ??', [ownedDatabase]);
+    }
+  } finally {
+    if (owner) await owner.destroy();
+    for (const key of databaseEnvKeys) {
+      if (originalDatabaseEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalDatabaseEnv[key];
+    }
   }
 });
 
-test('documents open and re-hash after a restore onto another storage path', async () => {
+linuxTest('documents open and re-hash after a restore onto another storage path', async () => {
   const oldRoot = process.env.STORAGE_PATH;
 
   // 1. A contract written by this release: every stored path is relative.
@@ -270,7 +304,8 @@ test('documents open and re-hash after a restore onto another storage path', asy
   for (const a of signedAttached) expect(signedHashes.has(sha256(fs.readFileSync(a.path)))).toBe(true);
 });
 
-test('a stored path that climbs out of the storage root is not served', async () => {
+// Uses the contracts the restore test above created and signed.
+linuxTest('a stored path that climbs out of the storage root is not served', async () => {
   const contract = await db('contracts').whereNotNull('pdf_path').first('id', 'pdf_path');
   await db('contracts').where({ id: contract.id }).update({ pdf_path: '../../../../etc/passwd', signed_pdf_path: '/etc/passwd' });
   try {

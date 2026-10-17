@@ -9,6 +9,7 @@
  */
 
 const { db } = require('../database/db');
+const { livePhotos } = require('../utils/photoVisibility');
 
 /** The event's cap as a positive integer, or null when it has none. */
 function photoCapOf(event) {
@@ -17,7 +18,7 @@ function photoCapOf(event) {
 }
 
 async function countEventPhotos(eventId, conn = db) {
-  const row = await conn('photos').where({ event_id: eventId }).count('id as count').first();
+  const row = await livePhotos(conn).where({ event_id: eventId }).count('id as count').first();
   return parseInt(row && row.count, 10) || 0;
 }
 
@@ -40,7 +41,14 @@ function photoCapError(cap) {
  * insert result, or null when the cap is reached. Without a cap it is a plain
  * insert.
  */
-async function insertPhotoWithinCap(row, cap) {
+async function insertPhotoWithinCap(row, cap, conn = null) {
+  if (conn) {
+    if (cap) {
+      if (conn.client.config.client === 'pg') await conn('events').where({ id: row.event_id }).forUpdate().first();
+      if ((await countEventPhotos(row.event_id, conn)) >= cap) return null;
+    }
+    return conn('photos').insert(row).returning('id');
+  }
   if (!cap) return db('photos').insert(row).returning('id');
   return db.transaction(async (trx) => {
     // SQLite runs one write transaction at a time; Postgres needs the row lock.

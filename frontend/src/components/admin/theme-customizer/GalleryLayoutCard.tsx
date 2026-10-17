@@ -1,8 +1,8 @@
 import React from 'react';
 import { Layout, Check, AlertTriangle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { Card, Input } from '../../common';
-import { ThemeConfig, GalleryLayoutType } from '../../../types/theme.types';
+import { Card, Input, Switch } from '../../common';
+import { ThemeConfig, GalleryLayoutType, STORY_FOOTER_TEXT_MAX, STORY_FOOTER_TITLE_MAX } from '../../../types/theme.types';
 import { layoutIcons } from './icons';
 
 interface GalleryLayoutCardProps {
@@ -53,7 +53,7 @@ export const GalleryLayoutCard: React.FC<GalleryLayoutCardProps> = ({
               <span className="font-medium text-sm capitalize text-heading">
                 {layout}
                 {(layout === 'gallery-premium' || layout === 'gallery-story') && (
-                  <span className="ml-1 text-xs text-amber-600 dark:text-amber-400">(Beta)</span>
+                  <span className="ml-1 text-xs text-warning-text">(Beta)</span>
                 )}
               </span>
               <span className="text-xs text-soft mt-1">
@@ -69,19 +69,19 @@ export const GalleryLayoutCard: React.FC<GalleryLayoutCardProps> = ({
 
       {/* Warning: Beta theme with low thumbnail resolution */}
       {isBetaLayout && isThumbnailTooSmall && (
-        <div className="mt-4 p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg">
+        <div className="mt-4 p-4 bg-warning-soft border border-warning-line rounded-lg">
           <div className="flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+            <AlertTriangle className="w-5 h-5 text-warning-text flex-shrink-0 mt-0.5" />
             <div>
-              <p className="text-sm font-medium text-amber-800 dark:text-amber-300">
+              <p className="text-sm font-medium text-warning-text">
                 {t('branding.betaThumbnailWarningTitle')}
               </p>
-              <p className="text-sm text-amber-700 dark:text-amber-400 mt-1">
+              <p className="text-sm text-warning-text mt-1">
                 {t('branding.betaThumbnailWarningText', { width: thumbnailWidth, height: thumbnailHeight, recommended: minRecommendedThumbnailSize })}
               </p>
               <a
                 href="/admin/settings"
-                className="inline-flex items-center gap-1 mt-2 text-sm font-medium text-amber-800 dark:text-amber-300 hover:underline"
+                className="inline-flex items-center gap-1 mt-2 text-sm font-medium text-warning-text hover:underline"
                 onClick={(e) => {
                   e.preventDefault();
                   window.location.href = '/admin/settings';
@@ -347,22 +347,57 @@ export const GalleryLayoutCard: React.FC<GalleryLayoutCardProps> = ({
           {/* Mosaic specific */}
           {/* Gallery Story specific (issue 1709) */}
           {localTheme.galleryLayout === 'gallery-story' && (
-            <div>
-              <label className="block text-sm font-medium text-body mb-2">
-                {t('branding.storyGridMode', 'Photo Framing')}
-              </label>
-              <select
-                value={localTheme.gallerySettings?.storyGridMode || 'fixed'}
-                onChange={(e) => updateGallerySettings('storyGridMode', e.target.value)}
-                className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading"
-              >
-                <option value="fixed">{t('branding.storyGridModeOptions.fixed', 'Fixed tiles (crop to fill)')}</option>
-                <option value="natural">{t('branding.storyGridModeOptions.natural', 'Natural (keep every aspect ratio)')}</option>
-              </select>
-              <p className="text-xs text-muted mt-1">
-                {t('branding.storyGridModeHint', 'Natural lays scenes out in rows from each photo\'s dimensions, so portrait photos are shown whole instead of cropped.')}
-              </p>
-            </div>
+            <>
+              <div>
+                <label className="block text-sm font-medium text-body mb-2">
+                  {t('branding.storyGridMode', 'Photo Framing')}
+                </label>
+                <select
+                  value={localTheme.gallerySettings?.storyGridMode || 'fixed'}
+                  onChange={(e) => updateGallerySettings('storyGridMode', e.target.value)}
+                  className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading"
+                >
+                  <option value="fixed">{t('branding.storyGridModeOptions.fixed', 'Fixed tiles (crop to fill)')}</option>
+                  <option value="natural">{t('branding.storyGridModeOptions.natural', 'Natural (keep every aspect ratio)')}</option>
+                </select>
+                <p className="text-xs text-muted mt-1">
+                  {t('branding.storyGridModeHint', 'Natural lays scenes out in rows from each photo\'s dimensions, so portrait photos are shown whole instead of cropped.')}
+                </p>
+              </div>
+              <Switch
+                checked={localTheme.gallerySettings?.storyShowFilenames === true}
+                onChange={(next) => updateGallerySettings('storyShowFilenames', next)}
+                label={t('branding.storyShowFilenames', 'Show filenames on hover')}
+                description={t('branding.storyShowFilenamesHint', 'Shows the photo\'s filename when a guest hovers over it. A gallery set to show original filenames shows the uploaded name.')}
+              />
+              <Input
+                label={t('branding.storyFooterTitle', 'Footer title')}
+                value={localTheme.gallerySettings?.storyFooterTitle || ''}
+                onChange={(e) => updateGallerySettings('storyFooterTitle', e.target.value)}
+                maxLength={STORY_FOOTER_TITLE_MAX}
+                placeholder={t('gallery.thankYou', 'Thank You')}
+                helperText={t('branding.storyFooterTitleHint', 'Leave empty for "Thank You".')}
+              />
+              <div>
+                <label htmlFor="story-footer-text" className="block text-sm font-medium text-body mb-1.5">
+                  {t('branding.storyFooterText', 'Footer text')}
+                </label>
+                <textarea
+                  id="story-footer-text"
+                  rows={3}
+                  value={localTheme.gallerySettings?.storyFooterText || ''}
+                  onChange={(e) => updateGallerySettings('storyFooterText', e.target.value)}
+                  maxLength={STORY_FOOTER_TEXT_MAX}
+                  // h-auto: `.input` fixes the height at h-10, which would
+                  // cut the three rows down to one.
+                  className="input w-full h-auto"
+                  aria-describedby="story-footer-text-hint"
+                />
+                <p id="story-footer-text-hint" className="text-xs text-muted mt-1">
+                  {t('branding.storyFooterTextHint', 'Plain text, up to {{max}} characters. Leave empty to show the welcome message, or the default thank-you line when there is none.', { max: STORY_FOOTER_TEXT_MAX })}
+                </p>
+              </div>
+            </>
           )}
 
           {localTheme.galleryLayout === 'mosaic' && (

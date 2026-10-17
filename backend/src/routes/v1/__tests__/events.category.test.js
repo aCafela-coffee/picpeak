@@ -51,6 +51,15 @@ jest.mock('../../../middleware/permissions', () => ({
   requirePermission: () => (_req, _res, next) => next(),
   userHasAnyPermission: async () => true,
   userHasAllPermissions: async () => true,
+  roleHasPermission: async () => true,
+}));
+
+// The upload columns (issue 743: uploader, account credit, review) read
+// admin_users; this suite queues db() chains in call order, so they are pinned
+// here and covered in __tests__/routes/eventAdminAssignments.
+jest.mock('../../../services/uploadReviewService', () => ({
+  holdsForReview: async () => false,
+  adminUploadColumns: async (admin) => ({ uploaded_by_admin_id: admin.id }),
 }));
 
 jest.mock('../../../middleware/apiTokenAuth', () => ({
@@ -101,21 +110,46 @@ jest.mock('../../../services/uploadSettings', () => ({
   DEFAULT_MAX_FILE_SIZE_MB: 50,
 }));
 
+// This is a handler-only unit test with sequenced DB builders and fake
+// Multer/Sharp/storage, not an ingress test. Real parser, auth and persistent
+// admission are exercised by integration/adminUploadAdmission.test.js.
+jest.mock('../../../middleware/publicUploadStream', () => ({
+  withPublicUpload: jest.fn(async (req, res, scope, makeUploader, handler) => {
+    req.publicUploadReservation = { id: 'unit-admission', event_id: scope.eventId };
+    const upload = makeUploader({ storage: {}, streamHandler: () => {}, rejectBody: () => {}, maxFiles: 1 });
+    await new Promise((resolve, reject) => upload(req, res, err => err ? reject(err) : resolve()));
+    await handler(req.publicUploadReservation, res);
+  }),
+}));
+jest.mock('../../../services/publicUploadQuota', () => ({
+  prepareObject: jest.fn(async (_session, key, size) => ({ id: 'unit-object', object_key: key, bytes: size })),
+  commitObject: jest.fn(async (_object, _type, writeRow) => writeRow(require('../../../database/db').db)),
+  processingComplete: jest.fn().mockResolvedValue(undefined),
+  failedObject: jest.fn().mockResolvedValue(undefined),
+}));
+
 // Stub sharp so the happy-path test doesn't actually decode an image
-// (the temp file is a 0-byte placeholder — see the beforeAll below).
-jest.mock('sharp', () => jest.fn(() => ({
+// (the temp file is a one-byte placeholder — see the beforeEach below).
+jest.mock('../../../services/isolatedSharp', () => jest.fn(() => ({
   metadata: jest.fn().mockResolvedValue({ width: 1920, height: 1080 }),
+  // The upload's decode check resizes the file to a thumbnail-sized buffer.
+  resize: jest.fn().mockReturnThis(),
+  toBuffer: jest.fn().mockResolvedValue(Buffer.alloc(1)),
 })));
 
 // Thumbnail + storage are network/fs-heavy; stub to constant resolves
 // so the test stays a pure unit test of the route handler's contract.
 jest.mock('../../../services/imageProcessor', () => ({
   generateThumbnail: jest.fn().mockResolvedValue('thumbnails/fake_thumb.jpg'),
+  // The upload reads the capture date itself (no worker runs for this row).
+  extractCaptureDate: jest.fn().mockResolvedValue(null),
 }));
 
 jest.mock('../../../services/storage', () => ({
   getStorage: jest.fn(() => ({
     putFromFile: jest.fn().mockResolvedValue(undefined),
+    // The size of the staged file, which the route compares after storing.
+    stat: jest.fn().mockResolvedValue({ size: require('../../../../__tests__/helpers/minimalJpeg').length }),
   })),
 }));
 
@@ -127,6 +161,7 @@ jest.mock('../../../services/webhookService', () => ({
 }));
 
 const fsSync = require('fs');
+const MINIMAL_JPEG = require('../../../../__tests__/helpers/minimalJpeg');
 const { db } = require('../../../database/db');
 const eventsRouter = require('../events');
 
@@ -140,6 +175,8 @@ const buildApp = () => {
 describe('v1 POST /events/:id/photos — category scoping', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // The route checks the staged file's content before the category.
+    fsSync.writeFileSync('/tmp/fake-v1-upload.jpg', MINIMAL_JPEG);
   });
 
   it('scopes the category lookup to event-owned or global rows', async () => {
@@ -203,7 +240,7 @@ describe('v1 POST /events/:id/photos — happy path (#525)', () => {
     // fs.unlink(tempPath) after a successful upload, so a beforeAll
     // would leave the second test without an inode for statSync to
     // read (manifests as 500 Internal Server Error).
-    fsSync.writeFileSync(FAKE_TMP, '');
+    fsSync.writeFileSync(FAKE_TMP, MINIMAL_JPEG);
   });
 
   afterAll(() => {
@@ -239,7 +276,7 @@ describe('v1 POST /events/:id/photos — happy path (#525)', () => {
     expect(response.body).toMatchObject({
       id: 101,
       category_id: 7,
-      size_bytes: 0,
+      size_bytes: MINIMAL_JPEG.length,
       thumbnail_path: 'thumbnails/fake_thumb.jpg',
     });
     expect(response.body.filename).toMatch(/^\d+_[a-f0-9]+\.jpg$/);

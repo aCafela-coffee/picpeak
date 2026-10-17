@@ -82,6 +82,15 @@ const handleKnownErrors = (err) => {
     return new ValidationError('Invalid JSON in request body');
   }
 
+  // body-parser's refusal of a body over its limit is the client's, not a
+  // server fault (issue 2078: it surfaced as 413 with INTERNAL_ERROR).
+  if (err.type === 'entity.too.large') {
+    const { AppError } = require('../utils/errors');
+    const error = new AppError('Request body is too large', 413, 'PAYLOAD_TOO_LARGE');
+    error.isOperational = true;
+    return error;
+  }
+
   // Handle multer file upload errors
   if (err.code === 'LIMIT_FILE_SIZE') {
     const { ValidationError } = require('../utils/errors');
@@ -101,6 +110,16 @@ const handleKnownErrors = (err) => {
   if (err.code === 'LIMIT_FIELD_ARRAY_INDEX') {
     const { ValidationError } = require('../utils/errors');
     return new ValidationError('Field name array index too large');
+  }
+
+  // The multipart routes now size their parsers to the fields they read
+  // (`fields`, `parts`, `files`, `fieldSize`); a request that exceeds one of
+  // those budgets is a bad request, not a server fault.
+  if (err.code === 'LIMIT_FIELD_COUNT' || err.code === 'LIMIT_PART_COUNT'
+    || err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_FIELD_VALUE'
+    || err.code === 'LIMIT_FIELD_KEY') {
+    const { ValidationError } = require('../utils/errors');
+    return new ValidationError('Multipart request exceeds the allowed number or size of parts');
   }
 
   return err;

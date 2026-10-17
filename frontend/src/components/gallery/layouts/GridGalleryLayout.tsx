@@ -1,12 +1,16 @@
 import React from 'react';
-import { MessageSquare, Star, Heart, Video, Eye, EyeOff } from 'lucide-react';
+import { MessageSquare, Star, Heart, Video } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '../../../contexts/ThemeContext';
 import { PhotoCard } from '../PhotoCard';
+import { firstLookAboveChips } from '../GalleryTileBadges';
+import { ClientVisibilityToggle, isHiddenFromGuests } from '../ClientVisibilityToggle';
 import { FeedbackIdentityModal } from '../../gallery/FeedbackIdentityModal';
 import { feedbackService } from '../../../services/feedback.service';
 import type { BaseGalleryLayoutProps } from './BaseGalleryLayout';
 import type { Photo } from '../../../types';
+import type { GalleryLayoutSettings } from '../../../types/theme.types';
+import { useLazyBands } from './lazyBands';
 
 interface GridPhotoProps {
   photo: Photo;
@@ -28,11 +32,16 @@ interface GridPhotoProps {
   };
   savedIdentity?: { name: string; email: string } | null;
   onRequireIdentity?: (action: 'like', photoId: number) => void;
+  onIdentitySaved?: (identity: { name: string; email: string }) => void;
   onQuickComment?: () => void;
-  onFeedbackChange?: () => void;
+  onFeedbackChange?: (toggledPhotoId?: number) => void;
   // Immediate UI like state and callback
   liked?: boolean;
   onLikeSuccess?: () => void;
+  /** The client's hide/show button (#172), when the viewer is the client. */
+  visibilityToggle?: React.ReactNode;
+  /** Dim the photo: the client hid it from guests. */
+  dimmed?: boolean;
 }
 
 const GridPhoto: React.FC<GridPhotoProps> = ({
@@ -49,11 +58,15 @@ const GridPhoto: React.FC<GridPhotoProps> = ({
   feedbackOptions,
   savedIdentity,
   onRequireIdentity,
+  onIdentitySaved,
   onQuickComment,
   onFeedbackChange,
   liked = false,
-  onLikeSuccess
+  onLikeSuccess,
+  visibilityToggle,
+  dimmed = false,
 }) => {
+  const bands = useLazyBands();
   const { t } = useTranslation();
 
   const animationClass = animationType === 'scale'
@@ -69,9 +82,15 @@ const GridPhoto: React.FC<GridPhotoProps> = ({
     (photo.mime_type && photo.mime_type.startsWith('video/')) ||
     photo.type === 'video';
 
+  // Feedback indicators own the bottom-left corner (one row higher on a
+  // collage); the first-look pill sits above them (issue 1562).
+  const hasIndicators = commentCount > 0 || averageRating > 0 || likeCount > 0 || liked;
+  const firstLookRows = hasIndicators ? (photo.type === 'collage' ? 2 : 1) : 0;
+
   return (
     <PhotoCard
       photo={photo}
+      firstLookClassName={firstLookAboveChips(firstLookRows)}
       isSelected={isSelected}
       isSelectionMode={isSelectionMode}
       onClick={onClick}
@@ -96,7 +115,7 @@ const GridPhoto: React.FC<GridPhotoProps> = ({
        * resolves against the root's own box, so 100% is one viewport height
        * of lead in each direction, which is what vh would have meant.
        */
-      inViewRootMargin="100% 0px"
+      inViewRootMargin={bands.load}
       /*
        * Release band (#1287). The pre-load band above fixed tiles arriving
        * late; it did nothing about tiles never leaving. Every tile scrolled
@@ -112,18 +131,33 @@ const GridPhoto: React.FC<GridPhotoProps> = ({
        * Thumbnails are served `private, max-age=1800`, so coming back costs a
        * cache hit rather than a round trip.
        *
-       * Grid and Mosaic only, and deliberately so: the skeleton here is
-       * `aspect-square`, Mosaic's tile carries an explicit `aspectRatio`, and
-       * either holds the tile's box exactly, so releasing shifts nothing. The
-       * measured layouts have no such guarantee.
+       * Safe because the skeleton here is `aspect-square`, which holds the
+       * tile's box exactly whether or not the image is mounted, so releasing
+       * shifts nothing. Every other grid layout sizes its tile the same way,
+       * from the stored dimensions, and releases with the same bands
+       * (issue 1733).
        */
-      releaseRootMargin="300% 0px"
+      releaseRootMargin={bands.keep}
+      /*
+       * Issue 1733: a released tile still costs style, layout and paint on
+       * every scroll frame — 500 skeletons are still 500 boxes. With
+       * `content-visibility: auto` the browser skips all three for tiles
+       * outside its own (viewport-sized) proximity band and treats them as
+       * empty. That is only safe when the box does not depend on the
+       * contents, which `aspect-square` with the grid's column width
+       * guarantees; no `contain-intrinsic-size` is needed because width and
+       * aspect ratio already give a definite height. Not on Mosaic: inside
+       * CSS columns Safari mis-balances the columns of skipped content.
+       */
+      style={{ contentVisibility: 'auto' }}
       fadeInWhenVisible={animationType === 'fade'}
-      skeletonClassName="skeleton aspect-square w-full rounded-lg"
+      skeletonClassName="skeleton bg-border-token aspect-square w-full rounded-lg"
       imageProps={{
         src: photo.thumbnail_url || photo.url,
         alt: photo.filename,
-        className: 'w-full h-full object-cover rounded-lg',
+        // The image only, not the tile, so the toggle and the chips stay at
+        // full strength (issue 1992).
+        className: `w-full h-full object-cover rounded-lg${dimmed ? ' opacity-40' : ''}`,
         loading: 'lazy',
         isGallery: true,
         slug,
@@ -142,19 +176,21 @@ const GridPhoto: React.FC<GridPhotoProps> = ({
       onLikeSuccess={onLikeSuccess}
       savedIdentity={savedIdentity}
       onRequireIdentity={onRequireIdentity}
+      onIdentitySaved={onIdentitySaved}
       checkboxTestId
+      topLeftControl={visibilityToggle}
     >
       {/* Feedback Indicators (always visible, bottom-left). Show like immediately when user liked */}
       {(commentCount > 0 || averageRating > 0 || likeCount > 0 || liked) && (
         <div className={`absolute ${photo.type === 'collage' ? 'bottom-8' : 'bottom-2'} left-2 flex items-center gap-1 z-10`}>
           {(likeCount > 0 || liked) && (
             <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-white/90 backdrop-blur-sm" title="Liked">
-              <Heart className="w-3.5 h-3.5 text-red-500" fill="currentColor" />
+              <Heart className="w-3.5 h-3.5 text-danger" fill="currentColor" />
             </span>
           )}
           {averageRating > 0 && (
             <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-white/90 backdrop-blur-sm" title="Rated">
-              <Star className="w-3.5 h-3.5 text-yellow-500" fill="currentColor" />
+              <Star className="w-3.5 h-3.5 text-rating" fill="currentColor" />
             </span>
           )}
           {commentCount > 0 && (
@@ -185,6 +221,27 @@ const GridPhoto: React.FC<GridPhotoProps> = ({
   );
 };
 
+/**
+ * The grid's columns and gaps from the theme. Shared with the delivery
+ * placeholders (issue 1562), which have to line up with the real tiles above
+ * them. The grid-cols classes are safelisted in tailwind.config.
+ */
+export function gridGeometryClass(gallerySettings: GalleryLayoutSettings): string {
+  const columns = gallerySettings.gridColumns || { mobile: 2, tablet: 3, desktop: 4 };
+  const spacing = gallerySettings.spacing || 'normal';
+  const scale = gallerySettings.thumbnailScale || 'md';
+
+  const scaleOffsets: Record<string, number> = { xs: 3, sm: 1, md: 0, lg: -1, xl: -2 };
+  const applyScale = (cols: number) => Math.max(1, cols + (scaleOffsets[scale] ?? 0));
+  const spacingClass = spacing === 'tight' ? 'gap-2' : spacing === 'relaxed' ? 'gap-6' : 'gap-4';
+
+  return `grid ${spacingClass}
+    grid-cols-${applyScale(columns.mobile)}
+    sm:grid-cols-${applyScale(columns.tablet)}
+    lg:grid-cols-${applyScale(columns.desktop)}
+    xl:grid-cols-${applyScale(columns.desktop + 1)}`;
+}
+
 export const GridGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
   photos,
   slug,
@@ -204,13 +261,7 @@ export const GridGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
 }) => {
   const { theme } = useTheme();
   const gallerySettings = theme.gallerySettings || {};
-  const columns = gallerySettings.gridColumns || { mobile: 2, tablet: 3, desktop: 4 };
-  const spacing = gallerySettings.spacing || 'normal';
   const animation = gallerySettings.photoAnimation || 'fade';
-  const scale = gallerySettings.thumbnailScale || 'md';
-
-  const scaleOffsets: Record<string, number> = { xs: 3, sm: 1, md: 0, lg: -1, xl: -2 };
-  const applyScale = (cols: number) => Math.max(1, cols + (scaleOffsets[scale] ?? 0));
 
   const [showIdentityModal, setShowIdentityModal] = React.useState(false);
   const [pendingAction, setPendingAction] = React.useState<null | { type: 'like'; photoId: number }>(null);
@@ -225,20 +276,13 @@ export const GridGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
   }, [photos]);
   const [savedIdentity, setSavedIdentity] = React.useState<{ name: string; email: string } | null>(null);
 
-  const spacingClass = spacing === 'tight' ? 'gap-2' : spacing === 'relaxed' ? 'gap-6' : 'gap-4';
-
-  const gridClass = `photo-grid grid ${spacingClass}
-    grid-cols-${applyScale(columns.mobile)}
-    sm:grid-cols-${applyScale(columns.tablet)}
-    lg:grid-cols-${applyScale(columns.desktop)}
-    xl:grid-cols-${applyScale(columns.desktop + 1)}`;
+  const gridClass = `photo-grid ${gridGeometryClass(gallerySettings)}`;
 
   return (
     <div className={gridClass}>
       {photos.map((photo, index) => {
-        const isHidden = photo.visibility === 'hidden';
         return (
-          <div key={photo.id} className={`relative ${isClient && isHidden ? 'opacity-40' : ''}`}>
+          <div key={photo.id} className="relative">
             <GridPhoto
               photo={photo}
               isSelected={selectedPhotos.has(photo.id)}
@@ -253,6 +297,7 @@ export const GridGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
               feedbackEnabled={feedbackEnabled}
               feedbackOptions={feedbackOptions}
               savedIdentity={savedIdentity}
+              onIdentitySaved={setSavedIdentity}
               onRequireIdentity={(action, photoId) => {
                 setPendingAction({ type: action, photoId });
                 setShowIdentityModal(true);
@@ -270,24 +315,12 @@ export const GridGalleryLayout: React.FC<BaseGalleryLayoutProps> = ({
                   return next;
                 });
               }}
+              // Client visibility toggle (#172) and the dimmed hidden photo.
+              visibilityToggle={isClient && onToggleVisibility
+                ? <ClientVisibilityToggle photo={photo} onToggle={onToggleVisibility} />
+                : undefined}
+              dimmed={isClient && Boolean(onToggleVisibility) && isHiddenFromGuests(photo)}
             />
-            {/* Client visibility toggle overlay (#172) */}
-            {isClient && onToggleVisibility && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onToggleVisibility(photo.id, photo.visibility || 'visible');
-                }}
-                className={`absolute top-2 left-2 z-10 p-1.5 rounded-full shadow-md transition-colors ${
-                  isHidden
-                    ? 'bg-red-500/90 text-white hover:bg-red-600'
-                    : 'bg-white/90 text-neutral-700 hover:bg-white dark:bg-neutral-800/90 dark:text-neutral-200 dark:hover:bg-neutral-700'
-                }`}
-                title={isHidden ? 'Hidden from guests' : 'Visible to guests'}
-              >
-                {isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-              </button>
-            )}
           </div>
         );
       })}

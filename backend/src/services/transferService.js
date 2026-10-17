@@ -3,7 +3,7 @@
  *
  * A "transfer" is a share link that bundles ORIGINAL photos picked from any
  * number of events and hands them to a recipient as a download link. It can
- * also open a short (6-char) upload token so the client can send files back
+ * also open a short (10-char) upload code so the client can send files back
  * (logos etc.).
  *
  * Design decisions (from the issue):
@@ -21,9 +21,12 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const archiver = require('archiver');
+const { createArchiveStreamGuard } = require('../utils/archiveStreamGuard');
 
 const { db } = require('../database/db');
+const { joinLivePhotos, livePhotos, wherePhotoLive, wherePhotoProcessed } = require('../utils/photoVisibility');
 const logger = require('../utils/logger');
+const applicationWork = require('./activeApplicationWork');
 const { pipeStreamToResponse } = require('../utils/streamResponse');
 const { formatBoolean } = require('../utils/dbCompat');
 const { getAppSetting } = require('../utils/appSettings');
@@ -31,13 +34,15 @@ const { getStorage } = require('./storage');
 const { resolvePhotoStorageKey, resolvePhotoFilePath } = require('./photoResolver');
 const { getUseOriginalFilenames, getZipEntryNames } = require('./downloadFilenameService');
 const { sanitizeForZipEntry, buildContentDisposition } = require('../utils/filenameSanitizer');
-const { setAttachmentHeaders, opaqueStoredName } = require('./transferUploadPolicy');
+const {
+  setAttachmentHeaders, opaqueStoredName, normalizeMaxFiles, getTransferUploadPolicy, effectiveMaxFiles,
+} = require('./transferUploadPolicy');
 const { filterOwnedEventIds } = require('../middleware/ownership');
 
 // Unambiguous alphabet for the client upload token — no 0/O/1/I/L to keep it
 // easy to read aloud / type from an email. 31 characters, so 10 of them give
-// about 49.6 bits; the 6-character codes issued before (about 29.7 bits)
-// stay valid, the route accepts 4 to 16. Guessing is further slowed by the
+// about 49.6 bits. Legacy shorter codes are rotated by migration 272 and the
+// public route rejects them afterward. Guessing is further slowed by the
 // per-route rate limiter and the per-network lockout on the upload endpoint.
 const UPLOAD_TOKEN_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const UPLOAD_TOKEN_LENGTH = 10;
@@ -114,7 +119,7 @@ function generateUploadTokenCandidate(length = UPLOAD_TOKEN_LENGTH) {
 async function filterOwnedPhotoIds(admin, photoIds) {
   const ids = [...new Set((photoIds || []).map((n) => parseInt(n, 10)).filter(Boolean))];
   if (!ids.length) return [];
-  const photos = await db('photos').whereIn('id', ids).select('id', 'event_id');
+  const photos = await livePhotos(db).whereIn('id', ids).select('id', 'event_id');
   const eventIds = [...new Set(photos.map((p) => p.event_id))];
   if (!eventIds.length) return [];
   const { allowed } = await filterOwnedEventIds(admin, eventIds);
@@ -223,6 +228,7 @@ async function createTransfer(input, admin) {
     graceDays,
     photoIds = [],
     deliveryMethod = 'link',
+    maxFilesPerUpload,
   } = input || {};
 
   // A transfer is one thing or the other (#1544). A send never accepts uploads;
@@ -268,6 +274,10 @@ async function createTransfer(input, admin) {
     // The 64-hex `token` is the request link. The short code stays on as the
     // optional read-aloud alternative, with its own per-network lockout.
     row.upload_token = await generateUniqueUploadToken();
+    // Only written when the request has its own limit, so nothing changes
+    // for a create that does not ask for one (issue 1914).
+    const ownLimit = normalizeMaxFiles(maxFilesPerUpload);
+    if (ownLimit) row.max_files_per_upload = ownLimit;
   }
 
   const [id] = await db('transfers').insert(row).returning('id');
@@ -300,7 +310,7 @@ async function listTransfers({ search = '', admin } = {}) {
 
   // File + upload counts in two grouped queries rather than N+1.
   const fileCounts = ids.length
-    ? await db('transfer_files').whereIn('transfer_id', ids)
+    ? await db('transfer_files').modify(wherePhotoLive, 'transfer_files.photo_id').whereIn('transfer_id', ids)
       .select('transfer_id').count('* as count').groupBy('transfer_id')
     : [];
   const uploadCounts = ids.length
@@ -355,6 +365,9 @@ function serializeTransfer(row) {
     delivery_method: row.delivery_method === 'email' ? 'email' : 'link',
     upload_token: row.upload_token || null,
     upload_expires_at: row.upload_expires_at || null,
+    // Requests only: this request's own files-per-upload limit, or null when
+    // it follows the global default (issue 1914).
+    max_files_per_upload: request ? normalizeMaxFiles(row.max_files_per_upload) : null,
     created_at: row.created_at,
     updated_at: row.updated_at,
     status: computeStatus(row),
@@ -374,7 +387,7 @@ async function getTransfer(id) {
   if (!row) return null;
 
   const files = await db('transfer_files')
-    .join('photos', 'photos.id', 'transfer_files.photo_id')
+    .modify(joinLivePhotos, 'photos.id', 'transfer_files.photo_id')
     .join('events', 'events.id', 'photos.event_id')
     .where('transfer_files.transfer_id', id)
     .orderBy('transfer_files.sort_order', 'asc')
@@ -409,8 +422,14 @@ async function getTransfer(id) {
     .orderBy('id', 'asc')
     .select('id', 'email', 'last_sent_at');
 
+  // What the upload page will be told, so the admin sees the number in force
+  // whether or not this request overrides the default.
+  const effectiveLimit = normalizeKind(row.kind) === KIND_REQUEST
+    ? effectiveMaxFiles(row, await getTransferUploadPolicy()) : null;
+
   return {
     ...serializeTransfer(row),
+    effective_max_files_per_upload: effectiveLimit,
     file_count: files.length + extraFiles.length,
     upload_count: uploads.length,
     extra_files: extraFiles.map((f) => ({
@@ -419,7 +438,10 @@ async function getTransfer(id) {
       size_bytes: f.size_bytes,
       mime_type: f.mime_type,
     })),
-    recipients: recipients.map((r) => ({ id: r.id, email: r.email, last_sent_at: r.last_sent_at || null })),
+    // held: the ready mail waits for a downloadable file (issue 2061).
+    recipients: recipients.map((r) => ({
+      id: r.id, email: r.email, last_sent_at: r.last_sent_at || null, held: r.last_sent_at == null,
+    })),
     files: files.map((f) => ({
       file_id: f.file_id,
       photo_id: f.photo_id,
@@ -463,6 +485,10 @@ async function updateTransfer(id, fields) {
     if (Number.isFinite(days) && days > 0) {
       update.expires_at = new Date(Date.now() + days * DAY_MS);
     }
+  }
+  // null clears the override, so the request follows the global default again.
+  if (fields.maxFilesPerUpload !== undefined && normalizeKind(row.kind) === KIND_REQUEST) {
+    update.max_files_per_upload = normalizeMaxFiles(fields.maxFilesPerUpload);
   }
   if (fields.isActive !== undefined) {
     update.is_active = formatBoolean(!!fields.isActive);
@@ -622,8 +648,8 @@ async function getTransferByUploadToken(uploadToken) {
  * NO thumbnails by design, so we deliberately don't expose any image URLs.
  */
 async function getPublicView(transfer) {
-  const files = await db('transfer_files')
-    .join('photos', 'photos.id', 'transfer_files.photo_id')
+  const files = await wherePhotoProcessed(db('transfer_files')
+    .modify(joinLivePhotos, 'photos.id', 'transfer_files.photo_id'))
     .where('transfer_files.transfer_id', transfer.id)
     .orderBy('transfer_files.sort_order', 'asc')
     .orderBy('transfer_files.id', 'asc')
@@ -742,10 +768,15 @@ async function claimDownload(transfer, { kind = 'all', photoId = null, ip = null
 // ZIP building — cross-event, originals only
 // ---------------------------------------------------------------------------
 
-/** Load the ordered photos for a transfer, each joined to its event. */
+/**
+ * Load the ordered photos for a transfer, each joined to its event. Like every
+ * recipient-facing read here, only photos the background worker has finished:
+ * one still processing (or failed) is left out until it completes, as the
+ * gallery leaves it out of its list and its downloads.
+ */
 async function loadTransferPhotos(transferId) {
-  const rows = await db('transfer_files')
-    .join('photos', 'photos.id', 'transfer_files.photo_id')
+  const rows = await wherePhotoProcessed(db('transfer_files')
+    .modify(joinLivePhotos, 'photos.id', 'transfer_files.photo_id'))
     .join('events', 'events.id', 'photos.event_id')
     .where('transfer_files.transfer_id', transferId)
     .orderBy('transfer_files.sort_order', 'asc')
@@ -771,6 +802,10 @@ async function loadTransferPhotos(transferId) {
 async function streamTransferArchive(transfer, res) {
   const photos = await loadTransferPhotos(transfer.id);
 
+  // Left while the rows were being read: 'close' has fired already and will
+  // not fire again for the listener below (issue 2130).
+  if (res.destroyed) return 0;
+
   const archiveName = `${sanitizeForZipEntry(transfer.title || 'transfer') || 'transfer'}.zip`;
   // A ZIP we built ourselves, so the type is known rather than echoed — but it
   // still carries the same nosniff/sandbox guarantees as every other transfer
@@ -780,11 +815,28 @@ async function streamTransferArchive(transfer, res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Content-Security-Policy', 'default-src \'none\'; sandbox');
 
+  // Reads go through the archive stream guard, as streamUploadsArchive's do:
+  // two open at a time instead of one S3 body per file parked behind
+  // archiver, and a recipient who closes the tab releases what is open
+  // instead of leaving it on a pooled socket (issue 2130).
   const archive = archiver('zip', { zlib: { level: 5 } });
-  archive.on('error', (err) => {
+  let stopped = false;
+  const stop = () => {
+    stopped = true;
+    guard.destroyAll();
+    archive.unpipe(res);
+    try { archive.abort(); } catch (_) { /* already aborted */ }
+    archive.resume();
+  };
+  const fail = (err) => {
+    if (stopped) return;
     logger.error('transferService: archive error', { transferId: transfer.id, error: err.message });
+    stop();
     try { res.destroy(err); } catch (_) { /* noop */ }
-  });
+  };
+  const guard = createArchiveStreamGuard({ onFatalError: fail });
+  archive.on('error', fail);
+  res.on('close', () => { if (!res.writableFinished && !stopped) stop(); });
   archive.pipe(res);
 
   const storage = getStorage();
@@ -794,6 +846,7 @@ async function streamTransferArchive(transfer, res) {
 
   let appended = 0;
   for (let i = 0; i < photos.length; i += 1) {
+    if (stopped) break;
     const photo = photos[i];
     const event = {
       id: photo.event_id,
@@ -818,8 +871,16 @@ async function streamTransferArchive(transfer, res) {
       }
 
       if (storageKey) {
+        if (!await guard.acquire()) break;
         const stream = await storage.get(storageKey);
-        archive.append(stream, { name });
+        // Listen first: the download may have ended during the await, and a
+        // lazy read destroyed unread can still fail to open.
+        stream.on('error', () => {});
+        if (stopped) {
+          stream.destroy();
+          break;
+        }
+        archive.append(guard.track(stream), { name });
       } else {
         archive.file(resolvePhotoFilePath(event, photo), { name });
       }
@@ -836,6 +897,7 @@ async function streamTransferArchive(transfer, res) {
   const extraFiles = await loadTransferExtraFiles(transfer.id);
   const usedNames = new Set();
   for (const extra of extraFiles) {
+    if (stopped) break;
     let base = sanitizeForZipEntry(extra.original_filename) || `file-${extra.id}`;
     if (usedNames.has(base)) base = `${extra.id}-${base}`; // keep same-named uploads apart
     usedNames.add(base);
@@ -843,8 +905,14 @@ async function streamTransferArchive(transfer, res) {
     try {
       const srcStat = storage.kind() === 'local' ? await storage.stat(extra.stored_path) : true;
       if (!srcStat) throw new Error(`Extra file missing in storage: ${extra.stored_path}`);
+      if (!await guard.acquire()) break;
       const stream = await storage.get(extra.stored_path);
-      archive.append(stream, { name });
+      stream.on('error', () => {});
+      if (stopped) {
+        stream.destroy();
+        break;
+      }
+      archive.append(guard.track(stream), { name });
       appended += 1;
     } catch (err) {
       logger.warn('transferService: skipping extra file in transfer archive', {
@@ -853,11 +921,166 @@ async function streamTransferArchive(transfer, res) {
     }
   }
 
-  await archive.finalize();
+  if (stopped) return appended;
+  // finalize() settles on the archive's end or error, and an aborted archive
+  // may emit neither; the response closing ends the wait too.
+  const finalized = archive.finalize();
+  finalized.catch(() => {}); // reported through fail()
+  await Promise.race([finalized, new Promise((resolve) => res.once('close', resolve))]);
+  return appended;
+}
+
+// Windows also ignores spaces before the extension here, and counts the
+// superscript digits as device numbers.
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])\s*(\.|$)/i;
+
+// The longest file name common file systems accept, in bytes.
+const MAX_FILENAME_BYTES = 255;
+
+/**
+ * `prefix` + `name`, shortened to fit a file name: a name that is already at
+ * the limit would otherwise leave the ZIP with an entry that cannot be
+ * unpacked (ENAMETOOLONG). The stem gives way, whole characters at a time,
+ * and the extension stays.
+ */
+function prefixedZipName(prefix, name) {
+  if (Buffer.byteLength(prefix + name) <= MAX_FILENAME_BYTES) return prefix + name;
+  const ext = path.extname(name);
+  const extension = Buffer.byteLength(ext) <= 32 ? ext : '';
+  const stem = Array.from(name.slice(0, name.length - extension.length));
+  while (stem.length > 1 && Buffer.byteLength(prefix + stem.join('') + extension) > MAX_FILENAME_BYTES) stem.pop();
+  // Cutting can leave a dot or space at the end, which Windows drops again.
+  return (prefix + stem.join('') + extension).replace(/[. ]+$/, '');
+}
+
+/**
+ * Stream a ZIP of everything a client sent through a file request to `res`
+ * (issue 1914): every upload round, oldest first, under the name the client
+ * gave each file. A name already taken gets the upload's id in front, and a
+ * counter if even that is taken. Names are compared the way a case-insensitive,
+ * normalising file system (macOS, Windows) would see them, so the archive
+ * unpacks intact there too: "a.JPG" and "A.jpg" clash, and so do the composed
+ * and decomposed spellings of "Müller.jpg".
+ *
+ * The bytes are stored exactly as received and are not opened here either.
+ *
+ * Reads go through the archive stream guard: two open at a time rather than
+ * one per file, a source that fails while still queued ends the download
+ * instead of the process, and a cancelled download releases what it holds.
+ *
+ * Returns the number of files appended.
+ */
+async function streamUploadsArchive(transfer, res) {
+  const uploads = await db('transfer_uploads')
+    .where('transfer_id', transfer.id)
+    .orderBy('uploaded_at', 'asc')
+    .orderBy('id', 'asc')
+    .select('id', 'original_filename', 'stored_path');
+
+  // Cancelled while the rows were being read: 'close' has fired already and
+  // will not fire again for the listener below, so nothing would ever release
+  // the reads opened from here on.
+  if (res.destroyed) return 0;
+
+  const archiveName = `${sanitizeForZipEntry(transfer.title || 'uploads') || 'uploads'}.zip`;
+  // Same guarantees as streamTransferArchive: a known type, nosniff, sandbox.
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', buildContentDisposition(archiveName));
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Security-Policy', 'default-src \'none\'; sandbox');
+
+  const archive = archiver('zip', { zlib: { level: 5 } });
+  let stopped = false;
+  // Every way out releases the open reads; abort() throws if archiver has
+  // already torn itself down.
+  const stop = () => {
+    stopped = true;
+    guard.destroyAll();
+    archive.unpipe(res);
+    try { archive.abort(); } catch (_) { /* already aborted */ }
+    // Keep the aborted archive flowing, or the entry it was compressing
+    // never ends and its file stays open (as the gallery ZIP routes do).
+    archive.resume();
+  };
+  const fail = (err) => {
+    if (stopped) return;
+    logger.error('transferService: uploads archive error', { transferId: transfer.id, error: err.message });
+    stop();
+    try { res.destroy(err); } catch (_) { /* noop */ }
+  };
+  const guard = createArchiveStreamGuard({ onFatalError: fail });
+  archive.on('error', fail);
+  // The admin cancelled the download: nothing reads the archive any more.
+  res.on('close', () => { if (!res.writableFinished && !stopped) stop(); });
+  archive.pipe(res);
+
+  const storage = getStorage();
+  const usedNames = new Set();
+  let appended = 0;
+  for (const upload of uploads) {
+    // As it will exist once unpacked: Windows drops trailing dots and spaces
+    // ("report.pdf." lands on "report.pdf"), and no file system takes a name
+    // over the byte limit, duplicate or not.
+    let cleaned = sanitizeForZipEntry(upload.original_filename).replace(/[. ]+$/, '');
+    // Device names to Windows whatever the extension: such an entry cannot be
+    // unpacked there.
+    if (WINDOWS_RESERVED_NAME.test(cleaned)) cleaned = `_${cleaned}`;
+    const base = prefixedZipName('', cleaned || `file-${upload.id}`);
+    // Upper- then lower-cased, which folds the letters a plain lowercase
+    // keeps apart ("σ" and final "ς", "ß" and "ss") the way a
+    // case-insensitive file system does.
+    const seenAs = (candidate) => candidate.normalize('NFC').toUpperCase().toLowerCase();
+    let name = base;
+    for (let attempt = 1; usedNames.has(seenAs(name)); attempt += 1) {
+      name = prefixedZipName(attempt === 1 ? `${upload.id}-` : `${upload.id}-${attempt}-`, base);
+    }
+    usedNames.add(seenAs(name));
+    if (!await guard.acquire()) break;
+    try {
+      const srcStat = storage.kind() === 'local' ? await storage.stat(upload.stored_path) : true;
+      if (!srcStat) throw new Error(`Upload missing in storage: ${upload.stored_path}`);
+      const source = await storage.get(upload.stored_path);
+      // The download may have ended during either await. The guard destroys
+      // a source handed to it after that without listening to it, and a lazy
+      // read that then fails to open (the file was deleted meanwhile) would
+      // be an error nobody handles. So: listen first, then stop here.
+      source.on('error', () => {});
+      if (stopped) {
+        source.destroy();
+        break;
+      }
+      archive.append(guard.track(source), { name });
+      appended += 1;
+    } catch (err) {
+      logger.warn('transferService: skipping upload in uploads archive', {
+        transferId: transfer.id, uploadId: upload.id, error: err.message,
+      });
+    }
+  }
+
+  if (stopped) return appended;
+  // finalize() settles on the archive's end or error, and an aborted archive
+  // may emit neither; the response closing ends the wait too.
+  const finalized = archive.finalize();
+  finalized.catch(() => {}); // reported through fail()
+  await Promise.race([finalized, new Promise((resolve) => res.once('close', resolve))]);
   return appended;
 }
 
 /** Load the admin-uploaded deliverable files for a transfer, in order. */
+/**
+ * How many files the recipient can download right now: finished photos (the
+ * set getPublicView lists and the ZIP holds) plus admin-uploaded files.
+ */
+async function countRecipientFiles(transferId) {
+  const photoRow = await wherePhotoProcessed(db('transfer_files')
+    .modify(joinLivePhotos, 'photos.id', 'transfer_files.photo_id'))
+    .where('transfer_files.transfer_id', transferId)
+    .count('* as c').first();
+  const extraRow = await db('transfer_extra_files').where('transfer_id', transferId).count('* as c').first();
+  return (Number(photoRow?.c) || 0) + (Number(extraRow?.c) || 0);
+}
+
 async function loadTransferExtraFiles(transferId) {
   return db('transfer_extra_files')
     .where('transfer_id', transferId)
@@ -904,8 +1127,8 @@ async function streamTransferFile(transfer, rawFileId, res, { beforeStream = nul
     return streamTransferExtraFile(transfer, numId, res, { beforeStream });
   }
 
-  const row = await db('transfer_files')
-    .join('photos', 'photos.id', 'transfer_files.photo_id')
+  const row = await wherePhotoProcessed(db('transfer_files')
+    .modify(joinLivePhotos, 'photos.id', 'transfer_files.photo_id'))
     .join('events', 'events.id', 'photos.event_id')
     .where('transfer_files.transfer_id', transfer.id)
     .where('transfer_files.id', numId)
@@ -1052,6 +1275,10 @@ async function removeExtraFiles(transferId) {
  * Email the download link to one or more recipients and record them. Sending is
  * best-effort per address (a bad SMTP config must not fail the whole create);
  * `sendTemplateEmail` is required lazily to avoid a service-load cycle.
+ *
+ * While nothing is downloadable yet (every photo still processing, issue 2061)
+ * no "ready" mail goes out: the recipients are recorded with no last_sent_at,
+ * and sendHeldReadyEmails sends to them once the transfer has a file.
  */
 async function sendTransferEmails(transferId, emails) {
   const clean = [...new Set((emails || [])
@@ -1062,42 +1289,135 @@ async function sendTransferEmails(transferId, emails) {
   const transfer = await db('transfers').where({ id: transferId }).first();
   if (!transfer) return { sent: 0, recipients: [] };
 
-  const fileCountRow = await db('transfer_files').where('transfer_id', transferId).count('* as c').first();
-  const extraCountRow = await db('transfer_extra_files').where('transfer_id', transferId).count('* as c').first();
-  const fileCount = (Number(fileCountRow?.c) || 0) + (Number(extraCountRow?.c) || 0);
+  // Read before the count: a held row that a finishing photo claims (and
+  // mails) after the count must not be put back on hold below, or it is
+  // claimed and mailed a second time.
+  const before = await db('transfer_recipients')
+    .where({ transfer_id: transferId }).whereIn('email', clean)
+    .select('id', 'email', 'last_sent_at');
+  const fileCount = await countRecipientFiles(transferId);
 
-  const { sendTemplateEmail } = require('./emailProcessor');
-  const downloadUrl = `${await getFrontendUrl()}/transfer/${transfer.token}`;
-  const vars = {
-    transfer_title: transfer.title || `Transfer #${transferId}`,
-    message: transfer.message || '',
-    download_url: downloadUrl,
-    file_count: String(fileCount),
-    expiry_date: isoDateOrEmpty(transfer.expires_at),
-  };
+  if (fileCount === 0) {
+    for (const email of clean) {
+      const existing = before.find((r) => r.email === email);
+      if (existing) {
+        if (existing.last_sent_at != null) {
+          await db('transfer_recipients').where({ id: existing.id }).whereNotNull('last_sent_at')
+            .update({ last_sent_at: null });
+        }
+      } else {
+        await db('transfer_recipients').insert({
+          transfer_id: transferId, email, created_at: new Date(), last_sent_at: null,
+        });
+      }
+    }
+    // A photo that finished between the count above and these rows found
+    // nothing held, so ask once more.
+    const late = await sendHeldReadyEmails(transferId);
+    return { sent: late.sent, recipients: clean, held: late.sent === 0 };
+  }
 
+  const vars = await readyEmailVars(transfer, fileCount);
   let sent = 0;
   for (const email of clean) {
-    try {
-      await sendTemplateEmail(email, 'transfer_ready', vars);
-      sent += 1;
-    } catch (err) {
-      logger.warn('transferService: failed to send transfer_ready email', {
-        transferId, email, error: err.message,
-      });
-    }
     // Record the recipient regardless of delivery so the detail panel shows who
     // it was addressed to (and a future resend has the list).
-    const existing = await db('transfer_recipients').where({ transfer_id: transferId, email }).first();
-    if (existing) {
+    // Decided from the snapshot read before the count, not a fresh read: a
+    // held row a finishing photo claims meanwhile would otherwise look sent
+    // and be mailed again here.
+    const existing = before.find((r) => r.email === email);
+    if (existing && existing.last_sent_at == null) {
+      // Held: claimed like sendHeldReadyEmails does, so a photo finishing
+      // meanwhile does not mail it too. Lost means it is being sent already.
+      const claimed = await db('transfer_recipients').where({ id: existing.id }).whereNull('last_sent_at')
+        .update({ last_sent_at: new Date() });
+      if (claimed !== 1) continue;
+    } else if (existing) {
       await db('transfer_recipients').where({ id: existing.id }).update({ last_sent_at: new Date() });
     } else {
       await db('transfer_recipients').insert({
         transfer_id: transferId, email, created_at: new Date(), last_sent_at: new Date(),
       });
     }
+    if (await sendReadyEmail(transferId, email, vars)) sent += 1;
   }
   return { sent, recipients: clean };
+}
+
+async function readyEmailVars(transfer, fileCount) {
+  return {
+    transfer_title: transfer.title || `Transfer #${transfer.id}`,
+    message: transfer.message || '',
+    download_url: `${await getFrontendUrl()}/transfer/${transfer.token}`,
+    file_count: String(fileCount),
+    expiry_date: isoDateOrEmpty(transfer.expires_at),
+  };
+}
+
+/** One transfer_ready mail; false (logged) when it could not be sent. */
+async function sendReadyEmail(transferId, email, vars) {
+  const { sendTemplateEmail } = require('./emailProcessor');
+  try {
+    await sendTemplateEmail(email, 'transfer_ready', vars);
+    return true;
+  } catch (err) {
+    logger.warn('transferService: failed to send transfer_ready email', {
+      transferId, email, error: err.message,
+    });
+    return false;
+  }
+}
+
+/**
+ * Send the ready mail held back by sendTransferEmails, once the transfer has
+ * something to download. Each held recipient is claimed by turning its NULL
+ * last_sent_at into a time in one guarded UPDATE, so only one caller (worker,
+ * replica, request) sends it, and only once.
+ */
+async function sendHeldReadyEmails(transferId) {
+  const transfer = await db('transfers').where({ id: transferId }).first();
+  // A link that was disabled or ran out meanwhile announces nothing; the admin
+  // can still send again from the detail panel.
+  if (!assertDownloadable(transfer).ok) return { sent: 0 };
+  const fileCount = await countRecipientFiles(transferId);
+  if (fileCount === 0) return { sent: 0 };
+  const held = await db('transfer_recipients')
+    .where({ transfer_id: transferId }).whereNull('last_sent_at')
+    .orderBy('id', 'asc').select('id', 'email');
+  if (!held.length) return { sent: 0 };
+
+  const vars = await readyEmailVars(transfer, fileCount);
+  let sent = 0;
+  for (const recipient of held) {
+    const claimed = await db('transfer_recipients')
+      .where({ id: recipient.id }).whereNull('last_sent_at')
+      .update({ last_sent_at: new Date() });
+    if (claimed !== 1) continue;
+    if (await sendReadyEmail(transferId, recipient.email, vars)) sent += 1;
+  }
+  return { sent };
+}
+
+/**
+ * Photos became downloadable (the background worker finished them, or they
+ * came back from the trash): send any ready mail that was held back for a
+ * transfer holding one. Driven from the held recipients, which are few,
+ * rather than from transfer_files, which has no photo_id index.
+ */
+function sendHeldReadyEmailsForPhotos(photoIds) {
+  // Tracked so shutdown and a coordinated restore wait for a send the photo
+  // worker did not wait for.
+  return applicationWork.track('transfer ready email', () => sendHeldReadyEmailsForPhotosInternal(photoIds));
+}
+
+async function sendHeldReadyEmailsForPhotosInternal(photoIds) {
+  if (!photoIds.length) return;
+  const rows = await db('transfer_recipients')
+    .join('transfer_files', 'transfer_files.transfer_id', 'transfer_recipients.transfer_id')
+    .whereNull('transfer_recipients.last_sent_at')
+    .whereIn('transfer_files.photo_id', photoIds)
+    .distinct('transfer_recipients.transfer_id as transfer_id');
+  for (const row of rows) await sendHeldReadyEmails(row.transfer_id);
 }
 
 /**
@@ -1154,7 +1474,11 @@ async function sendTransferRequestEmails(transferId, emails) {
  * Best-effort throughout — a client's upload has already succeeded by the time
  * this runs and must not be failed by a mail problem.
  */
-async function notifyFilesReceived(transferId, receivedCount) {
+function notifyFilesReceived(transferId, receivedCount) {
+  return applicationWork.track('transfer upload notification', () => notifyFilesReceivedInternal(transferId, receivedCount));
+}
+
+async function notifyFilesReceivedInternal(transferId, receivedCount) {
   try {
     const transfer = await db('transfers').where({ id: transferId }).first();
     if (!transfer || !isRequestRow(transfer)) return;
@@ -1245,8 +1569,8 @@ function assertUploadable(transfer) {
 }
 
 /** Record a client-uploaded file (bytes already written by the route/multer). */
-async function addUpload(transferId, { originalFilename, storedPath, sizeBytes, mimeType, ip }) {
-  const [id] = await db('transfer_uploads').insert({
+async function addUpload(transferId, { originalFilename, storedPath, sizeBytes, mimeType, ip }, conn = db) {
+  const [id] = await conn('transfer_uploads').insert({
     transfer_id: transferId,
     original_filename: truncateSafely(originalFilename || 'file', 512),
     stored_path: storedPath,
@@ -1256,7 +1580,7 @@ async function addUpload(transferId, { originalFilename, storedPath, sizeBytes, 
     uploader_ip: ip || null,
     uploaded_at: new Date(),
   }).returning('id');
-  await db('transfers').where({ id: transferId }).update({ updated_at: new Date() });
+  await conn('transfers').where({ id: transferId }).update({ updated_at: new Date() });
   return typeof id === 'object' && id !== null ? id.id : id;
 }
 
@@ -1373,6 +1697,8 @@ module.exports = {
   enableUploadCode,
   disableUploadCode,
   sendTransferEmails,
+  sendHeldReadyEmails,
+  sendHeldReadyEmailsForPhotos,
   sendTransferRequestEmails,
   notifyFilesReceived,
   // public
@@ -1383,7 +1709,9 @@ module.exports = {
   getPublicView,
   assertDownloadable,
   claimDownload,
+  countRecipientFiles,
   streamTransferArchive,
+  streamUploadsArchive,
   streamTransferFile,
   streamTransferExtraFile,
   // uploads

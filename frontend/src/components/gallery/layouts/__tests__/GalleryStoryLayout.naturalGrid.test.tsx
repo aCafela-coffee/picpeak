@@ -14,7 +14,7 @@ import { GalleryStoryLayout } from '../GalleryStoryLayout';
 import type { Photo } from '../../../../types';
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
+  useTranslation: () => ({ i18n: { language: 'en', changeLanguage: vi.fn() },
     t: (key: string, fallback?: unknown) => (typeof fallback === 'string' ? fallback : key),
   }),
 }));
@@ -213,7 +213,7 @@ describe('GalleryStoryLayout natural grid (issue 1709)', () => {
   });
 
   it('keeps favourites, lightbox links and lazy placeholders on every card', () => {
-    const { container } = render(<GalleryStoryLayout {...props} storyGridMode="natural" />);
+    const { container } = render(<GalleryStoryLayout {...props} storyGridMode="natural" feedbackEnabled />);
     expect(container.querySelectorAll('.story-gallery-justified-box .story-photo-card')).toHaveLength(6);
     expect(container.querySelectorAll('.story-gallery-justified-box a[data-pswp-src]')).toHaveLength(6);
     expect(container.querySelectorAll('.story-gallery-justified-box .story-photo-card-btn')).toHaveLength(6);

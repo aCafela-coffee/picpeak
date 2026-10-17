@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { useGuardedLinkClick, useLeaveGuard } from '../../contexts/UnsavedChangesContext';
 import {
@@ -41,6 +41,8 @@ import { useClientsNavItems } from './ClientsLayout';
 import { useAccountingNavItems } from './AccountingLayout';
 import { useSharingNavItems, SHARING_PATHS } from './sharingNav';
 import { useAutomationNavItems } from './AutomationLayout';
+import { isImeComposing } from '../../utils/imeComposition';
+import { useFocusTrap } from '../../hooks/useFocusTrap';
 
 // A section that takes over the sidebar while the admin is inside it:
 // the main menu is replaced by the section's own navigation, with a
@@ -248,6 +250,8 @@ export function navItemAllowed(
   return true;
 }
 
+const DRAWER_QUERY = '(max-width: 1023.98px)';
+
 export const AdminSidebar: React.FC<AdminSidebarProps> = ({ isOpen, onClose, collapsed = false, onToggleCollapse }) => {
   const location = useLocation();
   const navigate = useNavigate();
@@ -259,6 +263,41 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({ isOpen, onClose, col
     guardedLinkClick(e, href, { replace, after });
   const { t } = useTranslation();
   const { hasPermission, isLoading: permissionsLoading } = usePermissions();
+
+  // Below lg the sidebar is a drawer: translated off screen while closed, so
+  // it must also leave the tab order and the accessibility tree (inert), and
+  // an open one holds focus like a dialog. On lg+ it is always on screen.
+  const [isDrawer, setIsDrawer] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia(DRAWER_QUERY).matches
+      : false
+  );
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
+    const mql = window.matchMedia(DRAWER_QUERY);
+    const onChange = () => setIsDrawer(mql.matches);
+    onChange();
+    mql.addEventListener?.('change', onChange);
+    return () => mql.removeEventListener?.('change', onChange);
+  }, []);
+  const drawerRef = useFocusTrap(isDrawer && isOpen, { containFocus: true });
+  // The hamburger that opened the drawer gets focus back when it closes; the
+  // closed drawer is inert, so focus left inside would drop to the body.
+  const openerRef = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!isDrawer) return;
+    if (isOpen) {
+      // Only focus outside the drawer is an opener. Re-entering drawer mode
+      // with the drawer still open (lg and back) finds focus inside it and
+      // keeps the opener recorded when it was opened.
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && !drawerRef.current?.contains(active)) openerRef.current = active;
+      return;
+    }
+    if (drawerRef.current?.contains(document.activeElement)) {
+      openerRef.current?.focus();
+    }
+  }, [isDrawer, isOpen, drawerRef]);
   const { flags } = useFeatureFlags();
   // Branding lookup for the "logo_position = sidepanel" mode — when
   // chosen, the logo replaces the "PicPeak Admin" text in the brand
@@ -470,11 +509,15 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({ isOpen, onClose, col
   const iconClass = (isActive: boolean) => `w-5 h-5 flex-shrink-0 ${
     collapsed ? 'mr-3 lg:mr-0' : 'mr-3'
   } ${
-    isActive ? 'text-white' : 'text-neutral-400'
+    isActive ? 'text-white' : 'text-faint'
   }`;
 
   return (
     <div
+      ref={drawerRef}
+      // Closed drawer: out of the tab order and the accessibility tree
+      // (issue 2074). Spread, as React 18 does not know `inert` as a prop.
+      {...(isDrawer && !isOpen ? { inert: '' } : {})}
       // Right edge drawn via box-shadow rather than `border-r` so the
       // brand row's `border-b` can extend to the sidebar's full width
       // and meet the header's `border-b` cleanly at the L-junction. A
@@ -553,7 +596,7 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({ isOpen, onClose, col
           <button
             onClick={onClose}
             className="lg:hidden px-6 text-faint hover:text-body"
-            aria-label="Close sidebar"
+            aria-label={t('navigation.closeMenu', 'Close menu')}
           >
             <X className="w-6 h-6" />
           </button>
@@ -594,13 +637,15 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({ isOpen, onClose, col
             {searchable && (
               <div className="px-4 py-2">
                 <div className="relative">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400 pointer-events-none" />
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-faint pointer-events-none" />
                   <input
                     ref={searchRef}
                     type="search"
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
                     onKeyDown={(e) => {
+                      // Escape and Enter of an IME composition are the field's.
+                      if (isImeComposing(e)) return;
                       if (e.key === 'Escape') { setQuery(''); return; }
                       // Enter goes to the best match, so a filter that has
                       // narrowed to one result doesn't still need the mouse.
@@ -620,7 +665,7 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({ isOpen, onClose, col
                     }}
                     placeholder={t('settings.search.placeholder', 'Search settings…')}
                     aria-label={t('settings.search.label', 'Search settings')}
-                    className="w-full pl-9 pr-3 py-1.5 text-sm rounded-lg bg-subtle text-heading placeholder:text-muted border border-transparent focus:bg-panel focus:border-line-strong focus:outline-none focus:ring-2 focus:ring-primary-500"
+                    className="w-full pl-9 pr-3 py-1.5 text-sm rounded-lg bg-subtle text-heading placeholder:text-muted border border-transparent focus:bg-panel focus:border-line-strong focus:outline-none focus:ring-2 focus:ring-accent"
                   />
                 </div>
               </div>
@@ -737,7 +782,7 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({ isOpen, onClose, col
             <button
               type="button"
               onClick={onToggleCollapse}
-              className="inline-flex items-center justify-center w-9 h-9 rounded-md text-neutral-500 hover:text-heading hover:bg-hover-soft transition-colors"
+              className="inline-flex items-center justify-center w-9 h-9 rounded-md text-muted hover:text-heading hover:bg-hover-soft transition-colors"
               aria-label={collapsed ? t('admin.expandSidebar', 'Expand sidebar') : t('admin.collapseSidebar', 'Collapse sidebar')}
               title={collapsed ? t('admin.expandSidebar', 'Expand sidebar') : t('admin.collapseSidebar', 'Collapse sidebar')}
             >
@@ -810,9 +855,9 @@ const StorageInfo: React.FC = () => {
     ? Math.round((storageInfo.total_used / limitInUse) * 100)
     : 0;
   const isOverSoftLimit = limitInUse && storageInfo.total_used >= limitInUse;
-  const progressBarClass = isOverSoftLimit ? 'bg-red-600' : 'bg-accent-dark';
+  const progressBarClass = isOverSoftLimit ? 'bg-danger' : 'bg-accent-dark';
   const containerClass = isOverSoftLimit
-    ? 'bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800'
+    ? 'bg-danger-soft border border-danger-line'
     : 'bg-subtle';
   const softLimitDisplay = settingsService.formatBytes(limitInUse);
 

@@ -8,8 +8,11 @@ const fs = require('fs').promises;
 const path = require('path');
 const logger = require('../utils/logger');
 const { buildShareLinkVariants } = require('./shareLinkService');
+const { galleryLinkFor } = require('./galleryNotificationService');
 const { queueEmail } = require('./emailProcessor');
 const { getStorage } = require('./storage');
+const { findSlugHolder } = require('./slugRedirects');
+const { slugify } = require('../utils/slug');
 
 /**
  * Run `fn` over `items` with at most `limit` in flight. On the first failure
@@ -42,6 +45,13 @@ function isNotFound(err) {
     || err.$metadata?.httpStatusCode === 404;
 }
 
+// Galleries this process is renaming right now. The archive claim is the lock
+// for both jobs, so a refused claim alone cannot say which one holds it.
+const renamingIds = new Set();
+const busyMessage = (eventId) => (renamingIds.has(eventId)
+  ? 'This gallery is already being renamed'
+  : 'Cannot rename a gallery while it is being archived or renamed');
+
 class EventRenameService {
   constructor() {
     this.storagePath = process.env.STORAGE_PATH || path.join(__dirname, '../../../storage');
@@ -70,11 +80,10 @@ class EventRenameService {
    * @returns {string} Generated slug
    */
   generateSlug(eventType, eventName, eventDate) {
-    const processedEventName = eventName
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, '-')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '');
+    // The shared slugify, as event creation uses: accents are stripped, so
+    // NFC and NFD (macOS) input give the same slug ("Jörg" → "jorg"). ASCII
+    // names slug exactly as before; existing slugs are not touched.
+    const processedEventName = slugify(eventName);
     const formattedDate = this.formatDate(eventDate);
     return `${eventType}-${processedEventName}-${formattedDate}`;
   }
@@ -86,6 +95,8 @@ class EventRenameService {
    * @returns {Promise<{valid: boolean, error?: string, newSlug?: string}>}
    */
   async validateRename(eventId, newEventName) {
+    // NFC, like every other stored name: macOS input arrives decomposed.
+    if (typeof newEventName === 'string') newEventName = newEventName.normalize('NFC');
     try {
       // Get current event
       const event = await db('events').where({ id: eventId }).first();
@@ -95,6 +106,10 @@ class EventRenameService {
 
       if (event.is_archived) {
         return { valid: false, error: 'Cannot rename archived events' };
+      }
+      // The archive job reads the photos under the current slug (issue 2012).
+      if (await require('./archiveService').isArchiveRunning(eventId)) {
+        return { valid: false, conflict: true, error: busyMessage(eventId) };
       }
 
       // Validate new name
@@ -109,11 +124,9 @@ class EventRenameService {
       // Generate new slug
       const newSlug = this.generateSlug(event.event_type, newEventName.trim(), event.event_date);
 
-      // Check if slug already exists (for different event)
-      const existingEvent = await db('events')
-        .where({ slug: newSlug })
-        .whereNot({ id: eventId })
-        .first();
+      // Check if slug already exists (for different event). Another
+      // gallery's old slug counts: its links still lead to that gallery.
+      const existingEvent = await findSlugHolder(newSlug, { exceptEventId: eventId });
 
       if (existingEvent) {
         return { valid: false, error: 'An event with this name already exists for the same date', conflicts: [existingEvent.event_name] };
@@ -359,10 +372,12 @@ class EventRenameService {
       .first();
 
     if (existingRedirect) {
-      // Update existing redirect
+      // Update existing redirect. The row may have been written for a gallery
+      // that held this slug before; it belongs to this one now, so a delete of
+      // that other gallery must not cascade it away.
       await trx('slug_redirects')
         .where({ old_slug: oldSlug })
-        .update({ new_slug: newSlug });
+        .update({ new_slug: newSlug, event_id: eventId });
     } else {
       // Create new redirect
       await trx('slug_redirects').insert({
@@ -372,10 +387,19 @@ class EventRenameService {
       });
     }
 
-    // Also update any existing redirects pointing to the old slug
+    // Also update any existing redirects pointing to the old slug. Their
+    // event_id stays: these rows are this gallery's own, or (SQLite, no
+    // foreign keys) a deleted gallery's that must not become this one's.
     await trx('slug_redirects')
       .where({ new_slug: oldSlug })
       .update({ new_slug: newSlug });
+
+    // Renamed back to an earlier name: the chain update above turned that
+    // name's redirect into one pointing at itself. Only that row goes; a
+    // redirect from this slug to another gallery is that gallery's to keep.
+    await trx('slug_redirects')
+      .where({ old_slug: newSlug, new_slug: newSlug })
+      .del();
   }
 
   /**
@@ -396,7 +420,7 @@ class EventRenameService {
     await queueEmail(eventId, recipientEmail, 'gallery_link_updated', {
       customer_name: recipientName,
       event_name: event.event_name,
-      new_gallery_link: newShareLink,
+      new_gallery_link: await galleryLinkFor(event, recipientEmail, newShareLink),
       event_date: event.event_date
     });
   }
@@ -440,17 +464,34 @@ class EventRenameService {
    * @returns {Promise<{success: boolean, data?: object, error?: string}>}
    */
   async renameEvent(eventId, newEventName, resendEmail = false, adminUser = null) {
+    if (typeof newEventName === 'string') newEventName = newEventName.normalize('NFC');
     const backupData = {};
+    let lease = null;
+    let tracked = false;
 
     try {
       // 1. Validate
       const validation = await this.validateRename(eventId, newEventName);
       if (!validation.valid) {
-        return { success: false, error: validation.error };
+        return { success: false, error: validation.error, ...(validation.conflict && { conflict: true }) };
       }
 
-      // 2. Get current event data
+      // The archive job reads the photos under the current slug (issue 2012).
+      // Holding the gallery's archive claim through the move keeps one from
+      // starting halfway and zipping an emptied prefix.
+      lease = await require('./archiveService').claimArchive(eventId);
+      if (!lease) {
+        return { success: false, conflict: true, error: busyMessage(eventId) };
+      }
+      renamingIds.add(eventId);
+      tracked = true;
+
+      // 2. Get current event data, under the claim: an archive that finished
+      // after the validation above has moved the photos on.
       const event = await db('events').where({ id: eventId }).first();
+      if (!event || event.is_archived) {
+        return { success: false, error: 'Cannot rename archived events' };
+      }
       backupData.event = event;
       backupData.newSlug = validation.newSlug;
 
@@ -464,6 +505,16 @@ class EventRenameService {
         slug: newSlug,
         shareToken: event.share_token
       });
+
+      // A restore before per-run archive keys left its zip at the shared key
+      // of the old slug (issue 2012); after the rename nothing would find it
+      // there. Read before the transaction, which takes SQLite's only
+      // connection, and recorded inside it.
+      const archiveService = require('./archiveService');
+      const legacyZips = [];
+      for (const key of await archiveService.legacyArchiveKeys(event).catch(() => [])) {
+        if (await getStorage().exists(key).catch(() => false)) legacyZips.push(key);
+      }
 
       // 3. Start transaction
       const trx = await db.transaction();
@@ -481,7 +532,17 @@ class EventRenameService {
           backupData.folderRenamed = true;
         }
 
-        // 5. Rename photo files and update paths
+        // 5. The event row before the photos on PostgreSQL (issue 2108). The
+        // slug update below needs it FOR UPDATE, and a face scan, a tag
+        // commit or a trash restore takes it before the photo; held only
+        // from the photo rewrite on, each could hold its photo's event and
+        // wait for the photo while this waited for the event. After the
+        // object move, so a slow S3 copy does not hold up the gallery.
+        if (trx.client.config.client === 'pg') {
+          await trx('events').where({ id: eventId }).forUpdate().first('id');
+        }
+
+        // Rename photo files and update paths
         const filesRenamed = await this.renamePhotoFiles(eventId, oldName, newEventName.trim(), oldSlug, newSlug, trx);
 
         // 6. Update database records
@@ -506,6 +567,8 @@ class EventRenameService {
           }),
           event_id: eventId
         });
+
+        for (const key of legacyZips) await archiveService.recordSupersededArchive(lease, key, trx);
 
         // 9. Commit transaction
         await trx.commit();
@@ -551,7 +614,15 @@ class EventRenameService {
     } catch (error) {
       logger.error('Event rename failed', { eventId, error: error.message });
       await this.rollbackRename(backupData);
-      return { success: false, error: error.message || 'Failed to rename event' };
+      // A claim taken over mid-rename (recordSupersededArchive) is a 409 too.
+      return {
+        success: false,
+        error: error.message || 'Failed to rename event',
+        ...(error.statusCode === 409 ? { conflict: true } : {}),
+      };
+    } finally {
+      if (tracked) renamingIds.delete(eventId);
+      if (lease) await lease.release();
     }
   }
 }

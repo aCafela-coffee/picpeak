@@ -1,4 +1,8 @@
 import { api } from '../config/api';
+import { explainFeedbackLock } from '../utils/feedbackLock';
+import { FEEDBACK_SUBMITTED_EVENT, namedIdentity } from '../utils/feedbackEvents';
+import type { FeedbackSubmittedDetail } from '../utils/feedbackEvents';
+import type { PhotoAnnotation } from '../utils/photoAnnotation';
 
 export type IdentityMode = 'simple' | 'guest' | 'shared';
 
@@ -12,6 +16,13 @@ export type ReactionEmoji = (typeof REACTION_EMOJIS)[number];
 // Mirrored in backend/src/constants/colorLabels.js — update both together.
 export const COLOR_LABELS = ['red', 'yellow', 'green', 'blue', 'purple'] as const;
 export type ColorLabel = (typeof COLOR_LABELS)[number];
+
+// Approve / reject per photo (issue 744). Mirrored in
+// backend/src/constants/photoDecisions.js — update both together.
+export const PHOTO_DECISIONS = ['approved', 'rejected'] as const;
+export type PhotoDecision = (typeof PHOTO_DECISIONS)[number];
+/** Longest reason a guest can give for a decision (DECISION_REASON_MAX_LENGTH). */
+export const DECISION_REASON_MAX_LENGTH = 500;
 
 /** Which lightbox keyboard scheme a gallery uses. */
 export type KeybindMode = 'colors' | 'lightroom';
@@ -64,6 +75,12 @@ export interface FeedbackSettings {
   allow_favorites: boolean;
   allow_reactions: boolean;
   allow_color_labels: boolean;
+  /** Approve / reject per photo (issue 744). Off unless switched on. */
+  allow_decisions?: boolean;
+  /** "Finish selection" for guests (issue 1733). Off unless switched on. */
+  allow_selection_submit?: boolean;
+  /** Drawing on a photo with a comment (issue 1733). Off unless switched on. */
+  allow_annotations?: boolean;
   /** Which lightbox shortcut scheme this gallery uses (#1044). */
   keybind_mode?: KeybindMode;
   require_name_email: boolean;
@@ -83,12 +100,19 @@ export interface PhotoFeedback {
   id: number;
   photo_id: number;
   event_id: number;
-  feedback_type: 'rating' | 'like' | 'comment' | 'favorite' | 'reaction' | 'color_label';
+  feedback_type: 'rating' | 'like' | 'comment' | 'favorite' | 'reaction' | 'color_label' | 'decision';
   rating?: number;
   comment_text?: string;
   comment?: string;
   reaction?: string;
   color_label?: ColorLabel | null;
+  /** On decision rows (issue 744); the reason is in comment_text. */
+  decision?: PhotoDecision | null;
+  /**
+   * The drawing on a comment (issue 1733). Typed unknown on purpose: it is
+   * only ever drawn after parseAnnotation (utils/photoAnnotation.ts).
+   */
+  annotation?: unknown;
   guest_name?: string;
   guest_email?: string;
   is_approved: boolean;
@@ -108,6 +132,8 @@ export interface FeedbackSummary {
   favorite_count: number;
   reaction_count?: number;
   color_label_count?: number;
+  approved_count?: number;
+  rejected_count?: number;
   comment_count: number;
 }
 
@@ -117,6 +143,9 @@ export interface MyFeedback {
   favorited: boolean;
   reaction?: string | null;
   color_label?: ColorLabel | null;
+  /** The viewer's approve / reject (issue 744) and the reason they gave. */
+  decision?: PhotoDecision | null;
+  decision_reason?: string | null;
 }
 
 export interface FeedbackResponse {
@@ -134,6 +163,60 @@ export interface FeedbackResponse {
   };
 }
 
+/** Most photos one bulk rating request may name. Mirrors the backend cap. */
+export const BULK_RATING_MAX_PHOTOS = 200;
+
+export interface BulkRatingResponse {
+  success: boolean;
+  rating: number;
+  results: Array<{
+    photo_id: number;
+    success: boolean;
+    error?: string;
+    /** Only when the gallery shows feedback to guests. */
+    average_rating?: number;
+    total_ratings?: number;
+  }>;
+}
+
+/** What a guest hands in (issue 1733): their picks, or the edited photos. */
+export type SubmissionKind = 'selection' | 'approval';
+
+export interface SelectionSubmission {
+  id: number;
+  kind: SubmissionKind;
+  submitted_at: string;
+  item_count: number;
+  note: string | null;
+}
+
+/** The viewer's own state per kind, from GET /gallery/:slug/selection. */
+export interface SelectionState {
+  selection: {
+    /** Show "x of y selected": a cap is set, or the selection can be handed in. */
+    counter: boolean;
+    can_submit: boolean;
+    /** The feedback types that count as a pick in this gallery. */
+    pick_types: Array<'like' | 'favorite'>;
+    cap: number | null;
+    used: number;
+    submission: SelectionSubmission | null;
+  };
+  approval: {
+    can_submit: boolean;
+    approved: number;
+    rejected: number;
+    submission: SelectionSubmission | null;
+  };
+}
+
+/** A submission as the admin sees it. */
+export interface AdminSelectionSubmission extends SelectionSubmission {
+  guest_id: number | null;
+  guest_name: string | null;
+  reopened_at: string | null;
+}
+
 export interface FeedbackAnalytics {
   summary: {
     total_feedback: number;
@@ -143,6 +226,9 @@ export interface FeedbackAnalytics {
     total_comments: number;
     total_favorites: number;
     total_reactions?: number;
+    total_color_labels?: number;
+    total_approved?: number;
+    total_rejected?: number;
     pending_moderation: number;
   };
   topRated: Array<{
@@ -226,6 +312,16 @@ class FeedbackService {
     return response.data;
   }
 
+  async getSelectionSubmissions(eventId: string): Promise<AdminSelectionSubmission[]> {
+    const response = await api.get(`/admin/feedback/events/${eventId}/selection-submissions`);
+    return response.data.submissions;
+  }
+
+  async reopenSelectionSubmission(eventId: string, submissionId: number) {
+    const response = await api.post(`/admin/feedback/events/${eventId}/selection-submissions/${submissionId}/reopen`);
+    return response.data;
+  }
+
   async getPendingModeration() {
     const response = await api.get('/admin/feedback/feedback/pending-moderation');
     return response.data;
@@ -264,16 +360,62 @@ class FeedbackService {
   }
 
   async submitFeedback(slug: string, photoId: string, feedback: {
-    feedback_type: 'rating' | 'like' | 'comment' | 'favorite' | 'reaction' | 'color_label';
+    feedback_type: 'rating' | 'like' | 'comment' | 'favorite' | 'reaction' | 'color_label' | 'decision';
     rating?: number;
     comment_text?: string;
     reaction?: string;
     color_label?: ColorLabel;
+    decision?: PhotoDecision;
+    /** Only with feedback_type 'comment' (issue 1733). */
+    annotation?: PhotoAnnotation;
     guest_name?: string;
     guest_email?: string;
   }) {
-    const response = await api.post(`/gallery/${slug}/photos/${photoId}/feedback`, feedback);
+    try {
+      const response = await api.post(`/gallery/${slug}/photos/${photoId}/feedback`, feedback);
+      window.dispatchEvent(new CustomEvent<FeedbackSubmittedDetail>(FEEDBACK_SUBMITTED_EVENT, {
+        detail: { slug, feedback_type: feedback.feedback_type, ...namedIdentity(feedback) },
+      }));
+      return response.data;
+    } catch (error) {
+      // A finished selection locks the picks (issue 1733). Said here, once,
+      // because most tiles swallow a failed like without a word.
+      explainFeedbackLock(error);
+      throw error;
+    }
+  }
+
+  async getSelectionState(slug: string): Promise<SelectionState> {
+    const response = await api.get(`/gallery/${slug}/selection`);
     return response.data;
+  }
+
+  /**
+   * One rating for several photos (issue 1733); 0 clears. The server takes at
+   * most BULK_RATING_MAX_PHOTOS ids per request and rates all of them or,
+   * when the rating budget does not cover them, none (429).
+   */
+  async submitBulkRating(slug: string, photoIds: number[], rating: number, identity?: {
+    guest_name?: string;
+    guest_email?: string;
+  }): Promise<BulkRatingResponse> {
+    const response = await api.post(`/gallery/${slug}/feedback/bulk`, { photo_ids: photoIds, rating, ...identity });
+    // A 200 can rate nothing (every photo hidden or gone since it was picked):
+    // only a rating that landed names the visitor.
+    if ((response.data as BulkRatingResponse)?.results?.some((r) => r.success)) {
+      window.dispatchEvent(new CustomEvent<FeedbackSubmittedDetail>(FEEDBACK_SUBMITTED_EVENT, {
+        detail: { slug, feedback_type: 'rating', ...namedIdentity(identity) },
+      }));
+    }
+    return response.data;
+  }
+
+  async submitSelection(slug: string, kind: SubmissionKind, note?: string, identity?: {
+    guest_name: string;
+    guest_email: string;
+  }): Promise<SelectionSubmission> {
+    const response = await api.post(`/gallery/${slug}/selection/submit`, { kind, note: note || undefined, ...identity });
+    return response.data.submission;
   }
 
   async getGalleryFeedbackSummary(slug: string) {

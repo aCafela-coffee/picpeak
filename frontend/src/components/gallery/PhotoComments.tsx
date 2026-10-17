@@ -1,13 +1,15 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { MessageSquare, Send, User, Loader2 } from 'lucide-react';
+import { MessageSquare, Send, User, Loader2, Pencil, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { feedbackService } from '../../services/feedback.service';
 import { toast } from 'react-toastify';
-import { format } from 'date-fns';
 import { Button, Input } from '../common';
 import type { PhotoFeedback } from '../../services/feedback.service';
 import { useGuestIdentityOptional } from '../../contexts/GuestIdentityContext';
+import { useLocalizedDate } from '../../hooks/useLocalizedDate';
+import { useCommentAnnotation } from './annotation/CommentAnnotationContext';
+import { parseAnnotation } from '../../utils/photoAnnotation';
 
 interface PhotoCommentsProps {
   photoId: string;
@@ -16,6 +18,13 @@ interface PhotoCommentsProps {
   isEnabled: boolean;
   requireNameEmail: boolean;
   showToGuests: boolean;
+  /** The gallery lets a guest draw on the photo with a comment (issue 1733). */
+  allowAnnotations?: boolean;
+  /**
+   * `comments` is the fetched list, not the empty stand-in used while it
+   * loads. Only then can a comment be said to be gone.
+   */
+  commentsLoaded?: boolean;
   onCommentAdded?: () => void;
 }
 
@@ -26,12 +35,19 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
   isEnabled,
   requireNameEmail,
   showToGuests,
+  allowAnnotations = false,
+  commentsLoaded = false,
   onCommentAdded
 }) => {
   const { t } = useTranslation();
+  const { format } = useLocalizedDate();
   const queryClient = useQueryClient();
   const guestIdentity = useGuestIdentityOptional();
   const isGuestMode = guestIdentity?.identityMode === 'guest';
+  // Only inside the standard lightbox, which is where a drawing can be made
+  // and laid over the photo (issue 1733). Null anywhere else.
+  const annotation = useCommentAnnotation();
+  const canDraw = allowAnnotations && !!annotation?.canDraw;
   const [showCommentForm, setShowCommentForm] = useState(false);
   const [commentText, setCommentText] = useState('');
   const [guestName, setGuestName] = useState('');
@@ -52,12 +68,16 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
       feedbackService.submitFeedback(gallerySlug, photoId, {
         feedback_type: 'comment',
         comment_text: data.comment_text,
+        annotation: data.annotation,
         guest_name: data.guest_name,
         guest_email: data.guest_email
       }),
-    onSuccess: (response) => {
+    onSuccess: (response, data) => {
       setCommentText('');
       setShowCommentForm(false);
+      // Only the drawing that went with this comment: the handler also runs
+      // for a response that arrives after the panel was closed and reopened.
+      annotation?.discardSent(data.annotation);
       queryClient.invalidateQueries({ queryKey: ['photo-feedback', gallerySlug, photoId] });
       
       if (response.message) {
@@ -81,8 +101,13 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
     }
   });
 
+  // The finished drawing, sent with the comment when the gallery allows it.
+  const draftAnnotation = canDraw ? annotation?.draft ?? undefined : undefined;
+
   const handleSubmitComment = async (e: React.FormEvent) => {
     e.preventDefault();
+    // A drawing still in progress is not part of the comment yet.
+    if (annotation?.drawing) return;
     setErrors({});
 
     // Validate
@@ -112,23 +137,36 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
       } catch {
         return;
       }
-      submitCommentMutation.mutate({ comment_text: commentText.trim() });
+      submitCommentMutation.mutate({ comment_text: commentText.trim(), annotation: draftAnnotation });
       return;
     }
 
     submitCommentMutation.mutate({
       comment_text: commentText.trim(),
+      annotation: draftAnnotation,
       guest_name: guestName.trim() || undefined,
       guest_email: guestEmail.trim() || undefined
     });
   };
 
-  if (!isEnabled) return null;
-
   // Filter comments based on visibility settings
   const visibleComments = showToGuests 
     ? comments.filter(c => c.is_approved && !c.is_hidden)
     : comments.filter(c => c.is_mine);
+
+  // The drawing on the photo is a copy taken when its marker was clicked
+  // (issue 1733). When its comment leaves this list (hidden or deleted by the
+  // photographer, seen on the next fetch) the marker goes too, so the drawing
+  // has to come off the photo with it.
+  const shownCommentId = annotation?.shownCommentId ?? null;
+  const hideShown = annotation?.hideShown;
+  const shownCommentGone = isEnabled && commentsLoaded && shownCommentId !== null
+    && !visibleComments.some(c => c.id === shownCommentId && parseAnnotation(c.annotation));
+  useEffect(() => {
+    if (shownCommentGone) hideShown?.();
+  }, [shownCommentGone, hideShown]);
+
+  if (!isEnabled) return null;
 
   return (
     <div className="space-y-4">
@@ -154,16 +192,18 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
 
       {/* Comment Form */}
       {showCommentForm && (
-        <form onSubmit={handleSubmitComment} className="space-y-3 p-4 bg-surface rounded-lg border border-surface">
+        <form onSubmit={handleSubmitComment} className="space-y-3 p-4 bg-surface rounded-lg border border-border-token">
           {requireNameEmail && !isGuestMode && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <Input
+                themed
                 placeholder={t('feedback.yourName', 'Your name')}
                 value={guestName}
                 onChange={(e) => setGuestName(e.target.value)}
                 error={errors.guest_name}
               />
               <Input
+                themed
                 type="email"
                 placeholder={t('feedback.yourEmail', 'Your email')}
                 value={guestEmail}
@@ -179,19 +219,68 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
               value={commentText}
               onChange={(e) => setCommentText(e.target.value)}
               placeholder={t('feedback.writeComment', 'Write a comment...')}
-              className={`w-full px-3 py-2 text-sm border rounded-lg resize-vertical min-h-[100px] focus:ring-2 focus:ring-primary-500 focus:border-accent-dark ${
-                errors.comment_text ? 'border-red-500' : 'border-surface'
+              className={`w-full px-3 py-2 text-sm bg-surface text-theme placeholder:text-muted-theme border rounded-lg resize-vertical min-h-[100px] focus:ring-2 focus:ring-accent focus:border-accent-dark ${
+                errors.comment_text ? 'border-danger' : 'border-border-token'
               }`}
               rows={4}
               maxLength={500}
             />
             {errors.comment_text && (
-              <p className="text-xs text-red-600 mt-1">{errors.comment_text}</p>
+              <p className="text-xs text-status hue-danger mt-1">{errors.comment_text}</p>
             )}
             <p className="text-xs text-muted-theme mt-1">
               {commentText.length}/500
             </p>
           </div>
+
+          {/* Draw on the photo (issue 1733). The drawing is sent with this
+              comment, so the words stay required. */}
+          {canDraw && annotation && (
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              {annotation.drawing ? (
+                <p className="text-xs text-muted-theme" role="status">
+                  {t('feedback.annotation.inProgress', 'Finish the drawing on the photo, then send your comment.')}
+                </p>
+              ) : (
+                <>
+                  {annotation.draft && (
+                    <span className="inline-flex items-center gap-1.5 text-theme">
+                      <Pencil className="w-4 h-4" aria-hidden="true" />
+                      {t('feedback.annotation.attached', 'Drawing attached')}
+                    </span>
+                  )}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    leftIcon={annotation.draft ? undefined : <Pencil className="w-4 h-4" />}
+                    onClick={annotation.startDrawing}
+                    // Not while a comment is on its way: its success clears
+                    // the form and the drawing, and would take a newer one
+                    // too, on this photo or (the form is reused from photo
+                    // to photo) on the next.
+                    disabled={submitCommentMutation.isPending}
+                  >
+                    {annotation.draft
+                      ? t('feedback.annotation.edit', 'Edit drawing')
+                      : t('feedback.annotation.draw', 'Draw on photo')}
+                  </Button>
+                  {annotation.draft && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      leftIcon={<X className="w-4 h-4" />}
+                      onClick={annotation.discard}
+                      disabled={submitCommentMutation.isPending}
+                    >
+                      {t('feedback.annotation.remove', 'Remove drawing')}
+                    </Button>
+                  )}
+                </>
+              )}
+            </div>
+          )}
 
           <div className="flex gap-2">
             <Button
@@ -199,7 +288,7 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
               size="sm"
               variant="primary"
               leftIcon={submitCommentMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-              disabled={submitCommentMutation.isPending}
+              disabled={submitCommentMutation.isPending || !!annotation?.drawing}
             >
               {t('feedback.submit', 'Submit')}
             </Button>
@@ -211,6 +300,7 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
                 setShowCommentForm(false);
                 setCommentText('');
                 setErrors({});
+                annotation?.discard();
               }}
             >
               {t('common.cancel', 'Cancel')}
@@ -222,10 +312,15 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
       {/* Comments List */}
       {visibleComments.length > 0 && (
         <div className="space-y-3">
-          {visibleComments.map((comment) => (
+          {visibleComments.map((comment) => {
+            // A stored drawing (issue 1733), validated before anything draws
+            // it. The marker needs the lightbox to show it on the photo.
+            const drawing = annotation ? parseAnnotation(comment.annotation) : null;
+            const drawingShown = annotation?.shownCommentId === comment.id;
+            return (
             <div key={comment.id} className="flex gap-3">
               <div className="flex-shrink-0">
-                <div className="w-8 h-8 bg-black/10 rounded-full flex items-center justify-center">
+                <div className="w-8 h-8 bg-elevated rounded-full flex items-center justify-center">
                   <User className="w-4 h-4 text-muted-theme" />
                 </div>
               </div>
@@ -235,10 +330,10 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
                     {comment.guest_name || t('feedback.anonymous', 'Anonymous')}
                   </span>
                   <span className="text-xs text-muted-theme">
-                    {format(new Date(comment.created_at), 'PP')}
+                    {format(comment.created_at)}
                   </span>
                   {comment.is_mine && !comment.is_approved && (
-                    <span className="text-xs text-orange-600">
+                    <span className="text-xs text-status hue-warning">
                       {t('feedback.pendingApproval', 'Pending approval')}
                     </span>
                   )}
@@ -246,9 +341,23 @@ export const PhotoComments: React.FC<PhotoCommentsProps> = ({
                 <p className="text-sm text-muted-theme break-words">
                   {comment.comment_text}
                 </p>
+                {annotation && drawing && (
+                  <button
+                    type="button"
+                    aria-pressed={drawingShown}
+                    onClick={() => annotation.toggleShown(comment.id, drawing)}
+                    className={`mt-1 inline-flex items-center gap-1 text-xs rounded px-1.5 py-0.5 border border-border-token transition-colors ${drawingShown ? 'bg-elevated text-theme' : 'text-muted-theme hover-surface'}`}
+                  >
+                    <Pencil className="w-3 h-3" aria-hidden="true" />
+                    {drawingShown
+                      ? t('feedback.annotation.hide', 'Hide drawing')
+                      : t('feedback.annotation.show', 'Show drawing')}
+                  </button>
+                )}
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
 

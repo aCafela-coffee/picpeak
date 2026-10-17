@@ -45,16 +45,37 @@ const EXTENSION_TO_MIME = {
   'heif': 'image/heif',
   // Camera RAW / Apple ProRAW. Not sharp-decodable directly — the processing
   // pipeline extracts the embedded JPEG preview (exiftool) for thumbnails/
-  // display, keeping the original for download. Browsers also report a DNG as
-  // image/dng, image/tiff, or no type at all; the upload filters map those onto
-  // this entry via normalizeUploadMimeType() (utils/fileSecurityUtils.js).
+  // display, keeping the original for download.
+  //
+  // Browsers do not type these. macOS and Windows register no MIME for .arw,
+  // .cr2 or .nef, so the file arrives with an empty type; DNG is the exception
+  // Chrome happens to know, and even then it may say image/dng or image/tiff.
+  // normalizeUploadMimeType() (utils/fileSecurityUtils.js) names the type from
+  // the extension for this set, which is why an entry here is enough to make
+  // the format uploadable. Kept to TIFF-container formats: CR3, RAF and RW2
+  // need their own signatures in fileSecurityUtils and are not mapped yet.
+  //
+  // Adding an extension here does not enable it. Every one is opt-in through
+  // general_allowed_file_types, and none is in DEFAULT_ALLOWED_FILE_TYPES.
   'dng': 'image/x-adobe-dng',
+  'arw': 'image/x-sony-arw',
+  'sr2': 'image/x-sony-sr2',
+  'srf': 'image/x-sony-srf',
+  'cr2': 'image/x-canon-cr2',
+  'nef': 'image/x-nikon-nef',
+  'nrw': 'image/x-nikon-nrw',
+  'orf': 'image/x-olympus-orf',
+  'pef': 'image/x-pentax-pef',
+  'srw': 'image/x-samsung-srw',
 };
 
 const DEFAULT_ALLOWED_FILE_TYPES = 'jpg,jpeg,png,webp';
 
 let cachedAllowedTypes = null;
 let allowedTypesCacheExpiresAt = 0;
+
+let cachedAllowedExtensions = null;
+let allowedExtensionsCacheExpiresAt = 0;
 
 const parseSettingValue = (setting) => {
   if (!setting || setting.setting_value == null) {
@@ -213,7 +234,7 @@ const clearMaxVideoSizeCache = () => {
 
 /**
  * Convert a comma-separated list of file extensions into an array of MIME types.
- * Unknown extensions are silently ignored.
+ * Unknown extensions are ignored, with a warning.
  */
 const extensionsToMimeTypes = (extString) => {
   if (!extString || typeof extString !== 'string') {
@@ -221,19 +242,53 @@ const extensionsToMimeTypes = (extString) => {
   }
 
   const mimeSet = new Set();
+  const unknown = [];
   extString.split(',').forEach(ext => {
     const cleaned = ext.trim().toLowerCase().replace(/^\./, '');
+    if (!cleaned) return;
     const mime = EXTENSION_TO_MIME[cleaned];
     if (mime) {
       mimeSet.add(mime);
+    } else {
+      unknown.push(cleaned);
     }
   });
+
+  if (unknown.length > 0) {
+    // An extension this map does not know is dropped here, and the admin who
+    // typed it into Settings gets no feedback at all: uploads of that format
+    // are simply rejected further down, with a message about system settings
+    // they have already changed. At least say so in the log.
+    logger.warn(
+      `Ignoring unsupported upload file type(s) in general_allowed_file_types: ${unknown.join(', ')}. `
+      + `Supported: ${Object.keys(EXTENSION_TO_MIME).join(', ')}`
+    );
+  }
 
   if (mimeSet.size === 0) {
     return extensionsToMimeTypes(DEFAULT_ALLOWED_FILE_TYPES);
   }
 
   return Array.from(mimeSet);
+};
+
+// The stored general_allowed_file_types value, unwrapped from its JSON
+// encoding when it has one. Throws if the database read fails.
+//
+// Two caches sit on this one row, with opposite failure rules. The upload
+// gate (getAllowedMimeTypes) falls back to the defaults, because the browser
+// can send the file again. The watcher (getAllowedExtensions) gets the error,
+// because a watched file is announced only once.
+const readAllowedFileTypesSetting = async () => {
+  const setting = await db('app_settings')
+    .where({ setting_key: 'general_allowed_file_types' })
+    .first();
+
+  let rawValue = setting?.setting_value;
+  if (typeof rawValue === 'string') {
+    try { rawValue = JSON.parse(rawValue); } catch { /* keep string */ }
+  }
+  return rawValue;
 };
 
 /**
@@ -246,16 +301,7 @@ const getAllowedMimeTypes = async () => {
   }
 
   try {
-    const setting = await db('app_settings')
-      .where({ setting_key: 'general_allowed_file_types' })
-      .first();
-
-    let rawValue = setting?.setting_value;
-    if (typeof rawValue === 'string') {
-      try { rawValue = JSON.parse(rawValue); } catch { /* keep string */ }
-    }
-
-    const mimeTypes = extensionsToMimeTypes(rawValue);
+    const mimeTypes = extensionsToMimeTypes(await readAllowedFileTypesSetting());
     cachedAllowedTypes = mimeTypes;
     allowedTypesCacheExpiresAt = Date.now() + CACHE_TTL_MS;
     return mimeTypes;
@@ -268,9 +314,39 @@ const getAllowedMimeTypes = async () => {
   }
 };
 
+/**
+ * The configured extensions themselves, bare and lowercase. For callers that
+ * read files off disk rather than from a browser: there is no MIME to check,
+ * and an extension the MIME map does not know yet (CR3, RAF, RW2) is still a
+ * deliberate choice by the admin.
+ *
+ * Throws when the database read fails, unlike getAllowedMimeTypes, and caches
+ * nothing. A failed read passed off as "not allowed" used to skip every RAW
+ * for the next minute with a misleading warning. The caller decides whether
+ * to retry.
+ */
+const getAllowedExtensions = async () => {
+  if (Date.now() < allowedExtensionsCacheExpiresAt && cachedAllowedExtensions) {
+    return cachedAllowedExtensions;
+  }
+
+  const rawValue = await readAllowedFileTypesSetting();
+  const extensions = new Set(
+    String(typeof rawValue === 'string' && rawValue.trim() ? rawValue : DEFAULT_ALLOWED_FILE_TYPES)
+      .split(',')
+      .map(ext => ext.trim().toLowerCase().replace(/^\./, ''))
+      .filter(Boolean)
+  );
+  cachedAllowedExtensions = extensions;
+  allowedExtensionsCacheExpiresAt = Date.now() + CACHE_TTL_MS;
+  return extensions;
+};
+
 const clearAllowedTypesCache = () => {
   allowedTypesCacheExpiresAt = 0;
   cachedAllowedTypes = null;
+  allowedExtensionsCacheExpiresAt = 0;
+  cachedAllowedExtensions = null;
 };
 
 module.exports = {
@@ -283,6 +359,7 @@ module.exports = {
   getMaxVideoSizeBytes,
   clearMaxVideoSizeCache,
   getAllowedMimeTypes,
+  getAllowedExtensions,
   clearAllowedTypesCache,
   extensionsToMimeTypes,
   EXTENSION_TO_MIME,

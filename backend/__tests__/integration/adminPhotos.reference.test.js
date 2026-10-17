@@ -88,6 +88,10 @@ describe('Admin photos in reference mode', () => {
       table.string('event_name').notNullable();
       table.string('source_mode').notNullable();
       table.string('external_path');
+      // Persistent ingress resolves ownership and legacy catalogue usage.
+      table.integer('created_by');
+      table.string('archive_path');
+      table.bigInteger('archive_size');
     });
 
     await db.schema.createTable('photo_categories', (table) => {
@@ -96,6 +100,10 @@ describe('Admin photos in reference mode', () => {
       table.string('slug').notNullable();
       table.boolean('is_global').defaultTo(true);
       table.integer('event_id');
+      // Migrations 185 / 265: the upload maps a folder sent as category_id
+      // onto folder_id, so it reads is_folder.
+      table.boolean('is_folder').defaultTo(false);
+      table.integer('parent_id');
     });
 
     await db.schema.createTable('photos', (table) => {
@@ -111,23 +119,44 @@ describe('Admin photos in reference mode', () => {
       // relies on the NOT NULL DEFAULT 'managed' to mark managed originals.
       table.string('source_origin').notNullable().defaultTo('managed');
       table.string('external_relpath');
+      // Migration 294: the photo trash flag every reader filters on.
+      table.timestamp('deleted_at');
+      table.timestamp('purge_after');
+      table.integer('deleted_by_admin_id');
       // Columns the upload insert writes (migrations 048, 062, 071, 085, 193)
       // and the PATCH handler writes (migration 178). Without them the insert
       // and the update both fail on "no such column".
       table.string('original_filename', 512);
       table.string('source_filename', 255);
+      // Read and written by the upload's duplicate check (migration 290).
+      table.string('content_sha256', 64);
       table.datetime('captured_at').nullable();
       table.string('media_type').defaultTo('image');
       table.string('mime_type');
       table.string('processing_status', 16).notNullable().defaultTo('complete');
       table.string('upload_id', 64).nullable();
       table.boolean('auto_categorized');
+      // Migration 265: folder, folder request and first-look flag.
+      table.integer('folder_id');
+      table.integer('pending_folder_request_id');
+      table.boolean('first_look').notNullable().defaultTo(false);
       // Initial schema (db.js); the queued upload writes it since #1561.
       table.string('uploaded_by').defaultTo('admin');
       table.datetime('uploaded_at').defaultTo(db.fn.now());
       table.float('average_rating').defaultTo(0);
       table.integer('like_count').defaultTo(0);
       table.integer('favorite_count').defaultTo(0);
+      // Migration 269: the uploading account and the review state, which the
+      // upload writes and the list reads.
+      table.integer('uploaded_by_admin_id');
+      table.string('moderation_status', 16);
+    });
+
+    // The list joins the uploading account (migration 269).
+    await db.schema.dropTableIfExists('admin_users');
+    await db.schema.createTable('admin_users', (table) => {
+      table.increments('id').primary();
+      table.string('username');
     });
 
     await db.schema.createTable('photo_feedback', (table) => {
@@ -137,6 +166,20 @@ describe('Admin photos in reference mode', () => {
       table.boolean('is_approved');
       table.boolean('is_hidden');
     });
+
+    // Keep real admission/transactions in this integration fixture; the
+    // minimal pre-admission schema omitted these authoritative tables.
+    await db.schema.createTable('transfers', table => {
+      table.increments('id'); table.integer('created_by');
+    });
+    await db.schema.createTable('transfer_uploads', table => {
+      table.increments('id'); table.integer('transfer_id'); table.bigInteger('size_bytes');
+    });
+    await db.schema.createTable('app_settings', table => {
+      table.string('setting_key'); table.string('setting_value');
+    });
+    await require('../../migrations/core/276_public_upload_quotas').up(db);
+    await require('../../migrations/core/277_admin_upload_admission').up(db);
 
     await db('events').insert({
       id: 1,

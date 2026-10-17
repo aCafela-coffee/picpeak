@@ -6,7 +6,9 @@ const crypto = require('node:crypto');
 const image = process.argv[2];
 const baseline = require('../../aio-baseline.json');
 const platform = process.argv[3] || `linux/${process.arch === 'arm64' ? 'arm64' : 'amd64'}`;
-const official = `${baseline.image.split('@')[0]}@${baseline.platformManifestDigests[platform.split('/')[1]]}`;
+const arch = platform.split('/')[1];
+const official = `${baseline.image.split('@')[0]}@${baseline.platformManifestDigests[arch]}`;
+const previousOfficial = `${baseline.previousBaseline.image.split('@')[0]}@${baseline.previousBaseline.platformManifestDigests[arch]}`;
 if (!image) throw new Error('Usage: node scripts/ci/aio-smoke.cjs <local-image>');
 const name = `picpeak-smoke-${crypto.randomBytes(5).toString('hex')}`;
 const volume = `${name}-data`;
@@ -35,6 +37,14 @@ async function json(route, body, cookie = '') {
   return response;
 }
 async function checkData() {
+  if (adminCookie) {
+    const session = await http(`${base}/api/admin/events`, { headers: { cookie: adminCookie } });
+    assert.equal(session.status, 200, 'Existing admin session must survive image recreation');
+  }
+  if (galleryCookie) {
+    const download = await http(`${base}/api/gallery/ko-smoke/download/${photoId}`, { headers: { cookie: galleryCookie } });
+    assert.equal(download.status, 200, 'Existing share session must survive image recreation');
+  }
   adminCookie = cookies(await json('/api/auth/admin/login', { username: 'smoke@example.com', password: 'Smoke-Only-2026!Pass' }));
   const events = await http(`${base}/api/admin/events`, { headers: { cookie: adminCookie } });
   assert.equal(events.status, 200);
@@ -48,7 +58,7 @@ async function checkData() {
 function snapshot() {
   const program = `
     const { db } = require('./src/database/db');
-    (async () => {
+    const work = async () => {
       const schema = await db('sqlite_master').select('type','name','tbl_name','sql').whereNot('name','like','sqlite_%').orderBy('name');
       const migrations = await db('migrations').select('*').orderBy('id');
       const values = {};
@@ -56,13 +66,21 @@ function snapshot() {
         const info = await db(table.name).columnInfo();
         const columns = Object.keys(info).filter(c => /language|locale|currency|amount|minor|price|(?:^|_)rate(?:_|$)/.test(c));
         if (!columns.length) continue;
+        if (info.id && !columns.includes('id')) columns.unshift('id');
         const rows = await db(table.name).select(columns);
         values[table.name] = rows.sort((a,b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
       }
       const settings = await db('app_settings').select('setting_key','setting_value').where('setting_key','like','%language%').orWhere('setting_key','like','%currency%').orderBy('setting_key');
       console.log(JSON.stringify({schema,migrations,values,settings}));
       await db.destroy();
-    })().catch(e => { console.error(e); process.exit(1); });
+    };
+    // New official releases require an explicit trusted context even for
+    // local CRM reads. This process only inspects our disposable test volume.
+    const crm = './src/database/crmAccess';
+    const run = require('fs').existsSync(crm + '.js')
+      ? require(crm).withTrustedCrmAccess('CI snapshot of isolated synthetic data', work)
+      : work();
+    run.catch(e => { console.error(e); process.exit(1); });
   `;
   return JSON.parse(docker('exec', name, 'node', '-e', program).trim().split('\n').pop());
 }
@@ -74,12 +92,12 @@ function removeContainer() { docker('stop', name); docker('rm', name); }
 (async () => {
   docker('volume', 'create', volume);
   try {
-    await boot(official);
+    await boot(previousOfficial);
     // The official runner checks historical migrations only on existing DBs.
     // Establish the baseline after an official recreation too, so no first-run
     // vs existing-volume behaviour can be mistaken for an overlay migration.
     removeContainer();
-    await boot(official);
+    await boot(previousOfficial);
     const html = await (await http(`${base}/admin`)).text();
     assert.match(html, /<html/);
     console.log('Official baseline ready; creating the synthetic admin and fixtures.');
@@ -103,8 +121,29 @@ function removeContainer() { docker('stop', name); docker('rm', name); }
     photoId = JSON.parse(seeded).photoId;
     const secretHash = docker('exec', name, 'sha256sum', '/data/db/jwt.secret').trim();
     await checkData();
+    const previous = snapshot();
+    console.log('Previous official data captured; upgrading the synthetic volume.');
+    removeContainer();
+    await boot(official);
+    assert.equal(docker('exec', name, 'sha256sum', '/data/db/jwt.secret').trim(), secretHash);
     const reference = snapshot();
-    console.log('Official reference schema, migration history, languages and amounts captured.');
+    // New official migrations may add columns/tables; existing stored values
+    // must survive. Subsequent overlay stages require exact schema equality.
+    for (const [table, rows] of Object.entries(previous.values)) {
+      const columns = rows.length ? Object.keys(rows[0]) : [];
+      const projected = (reference.values[table] || []).map(row => Object.fromEntries(columns.map(key => [key, row[key]])));
+      // Official migrations may seed new rows too; retain every pre-existing
+      // row (and duplicate multiplicity) without forbidding those additions.
+      const remaining = projected.map(row => JSON.stringify(row));
+      for (const row of rows) {
+        const index = remaining.indexOf(JSON.stringify(row));
+        assert.ok(index >= 0, `Official upgrade changed stored values in ${table}: ${JSON.stringify(row)}`);
+        remaining.splice(index, 1);
+      }
+    }
+    assert.deepEqual(reference.settings, previous.settings, 'Official upgrade changed saved languages/currencies');
+    await checkData();
+    console.log('New official reference schema, migration history, languages and amounts captured.');
     for (const [stage, nextImage] of [['Korean overlay', image], ['Korean recreation', image], ['Official rollback', official]]) {
       removeContainer();
       await boot(nextImage);
@@ -115,7 +154,7 @@ function removeContainer() { docker('stop', name); docker('rm', name); }
       assert.deepEqual(snapshot(), reference, `${stage}: stored values changed after login/download`);
       console.log(`${stage} passed (${platform}).`);
     }
-    console.log('Official → Korean → recreation → same official digest passed: schema, migrations, languages, amounts, login, event, share, download and persistence.');
+    console.log('Previous official → new official → Korean → recreation → same new official digest passed: schema, migrations, languages, amounts, login, event, share, download and persistence.');
   } catch (error) {
     try { console.error(docker('inspect', '--format', '{{json .State}}', name)); } catch (_) {}
     try { console.error(docker('logs', '--tail', '120', name)); } catch (_) {}

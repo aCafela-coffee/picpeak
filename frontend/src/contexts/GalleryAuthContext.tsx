@@ -13,6 +13,7 @@ import {
 } from '../utils/galleryAuthStorage';
 import { clearGuestIdentity } from '../utils/guestIdentityStorage';
 import type { GalleryAccessLevel } from '../types';
+import { isShareToken } from '../utils/shareToken';
 
 interface GalleryEvent {
   id: number;
@@ -44,7 +45,7 @@ interface GalleryAuthContextType {
   /** Session was minted by the customer portal — credentialed, bypasses reveal. */
   viaCustomer: boolean;
   login: (slug: string, password?: string, recaptchaToken?: string | null) => Promise<void>;
-  clientLogin: (slug: string, password: string) => Promise<void>;
+  clientLogin: (slug: string, password: string, token: string) => Promise<void>;
   logout: () => void;
   isLoading: boolean;
   error: string | null;
@@ -114,7 +115,7 @@ export const GalleryAuthProvider: React.FC<GalleryAuthProviderProps> = ({ childr
         return;
       }
 
-      const looksLikeToken = /^[0-9a-fA-F]{32}$/.test(identifier) && !tokenSegment;
+      const looksLikeToken = isShareToken(identifier) && !tokenSegment;
 
       if (looksLikeToken) {
         if (lastResolvedIdentifier.current === identifier) {
@@ -219,13 +220,19 @@ export const GalleryAuthProvider: React.FC<GalleryAuthProviderProps> = ({ childr
         setIsLoading(true);
         const sessionResponse = await api.get<{
           valid: boolean; type: string; eventSlug?: string;
-          accessLevel?: GalleryAccessLevel; viaCustomer?: boolean;
+          accessLevel?: GalleryAccessLevel; viaCustomer?: boolean; token?: string;
         }>(
           '/auth/session',
           { params: { slug: currentSlug } }
         );
 
         if (sessionResponse.data?.valid && sessionResponse.data.type === 'gallery' && sessionResponse.data.eventSlug === currentSlug) {
+          // A session carried over from the gallery's old slug: replace any
+          // stale token kept for this slug, which would be sent as a Bearer
+          // and win over the cookie.
+          if (sessionResponse.data.token) {
+            storeGalleryToken(currentSlug, sessionResponse.data.token);
+          }
           setIsAuthenticated(true);
           // The SERVER's view of this session, not the per-tab sessionStorage
           // guess above (#1149). A second tab has no sessionStorage but the
@@ -234,6 +241,11 @@ export const GalleryAuthProvider: React.FC<GalleryAuthProviderProps> = ({ childr
           if (sessionResponse.data.accessLevel === 'client') {
             setAccessLevel('client');
             sessionStorage.setItem(`gallery_access_level_${currentSlug}`, 'client');
+          } else if (sessionResponse.data.accessLevel === 'guest') {
+            // And the other way: a dead client token replaced by a live
+            // guest session must not keep the client controls on screen.
+            setAccessLevel('guest');
+            sessionStorage.removeItem(`gallery_access_level_${currentSlug}`);
           }
           setViaCustomer(Boolean(sessionResponse.data.viaCustomer));
 
@@ -347,12 +359,12 @@ export const GalleryAuthProvider: React.FC<GalleryAuthProviderProps> = ({ childr
     }
   };
 
-  const clientLoginFn = async (slug: string, password: string) => {
+  const clientLoginFn = async (slug: string, password: string, token: string) => {
     try {
       setRouteError(null);
       setError(null);
       setIsLoading(true);
-      const response = await authService.clientLogin(slug, password);
+      const response = await authService.clientLogin(slug, password, token);
       if (response.token) {
         storeGalleryToken(slug, response.token);
       }

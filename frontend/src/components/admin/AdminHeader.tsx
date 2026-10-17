@@ -44,7 +44,7 @@ export const AdminHeader: React.FC<AdminHeaderProps> = ({ onMenuClick, onOpenSea
   const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || '');
   // Same gate as the sidebar's Settings entry: any visible tab, not settings.view.
   const hasVisibleSettings = useHasVisibleSettings();
-  const { confirmLeave } = useLeaveGuard();
+  const { confirmLeave, unguarded } = useLeaveGuard();
   const { user, logout } = useAdminAuth();
   const { isDark, toggle: toggleDarkMode, forcedMode } = useAdminDarkMode();
   const { t, i18n } = useTranslation();
@@ -154,7 +154,7 @@ export const AdminHeader: React.FC<AdminHeaderProps> = ({ onMenuClick, onOpenSea
           />
         )}
         {showText && (
-          <span className={`${wordmarkVisibilityClass} text-xl sm:text-2xl truncate`} style={{ fontFamily: 'Poppins, sans-serif', fontWeight: 600, color: '#145346' }}>{companyName}</span>
+          <span className={`${wordmarkVisibilityClass} text-xl sm:text-2xl truncate`} style={{ fontFamily: 'Poppins, sans-serif', fontWeight: 600, color: 'var(--picpeak-wordmark)' }}>{companyName}</span>
         )}
       </DashboardHomeLink>
     );
@@ -180,7 +180,8 @@ export const AdminHeader: React.FC<AdminHeaderProps> = ({ onMenuClick, onOpenSea
 
   const handleLogout = () => {
     logout();
-    navigate('/admin/login');
+    // Signing out never asked about unsaved edits; it still does not.
+    unguarded(() => navigate('/admin/login'));
   };
 
   // Fetch notifications
@@ -233,8 +234,10 @@ export const AdminHeader: React.FC<AdminHeaderProps> = ({ onMenuClick, onOpenSea
               cluster just before the action widgets. */}
           <div className="flex items-center gap-3 min-w-0">
             <button
+              type="button"
               onClick={onMenuClick}
-              className="lg:hidden text-neutral-500 hover:text-neutral-700"
+              aria-label={t('navigation.openMenu', 'Open menu')}
+              className="lg:hidden text-muted hover:text-body"
             >
               <Menu className="w-6 h-6" />
             </button>
@@ -345,20 +348,21 @@ export const AdminHeader: React.FC<AdminHeaderProps> = ({ onMenuClick, onOpenSea
               >
                 <Bell className="w-5 h-5" />
                 {unreadCount > 0 && (
-                  <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full" />
+                  <span className="absolute top-1 right-1 w-2 h-2 bg-danger rounded-full" />
                 )}
               </button>
 
               {/* Notifications dropdown */}
               {notificationsModal.isOpen && (
-                <div className="absolute right-0 mt-2 w-96 bg-panel rounded-lg shadow-lg border border-line">
-                  <div className="px-4 py-3 border-b border-line flex items-center justify-between">
+                <div className="absolute right-0 mt-2 w-96 max-w-[calc(100vw-2rem)] bg-panel rounded-lg shadow-lg border border-line">
+                  {/* Wraps instead of squeezing: the two actions beside the title overran the 384px panel in German (issue 2088). */}
+                  <div className="px-4 py-3 border-b border-line flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
                     <h3 className="text-sm font-semibold text-heading">{t('admin.notifications')}</h3>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                       {unreadCount > 0 && (
                         <button
                           onClick={() => markAllAsReadMutation.mutate()}
-                          className="text-xs text-accent hover:opacity-80 flex items-center gap-1"
+                          className="text-xs text-accent hover:opacity-80 flex items-center gap-1 whitespace-nowrap"
                           title={t('admin.markAllRead')}
                         >
                           <CheckCircle className="w-3 h-3" />
@@ -367,7 +371,7 @@ export const AdminHeader: React.FC<AdminHeaderProps> = ({ onMenuClick, onOpenSea
                       )}
                       <button
                         onClick={() => clearAllMutation.mutate()}
-                        className="text-xs text-soft hover:text-body flex items-center gap-1"
+                        className="text-xs text-soft hover:text-body flex items-center gap-1 whitespace-nowrap"
                         title={t('admin.clearAll')}
                       >
                         <Trash2 className="w-3 h-3" />

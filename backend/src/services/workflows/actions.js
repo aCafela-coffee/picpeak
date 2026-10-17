@@ -22,6 +22,7 @@ const { formatBoolean } = require('../../utils/dbCompat');
 // True once the run's invoice entity is settled (paid_at set, status paid, or
 // the cumulative paid amount covers the total).
 registry.registerCondition('invoice_paid', async (ctx) => {
+  if (ctx.run.entity_type !== 'invoice') return false;
   const id = ctx.run.entity_id;
   if (!id) return false;
   const inv = await ctx.db('invoices').where({ id }).first();
@@ -239,9 +240,11 @@ registry.registerAction('webhook', async (ctx) => {
 // prepare_* create DRAFT documents (idempotent, reusing the proven converters)
 // and stash the created ids in the run context; send_document then dispatches
 // the matching draft. Flows run system-side, so the actor is resolved from the
-// quote's creator (else the workflow's creator, else the first admin).
+// scoped execution principal (legacy fallback never chooses a first admin).
 
 async function resolveActor(ctx) {
+  const principal = require('../../database/crmAccess').currentCrmActor();
+  if (principal) return principal.id;
   try {
     if (ctx.run.entity_type === 'quote' && ctx.run.entity_id) {
       const q = await ctx.db('quotes').where({ id: ctx.run.entity_id }).first('created_by_admin_id');
@@ -249,8 +252,7 @@ async function resolveActor(ctx) {
     }
     const wf = await ctx.db('workflows').where({ id: ctx.run.workflow_id }).first('created_by');
     if (wf?.created_by) return wf.created_by;
-    const admin = await ctx.db('admin_users').orderBy('id', 'asc').first('id');
-    return admin?.id || null;
+    return null;
   } catch (_) { return null; }
 }
 
@@ -412,13 +414,28 @@ registry.registerAction('send_document', async (ctx) => {
     const ids = ctx.vars.preparedInvoiceIds || [];
     if (!ids.length) return { skipped: true, reason: 'no prepared invoice to send' };
     const invoiceService = require('../invoiceService');
+    // Only invoices still unsent go out. One the admin already sent, paid or
+    // cancelled by hand is reported, never mailed a second time (and
+    // sendInvoice itself refuses an automatic re-send).
     let sent = 0;
-    for (const id of ids) { await invoiceService.sendInvoice(id, adminId); sent += 1; }
-    return { invoices_sent: sent };
+    const alreadySent = [];
+    for (const id of ids) {
+      const row = await ctx.db('invoices').where({ id }).first('status');
+      if (!row || row.status !== 'scheduled') { alreadySent.push(id); continue; }
+      const res = await invoiceService.sendInvoice(id, adminId);
+      if (res && res.sent) sent += 1; else alreadySent.push(id);
+    }
+    if (!sent) return { skipped: true, reason: 'invoice already sent, paid or cancelled', already_sent: alreadySent };
+    return alreadySent.length ? { invoices_sent: sent, already_sent: alreadySent } : { invoices_sent: sent };
   }
   if (doc === 'contract') {
     const cid = ctx.vars.preparedContractId;
     if (!cid) return { skipped: true, reason: 'no prepared contract to send' };
+    // Sent by hand already: report it instead of failing the run on the 409.
+    const contract = await ctx.db('contracts').where({ id: cid }).first('status');
+    if (contract && !['draft', 'awaiting_data'].includes(contract.status)) {
+      return { skipped: true, reason: 'contract already sent', status: contract.status };
+    }
     const sent = await require('../contractService').sendContract(cid, adminId);
     // Sent, but the invitation failed: recorded on the contract, retried by
     // the hourly sweep. The run log says so rather than failing the step.

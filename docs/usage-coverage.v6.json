@@ -274,7 +274,12 @@
         "POST /mfa/setup",
         "POST /mfa/enable",
         "POST /mfa/disable",
-        "POST /mfa/recovery-codes"
+        "POST /mfa/recovery-codes",
+        "GET /passkeys",
+        "POST /passkeys/register/options",
+        "POST /passkeys/register/verify",
+        "PATCH /passkeys/:id",
+        "POST /passkeys/:id/delete"
       ]
     },
     "adminBackup.js": {
@@ -286,14 +291,13 @@
         "s3_storage",
         "s3_backups"
       ],
-      "reason": "Admin backup initiation, portable export/import and successful S3 roundtrip test. Local export never implies S3; names, schedules, sizes, contents and history excluded.",
+      "reason": "Admin backup initiation, portable export and successful S3 roundtrip test. Coordinated restore control is excluded separately; names, schedules, sizes, contents and history excluded.",
       "route_signatures": [
         "GET /config",
         "PUT /config",
         "GET /status",
         "POST /run",
         "GET /picpeak/export",
-        "POST /picpeak/import",
         "GET /runs/:id",
         "DELETE /runs/:id",
         "GET /files",
@@ -329,6 +333,33 @@
         "POST /bank-accounts",
         "PUT /bank-accounts/:id",
         "DELETE /bank-accounts/:id"
+      ]
+    },
+    "adminDelivery.js": {
+      "decision": "excluded",
+      "signals": [],
+      "reason": "Two-stage delivery state and the Full gallery is ready action (issue 1562): no product-usage middleware, counters or report triggers; delivery dates and counts stay on the install.",
+      "route_signatures": [
+        "GET /events/:eventId/delivery",
+        "POST /events/:eventId/delivery/complete"
+      ]
+    },
+    "adminFolders.js": {
+      "decision": "partial",
+      "signals": [
+        "gallery_folders"
+      ],
+      "reason": "Gallery folder tree (issue 1786): only the existing gallery_folders capability marker when a folder is actually created. No folder names, paths, counts, requests or approvals.",
+      "route_signatures": [
+        "GET /events/:eventId/folders",
+        "POST /events/:eventId/folders",
+        "PATCH /events/:eventId/folders/:folderId",
+        "DELETE /events/:eventId/folders/:folderId",
+        "POST /events/:eventId/folders/resolve",
+        "POST /events/:eventId/folders/apply-external-structure",
+        "GET /events/:eventId/folder-requests",
+        "POST /events/:eventId/folder-requests/:requestId/approve",
+        "POST /events/:eventId/folder-requests/:requestId/reject"
       ]
     },
     "adminPdfThemes.js": {
@@ -639,6 +670,7 @@
       "route_signatures": [
         "POST /",
         "GET /",
+        "GET /assignable-admins",
         "GET /:id",
         "POST /:id/send-gallery-email",
         "POST /:id/publish",
@@ -771,6 +803,16 @@
         "PATCH /:id/slideshow"
       ]
     },
+    "adminEvents/tags.js": {
+      "decision": "excluded",
+      "signals": [],
+      "reason": "Excluded: automatic scene tagging is not reported as a capability. No flag value, per-gallery switch, queue progress, tag keys, scores or counts.",
+      "route_signatures": [
+        "GET /:id/tags",
+        "PATCH /:id/tags",
+        "POST /:id/tags/rescan"
+      ]
+    },
     "adminEventTypes.js": {
       "decision": "partial",
       "signals": [
@@ -829,9 +871,12 @@
       "signals": [
         "share_mounts"
       ],
-      "reason": "Only admin import operation; status/list/browse are not use. Snapshot checks external-path presence, never reports a path.",
+      "reason": "Only admin import operation is use; status, browsing and source-owner assignment/revocation are excluded. Snapshot checks external-path presence, never reports a path or owner.",
       "route_signatures": [
         "GET /list",
+        "GET /sources",
+        "PUT /sources",
+        "DELETE /sources/:sourceId",
         "POST /events/:id/import-external",
         "GET /events/:id/status"
       ]
@@ -885,6 +930,8 @@
         "GET /events/:eventId/feedback-settings",
         "PUT /events/:eventId/feedback-settings",
         "GET /events/:eventId/feedback",
+        "GET /events/:eventId/selection-submissions",
+        "POST /events/:eventId/selection-submissions/:submissionId/reopen",
         "PUT /feedback/:feedbackId/:action",
         "DELETE /feedback/:feedbackId",
         "GET /events/:eventId/feedback-analytics",
@@ -927,7 +974,6 @@
         "GET /dashboard",
         "GET /logs",
         "GET /events/:eventId/access-logs",
-        "POST /block-ip",
         "DELETE /logs/cleanup",
         "GET /export"
       ]
@@ -1029,7 +1075,10 @@
         "POST /repair-orientation",
         "GET /repair-orientation/status",
         "POST /repair-credits",
-        "GET /repair-credits/status"
+        "GET /repair-credits/status",
+        "POST /repair-thumb-hashes",
+        "GET /repair-thumb-hashes/status",
+        "GET /refresh-renditions/status"
       ]
     },
     "adminPhotoExport.js": {
@@ -1070,6 +1119,12 @@
         "PATCH /:eventId/photos/:photoId",
         "POST /:eventId/photos/bulk-delete",
         "POST /:eventId/photos/bulk-update",
+        "GET /:eventId/photos/trash",
+        "GET /:eventId/photos/trash/:photoId/thumbnail",
+        "POST /:eventId/photos/trash/restore",
+        "POST /:eventId/photos/trash/purge",
+        "GET /:eventId/photos/moderation",
+        "POST /:eventId/photos/moderation",
         "GET /:eventId/photos/credits",
         "PUT /:eventId/photos/:photoId/credit",
         "GET /:eventId/photos/:photoId/download",
@@ -1264,6 +1319,9 @@
         "POST /updates/whatsnew/seen",
         "GET /updates/changelog",
         "GET /updates/instructions",
+        "GET /updates/self-update",
+        "POST /updates/self-update",
+        "DELETE /updates/self-update",
         "GET /status",
         "GET /database",
         "GET /updates/notifications",
@@ -1321,6 +1379,7 @@
       "route_signatures": [
         "GET /",
         "POST /",
+        "GET /upload-defaults",
         "GET /:id",
         "PATCH /:id",
         "DELETE /:id",
@@ -1333,6 +1392,7 @@
         "DELETE /:id/upload-code",
         "POST /:id/resend",
         "GET /:id/download",
+        "GET /:id/uploads/download",
         "GET /:id/uploads/:uploadId/download"
       ]
     },
@@ -1441,8 +1501,10 @@
     "analyticsTrackerProxy.js": {
       "decision": "excluded",
       "signals": [],
-      "reason": "Public/customer/gallery/visitor surface or existing optional third-party analytics proxy: no product-usage middleware, callbacks, counters or report triggers.",
-      "route_signatures": []
+      "reason": "Optional data-only visitor telemetry is separate from product-usage reporting: no product-usage middleware, callbacks, counters or report triggers.",
+      "route_signatures": [
+        "POST /events"
+      ]
     },
     "auth.js": {
       "decision": "partial",
@@ -1453,6 +1515,8 @@
       "route_signatures": [
         "POST /admin/login",
         "POST /admin/login/mfa",
+        "POST /admin/passkey/options",
+        "POST /admin/passkey/verify",
         "POST /logout",
         "POST /gallery/verify",
         "POST /gallery/:slug/client-login",
@@ -1527,8 +1591,11 @@
         "GET /:slug/feedback-settings",
         "GET /:slug/photos/:photoId/feedback",
         "POST /:slug/photos/:photoId/feedback",
+        "POST /:slug/feedback/bulk",
         "GET /:slug/feedback-summary",
-        "GET /:slug/my-feedback"
+        "GET /:slug/my-feedback",
+        "GET /:slug/selection",
+        "POST /:slug/selection/submit"
       ]
     },
     "galleryGuests.js": {
@@ -1572,6 +1639,18 @@
         "POST /:token/verification",
         "POST /:token/verification/confirm"
       ]
+    },
+    "portableRestoreControl.js": {
+      "decision": "excluded",
+      "signals": [],
+      "reason": "Coordinated maintenance admission and attempt-scoped progress are excluded: no product-usage middleware, background telemetry writers, capabilities, archive metadata or progress tokens are reported.",
+      "route_signatures": []
+    },
+    "portableRestoreShell.js": {
+      "decision": "excluded",
+      "signals": [],
+      "reason": "Read-only bundled maintenance UI and assets never inspect business data or start product-usage middleware, callbacks, counters or report triggers.",
+      "route_signatures": ["GET *"]
     },
     "publicFonts.js": {
       "decision": "excluded",
@@ -1685,6 +1764,7 @@
         "POST /:slug/download-selected",
         "POST /:slug/download-jobs",
         "GET /:slug/download-jobs/:token",
+        "POST /:slug/download-jobs/:token/notify",
         "GET /:slug/download-jobs/:token/file"
       ]
     },
@@ -1695,6 +1775,8 @@
       "route_signatures": [
         "POST /:slug/photo/:photoId/view",
         "GET /:slug/photo/:photoId",
+        "GET /:slug/hls/:photoId/master.m3u8",
+        "GET /:slug/hls/:photoId/:rung/:file",
         "GET /:slug/thumbnail/:photoId",
         "GET /:slug/hero/:photoId",
         "GET /:slug/preview/:photoId"
@@ -1716,6 +1798,7 @@
       "reason": "Public/customer/gallery/visitor surface or existing optional third-party analytics proxy: no product-usage middleware, callbacks, counters or report triggers.",
       "route_signatures": [
         "GET /:slug/photos",
+        "GET /:slug/photos/state",
         "GET /:slug/people",
         "PATCH /:slug/photos/:photoId/visibility",
         "PATCH /:slug/photos/visibility/bulk"
@@ -1855,6 +1938,10 @@
         "analytics_dashboard"
       ],
       "reason": "Only effective configuration boolean; dependency rules apply, no flag values/history beyond this boolean."
+    },
+    "autoTagging": {
+      "signals": [],
+      "reason": "Excluded: automatic scene tagging is not reported as its own capability; no flag value, tag keys, scores or counts."
     },
     "bills": {
       "signals": [

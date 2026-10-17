@@ -47,7 +47,7 @@ const {
 } = require('../services/galleryOgService');
 
 // The service hits two tables in sequence:
-//   1. events (slug lookup → may then hit event_slug_redirects)
+//   1. events (slug lookup → may then hit slug_redirects)
 //   2. app_settings (branding lookup)
 // then optionally a third query when og_image_share_enabled is true:
 //   3. photos (validate hero exists + has thumbnail)
@@ -56,7 +56,7 @@ const {
 // service calls them.
 function chain(result) {
   const q = {};
-  ['where', 'whereIn', 'andWhere', 'select', 'orderBy', 'limit', 'first']
+  ['where', 'whereIn', 'whereNull', 'andWhere', 'select', 'orderBy', 'limit', 'first']
     .forEach((m) => { q[m] = jest.fn().mockReturnValue(q); });
   q.first = jest.fn().mockResolvedValue(result?.first);
   q.then = (resolve) => Promise.resolve(result?.rows ?? []).then(resolve);
@@ -65,10 +65,13 @@ function chain(result) {
 }
 
 function mockResolveSlug(event) {
-  // events table query → return event row (or null + no redirects).
-  db.mockImplementationOnce(() => chain({ first: event || null }));
+  // events table query → return event row (or null + no redirects). A real
+  // row always carries is_active (column default true); the OG service now
+  // applies the shared isGalleryAvailable predicate, which requires it.
+  const row = event ? { is_active: true, ...event } : null;
+  db.mockImplementationOnce(() => chain({ first: row }));
   if (!event) {
-    // event_slug_redirects fallback — unused here, return null.
+    // slug_redirects fallback — unused here, return null.
     db.schema = db.schema || {};
     db.schema.hasTable = jest.fn().mockResolvedValue(false);
   }
@@ -250,6 +253,7 @@ describe('buildOgMetadata — share-token fallback', () => {
     const token = '00000000000000000000000000000001';
     const event = {
       id: 10,
+      is_active: true,
       slug: 'senior-2026-06-05',
       share_token: token,
       event_name: 'Senior Photo Gallery',
@@ -273,6 +277,32 @@ describe('buildOgMetadata — share-token fallback', () => {
     // og:url canonicalises to the slug-based URL even when the share-token
     // URL was the entry point — keeps social-share canonicals stable.
     expect(meta.url).toBe('https://gallery.example.com/gallery/senior-2026-06-05');
+  });
+
+  it('resolves a 64-char hex token too (a gallery converted from a quote or a contract)', async () => {
+    // Those conversions minted 64-hex tokens until 1834; their short links
+    // are out there and should still get the gallery's own preview.
+    const token = `${'0'.repeat(63)}3`;
+    const event = {
+      id: 11,
+      is_active: true,
+      slug: 'quote-q-2026-001-abc123',
+      share_token: token,
+      event_name: 'Converted Gallery',
+      event_date: '2026-10-03',
+      welcome_message: null,
+      hero_photo_id: null,
+      og_image_share_enabled: false,
+    };
+    db.mockImplementationOnce(() => chain({ first: null }));
+    db.schema = { hasTable: jest.fn().mockResolvedValue(false) };
+    db.mockImplementationOnce(() => chain({ first: event }));
+    mockBranding();
+
+    const meta = await buildOgMetadata(token, `/gallery/${token}`);
+
+    expect(meta.eventName).toBe('Converted Gallery');
+    expect(meta.url).toBe('https://gallery.example.com/gallery/quote-q-2026-001-abc123');
   });
 
   it('returns the site-wide fallback when the 32-hex slug matches NO event at all', async () => {

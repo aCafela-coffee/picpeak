@@ -3,23 +3,30 @@ const path = require('path');
 const fs = require('fs').promises;
 const os = require('os');
 const { db } = require('../database/db');
+const { leftJoinLivePhotos, livePhotos } = require('../utils/photoVisibility');
 const { deleteWithAccountingHistory } = require('../services/accountingHistory');
 const { formatBoolean } = require('../utils/dbCompat');
 const { slugify } = require('../utils/slug');
 const { adminAuth } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
 const StreamZip = require('node-stream-zip');
-const { requireEventOwnership, scopeEventsListQuery } = require('../middleware/ownership');
+const { requireEventOwnership, requireEventOwner, scopeEventsListQuery } = require('../middleware/ownership');
 const { assertZipEntriesWithin } = require('../utils/safePath');
-const { escapeLikePattern, likeWithEscape } = require('../utils/sqlSecurity');
+const { escapeLikePattern, likeWithEscape, unicodeSearchForms } = require('../utils/sqlSecurity');
 const logger = require('../utils/logger');
 const { sanitizeForZipEntry } = require('../utils/filenameSanitizer');
 const { getPagination } = require('../utils/routeHelpers');
 const { ALLOWED_MEDIA_TYPES, ALLOWED_VIDEO_TYPES } = require('../utils/fileSecurityUtils');
 const { toIso } = require('../utils/dateNormalize');
 const { clearGuestCredits } = require('../services/photoCredit');
+const folderTree = require('../services/folderTreeService');
+const { parseBooleanInput } = require('../utils/parsers');
 const { getStorage } = require('../services/storage');
-const { pipeStreamToResponse } = require('../utils/streamResponse');
+const {
+  claimArchive, isArchiveRunning, recordSupersededArchive, supersededArchives, legacyArchiveKeys,
+} = require('../services/archiveService');
+const { pipeStreamToResponse, answerVanished } = require('../utils/streamResponse');
+const { DEFAULT_STALE_MS } = require('../services/maintenanceJobState');
 const router = express.Router();
 
 /**
@@ -59,17 +66,21 @@ router.get('/', adminAuth, requirePermission('archives.view'), async (req, res) 
     // literal % or _ typed into the search box has to match itself rather
     // than act as a wildcard: escapeLikePattern() backslash-escapes them and
     // likeWithEscape() names that backslash in an explicit ESCAPE clause,
-    // which matters because SQLite has no default escape character.
+    // which matters because SQLite has no default escape character. Case
+    // folding is likeWithEscape()'s job too (ILIKE on Postgres); LOWER() on
+    // both sides is not an option because SQLite's LOWER() is ASCII-only.
     const applyFilters = (query) => {
       // Same visibility as the events list, so the rows, the total and the
       // stat cards never describe another owner's archives to a role limited
       // to its own events.
       scopeEventsListQuery(query, req.admin, 'events.created_by');
       if (search) {
-        query.whereRaw(
-          likeWithEscape('LOWER(events.event_name)'),
-          [`%${escapeLikePattern(search.toLowerCase())}%`]
-        );
+        // Every stored spelling of the name (unicodeSearchForms).
+        query.where((builder) => {
+          for (const form of unicodeSearchForms(search)) {
+            builder.orWhereRaw(likeWithEscape('events.event_name'), [`%${escapeLikePattern(form)}%`]);
+          }
+        });
       }
       if (type && type !== 'all') {
         query.where('events.event_type', type);
@@ -93,7 +104,7 @@ router.get('/', adminAuth, requirePermission('archives.view'), async (req, res) 
     const photoTotal = await applyFilters(
       db('events').where('events.is_archived', formatBoolean(true))
     )
-      .leftJoin('photos', 'events.id', 'photos.event_id')
+      .modify(leftJoinLivePhotos, 'events.id', 'photos.event_id')
       .count('photos.id as count')
       .first();
 
@@ -105,7 +116,7 @@ router.get('/', adminAuth, requirePermission('archives.view'), async (req, res) 
           db.raw('COUNT(DISTINCT photos.id) as photo_count'),
           db.raw('SUM(photos.size_bytes) as total_size')
         )
-        .leftJoin('photos', 'events.id', 'photos.event_id')
+        .modify(leftJoinLivePhotos, 'events.id', 'photos.event_id')
         .where('events.is_archived', formatBoolean(true))
     ).groupBy('events.id');
 
@@ -179,7 +190,7 @@ router.get('/:id', adminAuth, requirePermission('archives.view'), requireEventOw
     }
 
     // Get photo details
-    const photos = await db('photos')
+    const photos = await livePhotos(db)
       .where('event_id', archive.id)
       .select('filename', 'type', 'size_bytes', 'uploaded_at');
 
@@ -227,12 +238,31 @@ router.get('/:id', adminAuth, requirePermission('archives.view'), requireEventOw
 
 // Restore archive
 router.post('/:id/restore', adminAuth, requirePermission('archives.restore'), requireEventOwnership, async (req, res) => {
+  let lease = null;
   try {
-    const archive = await db('events')
+    let archive = await db('events')
       .where('id', req.params.id)
       .where('is_archived', formatBoolean(true))
       .first();
 
+    if (!archive) {
+      return res.status(404).json({ error: 'Archive not found' });
+    }
+
+    // The archive job sets is_archived before it deletes the originals and
+    // derived files (issue 2012): restoring in that window would bring photos
+    // back for the job to delete. The restore holds the gallery's archive
+    // claim, so it waits for no job and none starts under it, and a job that
+    // stalled past its lease sees the claim gone and stops deleting.
+    lease = await claimArchive(archive.id);
+    if (!lease) {
+      return res.status(409).json({ error: 'This gallery is being archived right now', code: 'ARCHIVE_IN_PROGRESS' });
+    }
+    // Again under the claim: a restore that finished in the meantime.
+    archive = await db('events')
+      .where('id', archive.id)
+      .where('is_archived', formatBoolean(true))
+      .first();
     if (!archive) {
       return res.status(404).json({ error: 'Archive not found' });
     }
@@ -440,6 +470,9 @@ router.post('/:id/restore', adminAuth, requirePermission('archives.restore'), re
       // Photo credits (#1561). A guest erased while the event was archived
       // had their name cleared from rows that no longer existed, so the
       // manifest still holds it; only a guest still on the event keeps theirs.
+      // The uploading account (issue 743) comes back only while it exists:
+      // the column is a foreign key on PostgreSQL.
+      const liveAdminIds = new Set((await db('admin_users').pluck('id')).map(Number));
       const activeGuestIds = new Set((await db('gallery_guests')
         .where({ event_id: archive.id, is_deleted: formatBoolean(false) })
         .pluck('id')).map(Number));
@@ -447,7 +480,7 @@ router.post('/:id/restore', adminAuth, requirePermission('archives.restore'), re
         if (!entry) return {};
         const fields = {};
         if (entry.uploaded_by === 'admin' || entry.uploaded_by === 'guest') fields.uploaded_by = entry.uploaded_by;
-        const source = ['guest', 'exif', 'manual'].includes(entry.credit_source) ? entry.credit_source : null;
+        const source = ['guest', 'exif', 'manual', 'account'].includes(entry.credit_source) ? entry.credit_source : null;
         const guestId = Number(entry.uploader_guest_id);
         const guestKept = Number.isInteger(guestId) && activeGuestIds.has(guestId);
         if (source === 'guest' && !guestKept) return fields;
@@ -653,6 +686,23 @@ router.post('/:id/restore', adminAuth, requirePermission('archives.restore'), re
           categoryId = await resolveCategoryId(dirPath.split('/')[0]);
         }
 
+        // Folder (issue 1786): rebuilt from the recorded path. A category name
+        // that resolves to a folder (an archive written before folder_id
+        // existed) lands in folder_id too, where that photo used to render.
+        let folderId = null;
+        if (manifestEntry?.folder_path) {
+          const segments = String(manifestEntry.folder_path).split('/').filter(Boolean);
+          // foldAtLimit: a restore never drops a photo over the folder cap.
+          ({ folderId } = await folderTree.ensurePath(archive.id, segments, { canCreate: true, foldAtLimit: true }));
+        }
+        if (categoryId) {
+          const resolved = await db('photo_categories').where('id', categoryId).first('is_folder');
+          if (resolved && parseBooleanInput(resolved.is_folder, false)) {
+            folderId = folderId || categoryId;
+            categoryId = null;
+          }
+        }
+
         const isVideoEntry = manifestEntry?.media_type === 'video'
           || String(manifestEntry?.mime_type || '').startsWith('video/')
           || VIDEO_EXTENSIONS.has(extension);
@@ -692,6 +742,8 @@ router.post('/:id/restore', adminAuth, requirePermission('archives.restore'), re
           // was just written.
           size_bytes: entry.size,
           category_id: categoryId,
+          folder_id: folderId,
+          first_look: formatBoolean(parseBooleanInput(manifestEntry?.first_look, false)),
           // Restore order is not upload order; stamping the clock here
           // reshuffled the whole gallery. The manifest holds whatever
           // shape the row had, and on SQLite a `new Date()` written
@@ -703,6 +755,14 @@ router.post('/:id/restore', adminAuth, requirePermission('archives.restore'), re
           // not the column default — and this column is NOT NULL.
           credit_visible_to_guests: false,
           ...creditFieldsOf(manifestEntry),
+          // Always written for the same multi-row reason. A team upload that
+          // was archived under review (issue 743) comes back hidden and under
+          // review; the restore must not publish it.
+          ...(['pending', 'rejected'].includes(manifestEntry?.moderation_status)
+            ? { moderation_status: manifestEntry.moderation_status, visibility: 'hidden' }
+            : { moderation_status: null, visibility: 'visible' }),
+          uploaded_by_admin_id: liveAdminIds.has(Number(manifestEntry?.uploaded_by_admin_id))
+            ? Number(manifestEntry.uploaded_by_admin_id) : null,
         });
       }
 
@@ -736,19 +796,37 @@ router.post('/:id/restore', adminAuth, requirePermission('archives.restore'), re
     const thirtyDaysFromNow = new Date();
     thirtyDaysFromNow.setDate(thirtyDaysFromNow.getDate() + 30);
     
-    await db('events')
-      .where('id', req.params.id)
-      .update({
-        is_archived: formatBoolean(false),
-        is_active: formatBoolean(true),
-        archive_path: null,
-        // Cleared with the path it measures — a restored event has no zip, and
-        // a stale size would be re-shown verbatim if it is archived again
-        // before the new archive finishes writing.
-        archive_size: null,
-        archived_at: null,
-        expires_at: thirtyDaysFromNow.toISOString() // Reset expiration - works on both DBs
-      });
+    // The zip stays (issue 2012): the gallery's fallback until it has a newer
+    // archive. Each archive run writes a key of its own, so archiving again no
+    // longer overwrites it; recorded with the update that drops its path, it
+    // goes once the next archive is published, or with the gallery.
+    await db.transaction(async (trx) => {
+      await trx('events')
+        .where('id', req.params.id)
+        .update({
+          is_archived: formatBoolean(false),
+          is_active: formatBoolean(true),
+          archive_path: null,
+          // Cleared with the path it measures — a restored event has no zip, and
+          // a stale size would be re-shown verbatim if it is archived again
+          // before the new archive finishes writing.
+          archive_size: null,
+          archived_at: null,
+          expires_at: thirtyDaysFromNow.toISOString() // Reset expiration - works on both DBs
+        });
+      await recordSupersededArchive(lease, archive.archive_path, trx);
+    });
+
+    // Browser-playable copies (issue 1430): archiving dropped them and reset
+    // the rows (archiveService). With the setting on, the restored videos are
+    // queued again here; off, they wait for the next switch-on backfill.
+    // Metadata stripping (issue 2102) queues them on its own while it is on.
+    const videoRendition = require('../services/videoRenditionService');
+    if (await videoRendition.isEnabled()) {
+      await videoRendition.backfillPending({ eventId: archive.id });
+    } else {
+      await videoRendition.queueForMetadataStrip({ eventId: archive.id });
+    }
 
     // Log activity
     await db('activity_logs').insert({
@@ -764,6 +842,8 @@ router.post('/:id/restore', adminAuth, requirePermission('archives.restore'), re
   } catch (error) {
     logger.error('Archive restore error:', error);
     res.status(500).json({ error: 'Failed to restore archive' });
+  } finally {
+    if (lease) await lease.release();
   }
 });
 
@@ -817,13 +897,15 @@ router.get('/:id/download', adminAuth, requirePermission('archives.download'), r
       metadata: JSON.stringify({ event_name: archive.event_name })
     });
   } catch (error) {
+    // Removed since the stat (issue 2129): the failed stat's 404.
+    if (answerVanished(res, error, 'Archive file not found in storage')) return;
     logger.error('Archive download error:', error);
     res.status(500).json({ error: 'Failed to download archive' });
   }
 });
 
 // Delete archive permanently
-router.delete('/:id', adminAuth, requirePermission('archives.delete'), requireEventOwnership, async (req, res) => {
+router.delete('/:id', adminAuth, requirePermission('archives.delete'), requireEventOwner, async (req, res) => {
   try {
     const archive = await db('events')
       .where('id', req.params.id)
@@ -833,6 +915,9 @@ router.delete('/:id', adminAuth, requirePermission('archives.delete'), requireEv
     if (!archive) {
       return res.status(404).json({ error: 'Archive not found' });
     }
+    if (await isArchiveRunning(archive.id)) {
+      return res.status(409).json({ error: 'This gallery is being archived right now', code: 'ARCHIVE_IN_PROGRESS' });
+    }
 
     // Delete archive file if exists. Through the storage backend: on an S3
     // deployment the local path never had it, so the zip outlived the event.
@@ -841,6 +926,13 @@ router.delete('/:id', adminAuth, requirePermission('archives.delete'), requireEv
     // would leave the zip in the bucket with nothing left to retry from.
     if (archive.archive_path) {
       await getStorage().delete(archive.archive_path);
+    }
+    // Zips earlier restores brought back (issue 2012), best effort, the one
+    // a restore before per-run keys left at the shared key too.
+    const restoredFrom = [...await supersededArchives(archive.id).catch(() => []),
+      ...await legacyArchiveKeys(archive).catch(() => [])];
+    for (const key of restoredFrom) {
+      if (key !== archive.archive_path) await getStorage().delete(key).catch(() => {});
     }
 
     // Delete thumbnails for this event
@@ -858,26 +950,73 @@ router.delete('/:id', adminAuth, requirePermission('archives.delete'), requireEv
       }
     }
 
-    // Face data (#1074, #1132). This route deletes the event row directly and
-    // relies on the FK cascade, but SQLite only honours ON DELETE CASCADE with
-    // `PRAGMA foreign_keys = ON`, which PicPeak does not set — and
-    // event_people_merge_dismissals has no event FK at all, on either engine.
-    // archiveEvent's purge step is deliberately nonfatal, so an event can
-    // still be carrying face data when it reaches this permanent delete.
-    // Delete explicitly, the same way deleteEventCascade does.
-    await db('photo_faces').where('event_id', req.params.id).del();
-    await db('event_people').where('event_id', req.params.id).del();
-    if (await db.schema.hasTable('event_people_merge_dismissals')) {
-      await db('event_people_merge_dismissals').where('event_id', req.params.id).del();
-    }
-    // Download-limit grants (issue 1560), for the same SQLite reason.
-    if (await db.schema.hasTable('event_download_grants')) {
-      await db('event_download_grants').where('event_id', req.params.id).del();
-    }
-
-    // Delete from database (cascade will delete photos and logs)
-    await deleteWithAccountingHistory(db, 'events', { id: req.params.id },
-      { actor: req.admin.id, source: 'archive.delete' });
+    // The child rows, explicitly, then the event. This used to delete the
+    // event row alone and rely on the FK cascade, but activity_logs,
+    // access_logs and email_queue reference events WITHOUT ON DELETE CASCADE
+    // (db.js), so on PostgreSQL the delete failed on the foreign key. SQLite
+    // never enforces the keys (PicPeak does not set `PRAGMA foreign_keys =
+    // ON`), which is why it went unnoticed there — and why the declared
+    // cascades on photo_faces, event_download_grants and feedback_rate_limits
+    // are inert there too. Same table list and order as deleteEventCascade
+    // (adminEvents/helpers.js), which carries the reasons for each one; not
+    // reused because it sweeps and audits as an event delete, and this is an
+    // archive delete.
+    const hasMergeDismissals = await db.schema.hasTable('event_people_merge_dismissals');
+    const hasDownloadGrants = await db.schema.hasTable('event_download_grants');
+    const hasAdminAssignments = await db.schema.hasTable('event_admin_assignments');
+    const hasDownloadRecipients = await db.schema.hasTable('download_job_recipients');
+    const hasSelectionSubmissions = await db.schema.hasTable('selection_submissions');
+    await db.transaction(async (trx) => {
+      // Event row first (issue 1560): the download-limit grants lock the
+      // event row and then grant/photo rows, so taking them here in the
+      // opposite order could deadlock on PostgreSQL.
+      if (trx.client.config.client === 'pg') {
+        await trx('events').where({ id: req.params.id }).forUpdate().first();
+        // Then its photos (issue 2069): a face scan locks its photo before
+        // the photo's faces, so deleting the faces below first could wait for
+        // a scan that waits for the photo delete at the end.
+        await trx('photos').where('event_id', req.params.id).orderBy('id').forUpdate().pluck('id');
+      }
+      await trx('activity_logs').where('event_id', req.params.id).del();
+      await trx('access_logs').where('event_id', req.params.id).del();
+      await trx('email_queue').where('event_id', req.params.id).del();
+      // Face data (#1074, #1132): archiveEvent's purge step is deliberately
+      // nonfatal, so an event can still be carrying it here.
+      await trx('photo_faces').where('event_id', req.params.id).del();
+      await trx('event_people').where('event_id', req.params.id).del();
+      if (hasMergeDismissals) {
+        await trx('event_people_merge_dismissals').where('event_id', req.params.id).del();
+      }
+      if (hasDownloadGrants) {
+        await trx('event_download_grants').where('event_id', req.params.id).del();
+      }
+      if (hasAdminAssignments) {
+        await trx('event_admin_assignments').where('event_id', req.params.id).del();
+      }
+      if (hasDownloadRecipients) {
+        await trx('download_job_recipients')
+          .whereIn('job_id', trx('download_jobs').where('event_id', req.params.id).select('id')).del();
+      }
+      await trx('feedback_rate_limits').where('event_id', req.params.id).del();
+      if (hasSelectionSubmissions) {
+        await trx('selection_submissions').where('event_id', req.params.id).del();
+      }
+      await trx('photos').where('event_id', req.params.id).del();
+      // Scene tags (issue 1733) stay with an archived gallery's photo rows.
+      // After the photos: a tagging worker locks the photo row first, and
+      // taking the two in the other order can deadlock on PostgreSQL.
+      await trx('photo_tags').where('event_id', req.params.id).del();
+      if (await trx.schema.hasTable('maintenance_jobs')) {
+        // Only a claim nobody holds, on claim()'s own terms: a restore that
+        // took the gallery after the check above still needs its row.
+        const cutoff = new Date(Date.now() - DEFAULT_STALE_MS).toISOString();
+        await trx('maintenance_jobs').where({ job_name: `event_archive:${Number(req.params.id)}` })
+          .where(function () { this.where('is_running', false).orWhere('heartbeat_at', '<', cutoff); })
+          .del();
+      }
+      await deleteWithAccountingHistory(trx, 'events', { id: req.params.id },
+        { actor: req.admin.id, source: 'archive.delete' });
+    });
 
     // Log activity
     await db('activity_logs').insert({

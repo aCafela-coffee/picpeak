@@ -1,16 +1,18 @@
 const express = require('express');
 const { db } = require('../database/db');
+const { livePhotos } = require('../utils/photoVisibility');
 const { adminAuth } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/permissions');
-const { seesAllEvents } = require('../middleware/ownership');
+const { seesAllEvents, scopeEventsQuery } = require('../middleware/ownership');
 const { sanitizeDays } = require('../utils/sqlSecurity');
-const { formatBoolean } = require('../utils/dbCompat');
+const { formatBoolean, whereTimestamp } = require('../utils/dbCompat');
 const { resolveAdapter } = require('../services/trackers');
 const logger = require('../utils/logger');
 const { errorResponse, getPagination } = require('../utils/routeHelpers');
 const { measureLocalStorageUsage } = require('../services/localStorageUsage');
-const { queueTimestamp } = require('../utils/queueTimestamps');
+const { queueTimestamp, toUtcIso } = require('../utils/queueTimestamps');
 const { IS_VIDEO_SQL } = require('../utils/mediaTypeSql');
+const { PROTECTED_PENDING_STATUS } = require('../utils/emailQueueEncryption');
 const router = express.Router();
 
 /**
@@ -46,12 +48,12 @@ function normaliseDateKey(value) {
  */
 function isScopedAdmin(admin) {
   // Mirrors the events list: every role except super_admin and admin is
-  // limited to its own events plus ownerless ones.
+  // limited to its own events, assigned ones and ownerless ones.
   return !seesAllEvents(admin);
 }
 
 /**
- * Restrict `query` to the caller's own events.
+ * Restrict `query` to the caller's own and assigned events.
  *
  * Uses a SUBQUERY rather than materialising the id list. An editor owning more
  * events than the driver's bind-parameter limit (~999 on SQLite, 65535 on
@@ -61,8 +63,7 @@ function isScopedAdmin(admin) {
  */
 function applyEventScope(query, admin, column) {
   if (!isScopedAdmin(admin)) return query;
-  return query.whereIn(column, db('events').select('id')
-    .where((q) => q.whereNull('created_by').orWhere('created_by', admin.id)));
+  return query.whereIn(column, scopeEventsQuery(db('events').select('id'), admin));
 }
 
 // Get dashboard statistics
@@ -80,22 +81,24 @@ router.get('/stats', adminAuth, requirePermission('analytics.view'), async (req,
     sevenDaysFromNow.setDate(sevenDaysFromNow.getDate() + 7);
     const now = new Date();
     
+    // Same mixed-shape comparison as the events list's status=expiring
+    // (issue 1733): the tile and the list it sits next to must agree.
     const expiringEvents = await applyEventScope(db('events'), req.admin, 'id')
       .where('is_active', formatBoolean(true))
       .where('is_archived', formatBoolean(false))
-      .where('expires_at', '<=', sevenDaysFromNow.toISOString())
-      .where('expires_at', '>', now.toISOString())
+      .modify(whereTimestamp, 'expires_at', '<=', sevenDaysFromNow)
+      .modify(whereTimestamp, 'expires_at', '>', now)
       .count('id as count')
       .first();
 
     // Get total photos count
-    const totalPhotos = await applyEventScope(db('photos'), req.admin, 'event_id')
+    const totalPhotos = await applyEventScope(livePhotos(db), req.admin, 'event_id')
       .count('id as count')
       .first();
 
     // How many of those rows are videos. totalPhotos stays the count of both
     // types; the dashboard shows the split when this is non-zero.
-    const totalVideos = await applyEventScope(db('photos'), req.admin, 'event_id')
+    const totalVideos = await applyEventScope(livePhotos(db), req.admin, 'event_id')
       .whereRaw(IS_VIDEO_SQL)
       .count('id as count')
       .first();
@@ -234,8 +237,14 @@ router.get('/activity', adminAuth, requirePermission('analytics.view'), async (r
     // the cross-admin actions this advisory is about.
     const activities = await applyEventScope(
       db('activity_logs')
-        .select('activity_logs.*', 'events.event_name')
-        .leftJoin('events', 'activity_logs.event_id', 'events.id'),
+        .select('activity_logs.*', 'events.event_name', 'actor_admin.username as actor_admin_username')
+        .leftJoin('events', 'activity_logs.event_id', 'events.id')
+        // Some admin rows carry the id but no name (services that only know
+        // the acting admin's id); read the current username for those.
+        .leftJoin('admin_users as actor_admin', function joinActorAdmin() {
+          this.on('activity_logs.actor_id', '=', 'actor_admin.id')
+            .andOnVal('activity_logs.actor_type', '=', 'admin');
+        }),
       req.admin,
       'activity_logs.event_id'
     )
@@ -247,7 +256,7 @@ router.get('/activity', adminAuth, requirePermission('analytics.view'), async (r
       id: activity.id,
       type: activity.activity_type,
       actorType: activity.actor_type,
-      actorName: activity.actor_name,
+      actorName: activity.actor_name || activity.actor_admin_username || null,
       eventName: activity.event_name,
       metadata: (() => {
         try {
@@ -259,7 +268,8 @@ router.get('/activity', adminAuth, requirePermission('analytics.view'), async (r
           return {};
         }
       })(),
-      createdAt: activity.created_at
+      // Zone-less UTC from the column default on SQLite; see toUtcIso.
+      createdAt: toUtcIso(activity.created_at)
     }));
 
     res.json(formattedActivities);
@@ -283,7 +293,7 @@ router.get('/health', adminAuth, requirePermission('settings.view'), async (req,
 
     // Check email queue
     const [pendingEmails] = await db('email_queue')
-      .where('status', 'pending')
+      .whereIn('status', ['pending', PROTECTED_PENDING_STATUS])
       .count('* as count');
     
     // Failures of the last day, by created_at: scheduled_at is NULL for mail
@@ -402,11 +412,13 @@ router.get('/analytics', adminAuth, requirePermission('analytics.view'), async (
       if (dateObj) dateObj.uniqueVisitors = Number(row.count) || 0;
     });
 
-    // Get top galleries by views with additional metrics
+    // Get top galleries by views with additional metrics. The camelCase
+    // alias is quoted because Postgres folds an unquoted identifier to
+    // lower case, and the frontend reads `uniqueVisitors`, not `uniquevisitors`.
     const topGalleries = await applyEventScope(db('access_logs'), req.admin, 'access_logs.event_id')
       .select('events.id', 'events.event_name', 'events.slug')
       .select(db.raw('COUNT(CASE WHEN action = \'view\' THEN 1 END) as views'))
-      .select(db.raw('COUNT(DISTINCT CASE WHEN action = \'view\' THEN ip_address END) as uniqueVisitors'))
+      .select(db.raw('COUNT(DISTINCT CASE WHEN action = \'view\' THEN ip_address END) as "uniqueVisitors"'))
       .select(db.raw('COUNT(CASE WHEN action IN (\'download\', \'download_all\', \'download_all_presigned\', \'download_selected\') THEN 1 END) as downloads'))
       .join('events', 'access_logs.event_id', 'events.id')
       .where('access_logs.timestamp', '>=', startDateStr)

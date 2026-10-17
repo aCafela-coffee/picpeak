@@ -21,6 +21,7 @@ const { db, logActivity } = require('../database/db');
 const { getBcryptRounds, MAX_PASSWORD_LENGTH } = require('../utils/passwordValidation');
 const { resolveStoredPathStrict, contractPdfRoots } = require('../utils/safePath');
 const { buildContentDisposition } = require('../utils/filenameSanitizer');
+const { pipeStreamToResponse, answerVanished } = require('../utils/streamResponse');
 const logger = require('../utils/logger');
 const { errorResponse, safeValidationErrors } = require('../utils/routeHelpers');
 const { getClientIp } = require('../utils/requestIp');
@@ -89,6 +90,7 @@ const PROFILE_FIELD_MAP = {
   countryCode: 'country_code',
   preferredLanguage: 'preferred_language',
 };
+const CUSTOMER_NAME_FIELDS = new Set(['first_name', 'last_name', 'display_name', 'company_name']);
 
 function shapeProfile(row) {
   if (!row) return null;
@@ -322,6 +324,8 @@ router.put('/profile', [
       if (!Object.prototype.hasOwnProperty.call(req.body, camel)) continue;
       let value = req.body[camel];
       if (typeof value === 'string') value = value.trim();
+      // One stored form per name (NFC), as the admin update path writes it.
+      if (typeof value === 'string' && CUSTOMER_NAME_FIELDS.has(snake)) value = value.normalize('NFC');
       if (value === '') value = null;
       if (snake === 'country_code' && value) {
         value = String(value).toUpperCase().slice(0, 2);
@@ -850,7 +854,9 @@ router.get('/contracts/:id/pdf', customerAuth, async (req, res) => {
     }
     res.set('Content-Type', 'application/pdf');
     res.set('Content-Disposition', `inline; filename="${path.basename(filePath)}"`);
-    fs.createReadStream(filePath).pipe(res);
+    // The read stream opens lazily: a file removed after the check above
+    // errors after this handler returned, outside the try/catch.
+    pipeStreamToResponse(fs.createReadStream(filePath), res, { context: `contract ${contract.id} PDF` });
   } catch (error) {
     if (error && error.statusCode === 403) return res.status(403).json({ error: error.message, code: error.code });
     errorResponse(res, error, 500, 'Failed to render contract PDF');
@@ -1026,7 +1032,7 @@ router.post(
       return next(error);
     }
   },
-  contractSignedPdfUpload.signedPdfUpload.single('file'),
+  contractSignedPdfUpload.signedPdfSingle,
   async (req, res) => {
     try {
       await contractSignedPdfUpload.finishSignedPdfUpload(req, res, { actor: portalActor(req) });
@@ -1347,14 +1353,22 @@ router.get('/documents/:id/download', customerAuth, requireDocumentsFeature, asy
       return res.status(409).json({ error: 'This document was rejected and cannot be downloaded.', code: 'DOCUMENT_REJECTED' });
     }
     const stream = await customerDocumentsService.openStream(row);
-    await customerDocumentsService.recordView(row.id, 'customer', req.customer.id);
-    await logActivity('customer_document_downloaded',
-      { documentId: row.id, customerId: req.customer.id },
-      row.event_id || null,
-      { type: 'customer', id: req.customer.id, name: req.customer.email }
-    );
+    try {
+      await customerDocumentsService.recordView(row.id, 'customer', req.customer.id);
+      await logActivity('customer_document_downloaded',
+        { documentId: row.id, customerId: req.customer.id },
+        row.event_id || null,
+        { type: 'customer', id: req.customer.id, name: req.customer.email }
+      );
+    } catch (error) {
+      // Nothing will read it now; on S3 it holds a pooled socket.
+      stream.destroy();
+      throw error;
+    }
     sendDocumentAttachment(res, stream, row);
   } catch (error) {
+    // Removed after the lookup: answered as a missing file, not a 500.
+    if (answerVanished(res, error, 'Document file not found')) return;
     sendDocumentError(res, error, 'Failed to download document');
   }
 });

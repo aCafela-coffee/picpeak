@@ -1,7 +1,43 @@
 import { useTranslation } from 'react-i18next';
 import { format as dateFnsFormat, formatDistanceToNow as dateFnsFormatDistanceToNow, isValid } from 'date-fns';
-import { de, enUS, ptBR, fr, ko } from 'date-fns/locale';
+import { de, enUS, es, fr, ko, nl, ptBR, ru, sl } from 'date-fns/locale';
+import type { Locale } from 'date-fns';
 import { usePublicSettings } from './usePublicSettings';
+import { expiryDay } from '../utils/expiryDay';
+
+// One entry per shipped UI locale (src/i18n/locales). Keyed by base
+// language so a regional tag like `de-DE` or `fr-CH` resolves too.
+const DATE_LOCALES: Record<string, Locale> = {
+  de,
+  en: enUS,
+  es,
+  fr,
+  ko,
+  nl,
+  pt: ptBR,
+  ru,
+  sl,
+};
+
+export const resolveDateLocale = (language: string | undefined): Locale =>
+  DATE_LOCALES[(language || '').toLowerCase().split('-')[0]] || enUS;
+
+/**
+ * SQLite's CURRENT_TIMESTAMP: 'YYYY-MM-DD HH:MM:SS', UTC with no zone marker.
+ * Columns filled by the database default reach the API in this shape on a
+ * SQLite install, and a browser reads a zone-less date-time as LOCAL time, so
+ * west of UTC such a row lies in the future (issue 1815). The space is what
+ * tells it apart from a `datetime-local` value ('YYYY-MM-DDTHH:mm'), which
+ * is local on purpose and is left alone.
+ */
+const SQLITE_UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/;
+
+/** A date or date string as a Date, reading SQLite's zone-less shape as UTC. */
+export const toDisplayDate = (date: Date | string): Date => {
+  if (typeof date !== 'string') return date;
+  const text = date.trim();
+  return new Date(SQLITE_UTC_TIMESTAMP.test(text) ? `${text.replace(' ', 'T')}Z` : date);
+};
 
 // Convert old date format strings to new date-fns format
 const convertDateFormat = (format: string): string => {
@@ -16,24 +52,10 @@ export const useLocalizedDate = () => {
   
   const { data: settings } = usePublicSettings();
   
-  const getLocale = () => {
-    switch (i18n.language?.toLowerCase().split('-')[0]) {
-      case 'ko':
-        return ko;
-      case 'de':
-        return de;
-      case 'pt':
-      case 'pt-BR':
-        return ptBR;
-      case 'fr':
-        return fr;
-      default:
-        return enUS;
-    }
-  };
+  const getLocale = () => resolveDateLocale(i18n.language);
   
   const format = (date: Date | string, formatStr?: string) => {
-    const dateObj = typeof date === 'string' ? new Date(date) : date;
+    const dateObj = toDisplayDate(date);
     // date-fns `format` throws RangeError on an Invalid Date, which crashes the
     // whole page when a call site renders a transient/partial date (e.g. the
     // event-date field mid-edit). Return '' instead so a bad value degrades to
@@ -55,8 +77,21 @@ export const useLocalizedDate = () => {
     return dateFnsFormat(dateObj, dateFormat, { locale: getLocale() });
   };
   
+  /**
+   * A gallery expiry as the day it stands for in the instance time zone (see
+   * utils/expiryDay), so every view names the day the settings field shows,
+   * wherever the viewer is. Formatted like `format()`.
+   */
+  const formatExpiry = (date: Date | string | number, formatStr?: string) => {
+    // A SQLite row can hold the expiry as epoch milliseconds.
+    const dateObj = typeof date === 'number' ? new Date(date) : toDisplayDate(date);
+    if (!isValid(dateObj)) return '';
+    const [y, m, d] = expiryDay(dateObj, settings?.expiry_time_zone).split('-').map(Number);
+    return format(new Date(y, m - 1, d), formatStr);
+  };
+
   const formatDistanceToNow = (date: Date | string, options?: { addSuffix?: boolean }) => {
-    const dateObj = typeof date === 'string' ? new Date(date) : date;
+    const dateObj = toDisplayDate(date);
     if (!isValid(dateObj)) return '';
     return dateFnsFormatDistanceToNow(dateObj, { ...options, locale: getLocale() });
   };
@@ -82,7 +117,7 @@ export const useLocalizedDate = () => {
       const d = new Date(2000, 0, 1, parseInt(h, 10), parseInt(m, 10));
       return dateFnsFormat(d, timeFormatToken, { locale: getLocale() });
     }
-    const dateObj = typeof date === 'string' ? new Date(date) : date;
+    const dateObj = toDisplayDate(date);
     return dateFnsFormat(dateObj, timeFormatToken, { locale: getLocale() });
   };
 
@@ -98,7 +133,7 @@ export const useLocalizedDate = () => {
    * Pass `formatStr` to override the date half (same shape as `format()`).
    */
   const formatDateTime = (date: Date | string, formatStr?: string) => {
-    const dateObj = typeof date === 'string' ? new Date(date) : date;
+    const dateObj = toDisplayDate(date);
     let dateFormat = formatStr;
     if (!dateFormat && settings?.general_date_format) {
       dateFormat = typeof settings.general_date_format === 'string'
@@ -112,6 +147,7 @@ export const useLocalizedDate = () => {
 
   return {
     format,
+    formatExpiry,
     formatTime,
     formatDateTime,
     formatDistanceToNow,

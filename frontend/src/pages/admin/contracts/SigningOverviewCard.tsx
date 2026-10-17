@@ -13,7 +13,7 @@ import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { AlertTriangle, BellRing, CheckCircle2, Eye, EyeOff, Send, ShieldCheck, Users, XCircle } from 'lucide-react';
-import { Button, Card } from '../../../components/common';
+import { Button, Card, useConfirm } from '../../../components/common';
 import { PermissionGate } from '../../../components/admin/PermissionGate';
 import { useLocalizedDate } from '../../../hooks/useLocalizedDate';
 import { useMutationWithToast } from '../../../hooks';
@@ -27,9 +27,9 @@ import {
 
 const STATUS_CHIP: Record<string, string> = {
   pending: 'bg-inset text-body',
-  invited: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200',
-  signed: 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200',
-  declined: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200',
+  invited: 'bg-warning-soft text-warning-text',
+  signed: 'bg-success-soft text-success-text',
+  declined: 'bg-danger-soft text-danger-text',
 };
 
 interface SigningOverviewCardProps {
@@ -40,6 +40,7 @@ interface SigningOverviewCardProps {
 
 export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contractId, contractStatus, overview }) => {
   const { t } = useTranslation();
+  const confirm = useConfirm();
   const { formatDateTime } = useLocalizedDate();
 
   // The failed step in words. Only the step and a safe code come from the
@@ -93,6 +94,15 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
     }
   };
   const signers = [...overview.signers].sort((a, b) => a.position - b.position);
+  // How each signer's current link reached them, from the signing log rather
+  // than today's switch: a link mailed before "no administrative emails"
+  // went on still reads "Link sent".
+  const LINK_EVENTS = ['invited', 'invited_portal', 'invitation_resent', 'reminded'];
+  const portalOnly = new Set<number>();
+  for (const e of [...overview.events].sort((a, b) => a.seq - b.seq)) {
+    if (e.signerId == null || !LINK_EVENTS.includes(e.type)) continue;
+    if (e.type === 'invited_portal') portalOnly.add(e.signerId); else portalOnly.delete(e.signerId);
+  }
   const nameOf = (id: number | null) => (id == null ? null : signers.find((s) => s.id === id)?.name || null);
 
   const resendMutation = useMutationWithToast({
@@ -101,6 +111,9 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
     invalidateKeys: [['contract-signers', contractId]],
     errorMessage: (err: unknown) => {
       const code = (err as { response?: { data?: { code?: string } } })?.response?.data?.code;
+      if (code === 'NO_ADMIN_EMAILS') {
+        return t('contracts.signers.noAdminEmails', 'This customer takes no administrative emails, so no link can be sent to them. They sign in the customer portal or on paper.') as string;
+      }
       if (code === 'SIGNER_NOT_DUE') {
         return t('contracts.signers.resendNotDue', 'This signer can\'t get a new link now: it isn\'t their turn yet, or they have already signed.') as string;
       }
@@ -117,6 +130,9 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
     invalidateKeys: [['contract-signers', contractId]],
     errorMessage: (err: unknown) => {
       const code = (err as { response?: { data?: { code?: string } } })?.response?.data?.code;
+      if (code === 'NO_ADMIN_EMAILS') {
+        return t('contracts.signers.noAdminEmails', 'This customer takes no administrative emails, so no link can be sent to them. They sign in the customer portal or on paper.') as string;
+      }
       if (code === 'SIGNER_NOT_DUE') {
         return t('contracts.signers.remindNotDue', 'This signer can\'t be reminded now: it isn\'t their turn yet, or they have already answered.') as string;
       }
@@ -131,7 +147,9 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
     switch (s.status) {
       case 'signed': return t('contracts.signers.status.signed', 'Signed');
       case 'declined': return t('contracts.signers.status.declined', 'Declined');
-      case 'invited': return t('contracts.signers.status.invited', 'Link sent');
+      case 'invited': return portalOnly.has(s.id)
+        ? t('contracts.signers.log.type.invited_portal', 'Opened in the portal (no email)')
+        : t('contracts.signers.status.invited', 'Link sent');
       default:
         return s.role === 'issuer'
           ? t('contracts.signers.status.issuerPending', 'Counter-signs last')
@@ -172,8 +190,7 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
           return (
             <div
               role="alert"
-              className="mb-3 p-3 rounded-md text-sm border border-amber-300 bg-amber-50 text-amber-900
-                dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+              className="mb-3 p-3 rounded-md text-sm border border-warning-line bg-warning-soft text-warning-text"
             >
               <p className="font-medium flex items-center gap-2">
                 <AlertTriangle className="w-4 h-4 shrink-0" />
@@ -187,7 +204,7 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
           {signers.map((s) => {
             const via = viaLabel(s.verifiedVia);
             // While details are collected, the first signer's link is the details link.
-            const canResend = s.role === 'customer' && s.status === 'invited'
+            const canResend = s.role === 'customer' && s.status === 'invited' && !s.noMail
               && (contractStatus === 'sent' || contractStatus === 'awaiting_data');
             return (
               <li key={s.id} className="py-2 flex flex-wrap items-start gap-3 text-sm">
@@ -205,7 +222,9 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
                   <p className="text-xs text-soft">
                     {[
                       s.status === 'invited' && s.invitedAt
-                        ? t('contracts.signers.invitedAt', 'Link sent {{date}}', { date: formatDateTime(s.invitedAt) })
+                        ? (portalOnly.has(s.id)
+                          ? t('contracts.signers.portalOpenAt', 'Open in the portal since {{date}} (no email)', { date: formatDateTime(s.invitedAt) })
+                          : t('contracts.signers.invitedAt', 'Link sent {{date}}', { date: formatDateTime(s.invitedAt) }))
                         : null,
                       via,
                       s.signedAt ? t('contracts.signers.signedAt', 'Signed {{date}}', { date: formatDateTime(s.signedAt) }) : null,
@@ -227,10 +246,11 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
                       variant="outline"
                       size="sm"
                       disabled={resendMutation.isPending}
-                      onClick={() => {
-                        if (window.confirm(t('contracts.signers.resendConfirm', 'Send {{name}} a new signing link? The previous link stops working.', { name: s.name || s.email || '' }) as string)) {
-                          resendMutation.mutate(s);
-                        }
+                      onClick={async () => {
+                        if (await confirm({
+                          message: t('contracts.signers.resendConfirm', 'Send {{name}} a new signing link? The previous link stops working.', { name: s.name || s.email || '' }),
+                          confirmLabel: t('contracts.signers.resend', 'Send the link again'),
+                        })) resendMutation.mutate(s);
                       }}
                     >
                       <Send className="w-4 h-4 mr-1" />
@@ -240,10 +260,11 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
                       variant="outline"
                       size="sm"
                       disabled={remindMutation.isPending}
-                      onClick={() => {
-                        if (window.confirm(t('contracts.signers.remindConfirm', 'Send {{name}} a reminder? It carries a new link; the previous one stops working.', { name: s.name || s.email || '' }) as string)) {
-                          remindMutation.mutate(s);
-                        }
+                      onClick={async () => {
+                        if (await confirm({
+                          message: t('contracts.signers.remindConfirm', 'Send {{name}} a reminder? It carries a new link; the previous one stops working.', { name: s.name || s.email || '' }),
+                          confirmLabel: t('contracts.signers.remind', 'Send reminder'),
+                        })) remindMutation.mutate(s);
                       }}
                     >
                       <BellRing className="w-4 h-4 mr-1" />
@@ -267,7 +288,7 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
             {t('contracts.signers.log.title', 'Signing log')}
           </h2>
           {overview.chain && (overview.chain.ok ? (
-            <span className="inline-flex items-center gap-1 text-xs text-green-700 dark:text-green-300">
+            <span className="inline-flex items-center gap-1 text-xs text-success-text">
               <CheckCircle2 className="w-3.5 h-3.5" />
               {t('contracts.signers.log.chainOk', 'Chain intact')}
               <span className="text-muted">
@@ -275,7 +296,7 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
               </span>
             </span>
           ) : (
-            <span className="inline-flex items-center gap-1 text-xs text-red-700 dark:text-red-300">
+            <span className="inline-flex items-center gap-1 text-xs text-danger-text">
               <XCircle className="w-3.5 h-3.5" />
               {t('contracts.signers.log.chainBroken', 'Chain broken at #{{seq}}', { seq: overview.chain.brokenAt ?? '?' })}
             </span>
@@ -285,7 +306,7 @@ export const SigningOverviewCard: React.FC<SigningOverviewCardProps> = ({ contra
           {t('contracts.signers.log.help', 'Every step of the signing, in order. Each entry is chained to the one before, so a change to any entry shows up in the check.')}
         </p>
         {overview.chain && !overview.chain.ok && overview.chain.reason && (
-          <p className="text-sm text-red-700 dark:text-red-300 mb-3">
+          <p className="text-sm text-danger-text mb-3">
             {t(`contracts.signers.log.reason.${overview.chain.reason}`, overview.chain.reason)}
           </p>
         )}
@@ -367,7 +388,7 @@ const EvidencePanel: React.FC<{ contractId: number }> = ({ contractId }) => {
         </span>
       </div>
       {shown && isError && (
-        <p className="mt-2 text-sm text-red-700 dark:text-red-300">
+        <p className="mt-2 text-sm text-danger-text">
           {t('contracts.signers.evidence.error', 'The evidence couldn\'t be loaded. Try again.')}
         </p>
       )}

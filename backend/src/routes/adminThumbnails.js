@@ -7,26 +7,9 @@ const { canAccessEvent } = require('../middleware/ownership');
 const { ensureThumbnail, ensurePreviewImage } = require('../services/imageProcessor');
 const { getStorage } = require('../services/storage');
 const logger = require('../utils/logger');
+const applicationWork = require('../services/activeApplicationWork');
 
-/**
- * Do these two stored paths address the same object?
- *
- * Compared the way the storage backends do, not as raw strings.
- * LocalFsStorage._resolve and S3StorageBackend._key both fold `\` to `/` and
- * strip a leading `./`, so `thumbnails\thumb_x.jpg`, `./thumbnails/thumb_x.jpg`
- * and `thumbnails/thumb_x.jpg` are all one file. A legacy thumbnail_path in
- * any of those shapes would compare unequal to the freshly generated POSIX
- * key — and the "the key moved, delete the old one" branch below would then
- * delete the thumbnail that had just been written, leaving every regenerated
- * photo pointing at nothing.
- */
-function sameStorageKey(a, b) {
-  const canonical = (key) => String(key)
-    .replace(/\\/g, '/')
-    .replace(/^\.?\/+/, '')
-    .replace(/\/+/g, '/');
-  return canonical(a) === canonical(b);
-}
+const { canonicalStorageKey, sameStorageKey } = require('../utils/storageKey');
 
 // One regeneration of each kind at a time. Two overlapping library-wide runs
 // double the load and delete each other's freshly written renditions. Held per
@@ -191,7 +174,16 @@ router.post('/regenerate', adminAuth, requirePermission('photos.edit'), async (r
     let query = db('photos')
       .select(
         'id', 'event_id', 'path', 'media_type', 'mime_type', 'thumbnail_path',
-        'source_origin', 'external_relpath', 'filename'
+        // ensureThumbnail keeps a complete video's poster note in step with
+        // the frame it rebuilt (issue 1430); it needs the status to know.
+        'processing_status',
+        // An external row's tier keys carry its size and mtime; selected
+        // here so the helpers need not read them per photo.
+        'source_origin', 'external_relpath', 'filename', 'size_bytes', 'source_mtime_ms', 'source_filename',
+        // A RAW photo's tier keys are scoped by its processing attempt
+        // (imageProcessor's derivativeCacheId): without it the sweep derives
+        // other keys and the old tiers stay served (issue 2113).
+        'processing_attempt_id'
       );
     if (eventId) {
       query = query.where('event_id', eventId);
@@ -214,7 +206,7 @@ router.post('/regenerate', adminAuth, requirePermission('photos.edit'), async (r
     });
     
     // Process thumbnails in background
-    setImmediate(async () => {
+    applicationWork.defer('thumbnail regeneration', async () => {
       let successCount = 0;
       let errorCount = 0;
       
@@ -247,7 +239,12 @@ router.post('/regenerate', adminAuth, requirePermission('photos.edit'), async (r
           // the canonical rendition leaves phones served the old fit, quality
           // or format indefinitely — which is exactly what this endpoint is
           // invoked to undo after a settings change.
-          await require('../services/imageProcessor').deleteThumbnailTiers(photo);
+          //
+          // `strict`: a tier that could not be deleted keeps being served, so
+          // the photo counts as failed, not regenerated. The rebuild still
+          // runs; only the count changes.
+          const tierError = await require('../services/imageProcessor')
+            .deleteThumbnailTiers(photo, { strict: true }).then(() => null, (err) => err);
 
           // Through ensureThumbnail, not a hand-rolled path (#1129). This
           // route used to resolve the source as `storage/events/active/<path>`
@@ -282,7 +279,17 @@ router.post('/regenerate', adminAuth, requirePermission('photos.edit'), async (r
             // Guarded on the key actually changing: on local storage it is
             // stable, and deleting the equal key would delete the file that
             // was just written.
-            if (photo.thumbnail_path && !sameStorageKey(photo.thumbnail_path, newThumbnailPath)) {
+            //
+            // And on no other row still pointing at it: watch-folder photos
+            // (stored under the camera's name, filename === source_filename)
+            // imported before their thumbnails got a per-photo name can share
+            // one key across galleries until the start-up repair separates
+            // them, and this photo moving off it must not blank the others.
+            // Uploads have generated names, so only those rows pay the lookup.
+            const moved = photo.thumbnail_path && !sameStorageKey(photo.thumbnail_path, newThumbnailPath);
+            const stillShared = moved && photo.filename === photo.source_filename
+              && await db('photos').where('thumbnail_path', photo.thumbnail_path).whereNot('id', photo.id).first('id');
+            if (moved && !stillShared) {
               await getStorage().delete(photo.thumbnail_path).catch((err) => {
                 // Losing the old object is untidy, not a failed regeneration.
                 logger.warn(
@@ -290,8 +297,13 @@ router.post('/regenerate', adminAuth, requirePermission('photos.edit'), async (r
                 );
               });
             }
-            successCount++;
-            logger.info(`Regenerated thumbnail for photo ${photo.id}`);
+            if (tierError) {
+              logger.error(`Regenerated thumbnail for photo ${photo.id}, but its old tiers remain: ${tierError.message}`);
+              errorCount++;
+            } else {
+              successCount++;
+              logger.info(`Regenerated thumbnail for photo ${photo.id}`);
+            }
           } else {
             errorCount++;
           }
@@ -332,7 +344,9 @@ router.post('/regenerate-previews', adminAuth, requirePermission('photos.edit'),
     // external photo looks managed here and generation is skipped.
     let query = db('photos').select(
       'id', 'event_id', 'path', 'media_type', 'mime_type', 'preview_path',
-      'source_origin', 'external_relpath', 'filename'
+      'source_origin', 'external_relpath', 'filename', 'size_bytes', 'source_mtime_ms',
+      // RAW tier keys carry the processing attempt; see /regenerate.
+      'processing_attempt_id'
     );
     if (eventId) query = query.where('event_id', eventId);
     // Skip videos — preview tier is image-only.
@@ -351,9 +365,11 @@ router.post('/regenerate-previews', adminAuth, requirePermission('photos.edit'),
       count: photos.length,
     });
 
-    setImmediate(async () => {
+    applicationWork.defer('preview regeneration', async () => {
       let successCount = 0;
       let errorCount = 0;
+      // Previews this run replaced, removed after the loop (see below).
+      const superseded = [];
       for (const photo of photos) {
         try {
           // Force regeneration regardless of existing preview state by
@@ -364,17 +380,65 @@ router.post('/regenerate-previews', adminAuth, requirePermission('photos.edit'),
           // leaves phones served the stale 640/1280 copy indefinitely — which
           // is precisely the case this endpoint exists for (a replaced
           // reference source, or a corrupted rendition).
-          await require('../services/imageProcessor').deletePreviewTiers(photo);
+          // `strict`: a tier left behind counts the photo as failed (see
+          // /regenerate); the rebuild still runs.
+          const tierError = await require('../services/imageProcessor')
+            .deletePreviewTiers(photo, { strict: true }).then(() => null, (err) => err);
           // `force`: never adopt a lazy generation already in flight (#1020).
           const newPreviewPath = await ensurePreviewImage({ ...photo, preview_path: null }, { force: true });
           if (newPreviewPath) {
-            successCount++;
+            // The replaced preview, when the key MOVED. A camera-named
+            // (watch-folder) photo's preview is now named per photo, an S3
+            // source renders from a randomly-named temp copy, and an external
+            // row's name carries its source version: in each case the new key
+            // differs and the nulled preview_path hid the old one from every
+            // cleanup.
+            if (photo.preview_path && !sameStorageKey(photo.preview_path, newPreviewPath)) {
+              superseded.push({ id: photo.id, key: photo.preview_path });
+            }
+            if (tierError) {
+              logger.error(`Regenerated preview for photo ${photo.id}, but its old tiers remain: ${tierError.message}`);
+              errorCount++;
+            } else {
+              successCount++;
+            }
           } else {
             errorCount++;
           }
         } catch (error) {
           logger.error(`Error regenerating preview for photo ${photo.id}:`, error);
           errorCount++;
+        }
+      }
+      // Delete the replaced previews no row points at any more, as the
+      // thumbnail endpoint does. One pass over every row's preview_path after
+      // the loop, not a lookup per photo (on S3 every key moves). A row that
+      // still holds a key keeps it, in whichever spelling it stores it:
+      // another photo (managed names derive from the source basename), or
+      // this one, when an older render on another replica published that key
+      // again. Trashed rows count; they are restorable.
+      if (superseded.length) {
+        try {
+          const referenced = new Set();
+          let lastId = 0;
+          for (;;) {
+            const rows = await db('photos').whereNotNull('preview_path').where('id', '>', lastId)
+              .orderBy('id').limit(1000).select('id', 'preview_path');
+            if (!rows.length) break;
+            for (const row of rows) referenced.add(canonicalStorageKey(row.preview_path));
+            lastId = rows[rows.length - 1].id;
+          }
+          for (const { id, key } of superseded) {
+            if (referenced.has(canonicalStorageKey(key))) continue;
+            // Two photos of this run may have shared it: one delete.
+            referenced.add(canonicalStorageKey(key));
+            await getStorage().delete(key).catch((err) => {
+              // Losing the old object is untidy, not a failed regeneration.
+              logger.warn(`Could not remove superseded preview ${key} for photo ${id}: ${err.message}`);
+            });
+          }
+        } catch (err) {
+          logger.warn(`Could not check which superseded previews are still in use; keeping them: ${err.message}`);
         }
       }
       runningJobs.previews = false;

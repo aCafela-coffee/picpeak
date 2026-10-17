@@ -10,9 +10,37 @@ import {
   isGalleryLimited, markGalleryLimited, notifyDownloadQuotaChanged,
   readDownloadLimitError, withDownloadLimit,
 } from '../utils/downloadLimit';
+import { SELECTED_DOWNLOAD_LIMIT } from '../components/gallery/folders';
 
 // Gallery pages beyond the first are fetched this many at a time (#1357).
 const PAGE_FETCH_CONCURRENCY = 4;
+
+// One archive request takes at most this many ids (download-selected and
+// download-jobs on the server); a larger set goes as several archives.
+export function splitIntoArchives(photoIds: number[]): number[][] {
+  const parts: number[][] = [];
+  for (let i = 0; i < photoIds.length; i += SELECTED_DOWNLOAD_LIMIT) {
+    parts.push(photoIds.slice(i, i + SELECTED_DOWNLOAD_LIMIT));
+  }
+  return parts;
+}
+
+// How long a downloaded blob's object URL stays valid. Revoking it in the
+// same task as the click can cancel the download before the browser has
+// started reading it (Safari and Firefox), so it is released a little later,
+// but soon: a download in parts would otherwise hold several zips at once.
+const BLOB_URL_RELEASE_MS = 1_000;
+
+function saveBlob(data: BlobPart, filename: string): void {
+  const url = window.URL.createObjectURL(new Blob([data]));
+  const link = document.createElement('a');
+  link.href = url;
+  link.setAttribute('download', filename);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => window.URL.revokeObjectURL(url), BLOB_URL_RELEASE_MS);
+}
 
 // Admin preview (#868): the preview tab carries `?admin_preview=1`. Browser-native
 // download navigations (a real `<a href>` / `api.getUri`) bypass the axios request
@@ -170,11 +198,14 @@ export const galleryService = {
   // A gallery with a download limit (issue 1560) fetches instead of
   // navigating: a refused navigation lands as a broken file in the browser's
   // download list, and the page never learns it should say why.
-  async savePhotoToDevice(slug: string, photoId: number, filename: string): Promise<void> {
-    return withDownloadLimit(slug, () => this.savePhotoToDeviceUnchecked(slug, photoId, filename));
+  //
+  // `onProgress` (issue 2043) is called as the bytes of a fetched photo
+  // arrive, so the caller can tell a slow download from a hung one.
+  async savePhotoToDevice(slug: string, photoId: number, filename: string, onProgress?: () => void): Promise<void> {
+    return withDownloadLimit(slug, () => this.savePhotoToDeviceUnchecked(slug, photoId, filename, onProgress));
   },
 
-  async savePhotoToDeviceUnchecked(slug: string, photoId: number, filename: string): Promise<void> {
+  async savePhotoToDeviceUnchecked(slug: string, photoId: number, filename: string, onProgress?: () => void): Promise<void> {
     if (!isIOS() && !isGalleryLimited(slug)) {
       this.triggerDirectDownload(
         withAdminPreview(api.getUri({ url: `/gallery/${slug}/download/${photoId}` })),
@@ -183,12 +214,12 @@ export const galleryService = {
       return;
     }
     if (!isIOS()) {
-      const direct = await this.fetchPhotoBlob(slug, photoId);
+      const direct = await this.fetchPhotoBlob(slug, photoId, onProgress);
       this.triggerBrowserDownload(direct.blob, direct.serverFilename || filename);
       return;
     }
 
-    const fetched = await this.fetchPhotoBlob(slug, photoId);
+    const fetched = await this.fetchPhotoBlob(slug, photoId, onProgress);
     const resolvedFilename = fetched.serverFilename || filename;
 
     // canShare() returns false on browsers without Web Share file
@@ -228,7 +259,9 @@ export const galleryService = {
   async fetchPhotoBlob(
     slug: string,
     photoId: number,
+    onProgress?: () => void,
   ): Promise<{ blob: Blob; serverFilename: string | null }> {
+    const progress = onProgress ? { onDownloadProgress: () => onProgress() } : {};
     const readResponse = (response: AxiosResponse<Blob>) => {
       const headerName =
         response.headers['content-disposition'] || response.headers['Content-Disposition'];
@@ -241,6 +274,7 @@ export const galleryService = {
     try {
       const response = await api.get<Blob>(`/gallery/${slug}/download/${photoId}`, {
         responseType: 'blob',
+        ...progress,
       });
       return readResponse(response);
     } catch (error) {
@@ -256,6 +290,7 @@ export const galleryService = {
 
       const response = await api.get<Blob>(`/gallery/${slug}/photo/${photoId}`, {
         responseType: 'blob',
+        ...progress,
       });
       return readResponse(response);
     }
@@ -265,14 +300,7 @@ export const galleryService = {
   // anchor. Extracted from downloadPhoto so the share-fallback path
   // can reuse it without re-fetching the blob.
   triggerBrowserDownload(blob: Blob, filename: string): void {
-    const url = window.URL.createObjectURL(new Blob([blob]));
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', filename);
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.URL.revokeObjectURL(url);
+    saveBlob(blob, filename);
   },
 
   // Trigger a browser-native download by navigating a hidden anchor at
@@ -293,9 +321,9 @@ export const galleryService = {
   // Download single photo — kept as the canonical name for the existing
   // grid + lightbox-action callers that haven't been migrated to the
   // share-aware savePhotoToDevice path yet.
-  async downloadPhoto(slug: string, photoId: number, filename: string): Promise<void> {
+  async downloadPhoto(slug: string, photoId: number, filename: string, onProgress?: () => void): Promise<void> {
     return withDownloadLimit(slug, async () => {
-      const fetched = await this.fetchPhotoBlob(slug, photoId);
+      const fetched = await this.fetchPhotoBlob(slug, photoId, onProgress);
       this.triggerBrowserDownload(fetched.blob, fetched.serverFilename || filename);
     });
   },
@@ -330,14 +358,7 @@ export const galleryService = {
       responseType: 'blob',
     }));
 
-    const url = window.URL.createObjectURL(new Blob([response.data]));
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `${slug}.zip`);
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.URL.revokeObjectURL(url);
+    saveBlob(response.data, `${slug}.zip`);
   },
 
   // Download selected photos. On iOS with a small selection, route
@@ -345,11 +366,19 @@ export const galleryService = {
   // share sheet's "Save N Images" action (#557, extending #531 to the
   // multi-photo case). Above the cap, or anywhere else, fall through
   // to the existing server-side zip flow.
-  async downloadSelectedPhotos(slug: string, photoIds: number[]): Promise<void> {
+  async downloadSelectedPhotos(
+    slug: string,
+    photoIds: number[],
+    part?: { index: number; total: number },
+    // Called as the zip's bytes arrive (issue 2043).
+    onProgress?: () => void,
+  ): Promise<void> {
     // Not on a limited gallery (issue 1560): the share path fetches photo by
     // photo, so a refusal halfway through would already have used up the
-    // photos before it, where the zip below is all or nothing.
+    // photos before it, where the zip below is all or nothing. Not for one
+    // part of a larger download either: those all arrive as zips.
     if (
+      !part &&
       isIOS() &&
       !isGalleryLimited(slug) &&
       photoIds.length > 0 &&
@@ -364,16 +393,23 @@ export const galleryService = {
 
     const response = await withDownloadLimit(slug, () => api.post(`/gallery/${slug}/download-selected`, { photo_ids: photoIds }, {
       responseType: 'blob',
+      ...(onProgress ? { onDownloadProgress: () => onProgress() } : {}),
     }));
 
-    const url = window.URL.createObjectURL(new Blob([response.data]));
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `${slug}-selected.zip`);
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.URL.revokeObjectURL(url);
+    saveBlob(response.data, part
+      ? `${slug}-selected-${part.index}-of-${part.total}.zip`
+      : `${slug}-selected.zip`);
+  },
+
+  // Download photos as zips of at most SELECTED_DOWNLOAD_LIMIT each, one after
+  // the other, so a set past the server's per-request cap is never cut short.
+  // The first failure stops the rest and is thrown.
+  async downloadPhotosInParts(slug: string, photoIds: number[]): Promise<void> {
+    const parts = splitIntoArchives(photoIds);
+    if (parts.length <= 1) return this.downloadSelectedPhotos(slug, photoIds);
+    for (let i = 0; i < parts.length; i += 1) {
+      await this.downloadSelectedPhotos(slug, parts[i], { index: i + 1, total: parts.length });
+    }
   },
 
   // ── Custom-resolution downloads (#858) ──────────────────────────────────
@@ -396,6 +432,12 @@ export const galleryService = {
   async getDownloadJob(slug: string, token: string): Promise<DownloadJobState> {
     const response = await api.get(`/gallery/${slug}/download-jobs/${token}`);
     return response.data;
+  },
+
+  // "Email me when it is ready" (issue 1733). No address is sent: the server
+  // uses the one it already holds for this visitor, or refuses.
+  async requestDownloadJobMail(slug: string, token: string): Promise<void> {
+    await api.post(`/gallery/${slug}/download-jobs/${token}/notify`);
   },
 
   // Native browser download so the archive streams with Content-Length
@@ -467,6 +509,12 @@ export const galleryService = {
   // Bulk toggle photo visibility (client-only)
   async bulkToggleVisibility(slug: string, photoIds: number[], visibility: 'visible' | 'hidden'): Promise<void> {
     await api.patch(`/gallery/${slug}/photos/visibility/bulk`, { photoIds, visibility });
+  },
+
+  // Live refresh (issue 1733, C5): what the photo list would hold right now.
+  async getPhotoState(slug: string, signal?: AbortSignal): Promise<{ count: number; max_id: number | null }> {
+    const response = await api.get<{ count: number; max_id: number | null }>(`/gallery/${slug}/photos/state`, { signal });
+    return response.data;
   },
 
   // Get gallery statistics

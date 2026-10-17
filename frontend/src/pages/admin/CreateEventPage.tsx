@@ -5,7 +5,6 @@ import {
   Mail,
   Lock,
   Clock,
-  ArrowLeft,
   Palette,
   Eye,
   EyeOff,
@@ -18,11 +17,17 @@ import {
 import { addDays } from 'date-fns';
 import { toast } from 'react-toastify';
 
-import { Button, Input, Card, PasswordGenerator, LocalizedDateInput, TimeField } from '../../components/common';
+import { Button, Input, Card, Notice, PasswordGenerator, LocalizedDateInput, TimeField } from '../../components/common';
+import { ExpiryPresets, EXPIRY_PRESET_DAYS } from '../../components/admin/ExpiryPresets';
 import { ThemeCustomizerEnhanced, GalleryPreview, WelcomeMessageEditor, FeedbackSettings } from '../../components/admin';
 import { CustomerAccountPicker } from '../../components/admin/CustomerAccountPicker';
+import { SectionPageHeader } from '../../components/admin/SectionPageHeader';
+import { TeamMemberPicker } from '../../components/admin/TeamMemberPicker';
+import { GalleryRecipientsList } from '../../components/admin/GalleryRecipientsList';
+import { useFeatureEnabled } from '../../contexts/FeatureFlagsContext';
+import { accountName, galleryRecipients } from '../../utils/galleryRecipients';
 import { UploaderNameSettings } from '../../components/admin/UploaderNameSettings';
-import type { GuestNameMode } from '../../types';
+import type { AssignedAdmin, GuestNameMode } from '../../types';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { eventsService } from '../../services/events.service';
 import { useLocalizedDate } from '../../hooks/useLocalizedDate';
@@ -39,6 +44,8 @@ import { usePermission } from '../../hooks/usePermission';
 import { ExternalFolderPicker } from './event-details/ExternalFolderPicker';
 import { ThemeDisplay } from '../../components/admin';
 import { Code } from 'lucide-react';
+import { todayIsoDate } from '../../utils/localDate';
+import { radioGroupKeyDown } from '../../utils/ariaKeyboard';
 
 interface FormData {
   event_type: string;
@@ -87,6 +94,9 @@ interface FormData {
     allow_favorites: boolean;
     allow_reactions: boolean;
     allow_color_labels: boolean;
+    allow_decisions?: boolean;
+    allow_selection_submit?: boolean;
+    allow_annotations?: boolean;
     // Optional, mirroring the shared FeedbackSettings contract — the
     // <FeedbackSettings> editor's onChange emits that shape.
     keybind_mode?: 'colors' | 'lightroom';
@@ -104,6 +114,9 @@ interface FormData {
   // the full picker selection so chips render without an extra fetch;
   // only the ids are sent to the backend on submit.
   customer_accounts: Array<{ id: number; email: string; displayName: string | null }>;
+  // Team members (issue 743) and whether their uploads wait for review.
+  assigned_admins: AssignedAdmin[];
+  review_contributor_uploads: boolean;
 }
 
 // Fallback event types (used when API is unavailable)
@@ -141,7 +154,7 @@ export const CreateEventPage: React.FC = () => {
   const [formData, setFormData] = useState<FormData>({
     event_type: 'wedding',
     event_name: '',
-    event_date: new Date().toISOString().split('T')[0], // Initialize with ISO date format
+    event_date: todayIsoDate(),
     event_time_start: '',
     event_time_end: '',
     is_full_day: true,
@@ -176,6 +189,8 @@ export const CreateEventPage: React.FC = () => {
       allow_favorites: true,
       allow_reactions: true,
       allow_color_labels: false,
+      allow_decisions: false,
+      allow_selection_submit: false,
       keybind_mode: 'colors',
       require_name_email: false,
       moderate_comments: true,
@@ -186,6 +201,8 @@ export const CreateEventPage: React.FC = () => {
     client_password: '',
     default_photo_sort: 'upload_date_desc',
     customer_accounts: [],
+    assigned_admins: [],
+    review_contributor_uploads: false,
   });
 
   const [errors, setErrors] = useState<Partial<Record<keyof FormData, string>>>({});
@@ -285,7 +302,25 @@ export const CreateEventPage: React.FC = () => {
 
   // Get field requirements (default to true if not set)
   const requireCustomerName = publicSettings?.event_require_customer_name !== false;
-  const requireCustomerEmail = publicSettings?.event_require_customer_email !== false;
+  // Customer accounts (#354) the portal email can reach are recipients too:
+  // with one picked, the inline customer email is optional even where the
+  // setting requires it. Same rule as the backend (eventCreationService):
+  // customers.events, and active accounts that can sign in.
+  const portalEnabled = useFeatureEnabled('customerPortal');
+  const canAnnounceToAccounts = usePermission('customers.events');
+  // The team picker lists admin accounts, which needs events.edit.
+  const canPickTeam = usePermission('events.edit');
+  const recipients = galleryRecipients(formData.customer_email, formData.customer_accounts, {
+    portalEnabled,
+    includeAccounts: canAnnounceToAccounts,
+    prefersGalleryEmail: !!formData.welcome_message?.trim() || formData.client_access_enabled,
+  });
+  const picksAccounts = recipients.accounts.length > 0;
+  const requireCustomerEmail = publicSettings?.event_require_customer_email !== false && !picksAccounts;
+  // Announced only through the customer portal, which opens the gallery
+  // without its password — so the backend generates one that just keeps the
+  // share link locked, and the admin has nothing to type.
+  const portalOnly = picksAccounts && !formData.customer_email.trim();
   const phoneFieldEnabled = publicSettings?.event_phone_field_enabled === true;
   const requireAdminEmail = publicSettings?.event_require_admin_email !== false;
   const requireEventDate = publicSettings?.event_require_event_date !== false;
@@ -360,6 +395,7 @@ export const CreateEventPage: React.FC = () => {
         allow_comments: publicSettings.event_default_allow_comments !== false,
         allow_reactions: publicSettings.event_default_allow_reactions !== false,
         allow_color_labels: publicSettings.event_default_allow_color_labels === true,
+        allow_decisions: publicSettings.event_default_allow_decisions === true,
         keybind_mode: publicSettings.event_default_keybind_mode === 'lightroom' ? 'lightroom' : 'colors'
       }
     }));
@@ -513,7 +549,7 @@ export const CreateEventPage: React.FC = () => {
       newErrors.admin_email = t('validation.invalidEmailFormat');
     }
 
-    if (formData.require_password) {
+    if (formData.require_password && !portalOnly) {
       if (!formData.password) {
         newErrors.password = t('validation.passwordRequired');
       } else if (formData.password.length < 6) {
@@ -569,7 +605,7 @@ export const CreateEventPage: React.FC = () => {
       ...(phoneFieldEnabled && formData.customer_phone ? { customer_phone: formData.customer_phone.trim() } : {}),
       admin_email: formData.admin_email,
       require_password: formData.require_password,
-      password: formData.require_password ? formData.password : undefined,
+      password: formData.require_password && !portalOnly ? formData.password : undefined,
       welcome_message: formData.welcome_message || '',
       // Only a gallery with custom styling stores a theme; the rest follow
       // Branding (backend services/galleryTheme).
@@ -600,6 +636,9 @@ export const CreateEventPage: React.FC = () => {
       allow_favorites: feedbackSettings.allow_favorites,
       allow_reactions: feedbackSettings.allow_reactions,
       allow_color_labels: feedbackSettings.allow_color_labels,
+      allow_decisions: feedbackSettings.allow_decisions,
+      allow_selection_submit: feedbackSettings.allow_selection_submit,
+      allow_annotations: feedbackSettings.allow_annotations,
       keybind_mode: feedbackSettings.keybind_mode,
       require_name_email: feedbackSettings.require_name_email,
       moderate_comments: feedbackSettings.moderate_comments,
@@ -616,6 +655,11 @@ export const CreateEventPage: React.FC = () => {
       // array of ids; the backend service diffs against the existing
       // assignments and applies adds/removes inside one transaction.
       customer_account_ids: formData.customer_accounts.map((c) => c.id),
+      // Team members (issue 743). The creator owns the gallery.
+      ...(canPickTeam ? {
+        assigned_admin_ids: formData.assigned_admins.map((a) => a.id),
+        review_contributor_uploads: formData.review_contributor_uploads,
+      } : {}),
     };
 
     isSubmittingRef.current = true;
@@ -666,19 +710,19 @@ export const CreateEventPage: React.FC = () => {
 
   return (
     <div className="max-w-4xl mx-auto">
-      <div className="mb-6 flex items-center justify-between">
-        <div className="flex items-center gap-4">
+      <SectionPageHeader
+        icon={Calendar}
+        title={t('events.create')}
+        actions={(
           <Button
-            variant="ghost"
-            size="sm"
-            leftIcon={<ArrowLeft className="w-4 h-4" />}
+            type="button"
+            variant="outline"
             onClick={() => navigate('/admin/events')}
           >
-            {t('common.back')}
+            {t('common.cancel')}
           </Button>
-          <h1 className="text-2xl font-bold text-heading">{t('events.create')}</h1>
-        </div>
-      </div>
+        )}
+      />
 
       <form onSubmit={handleSubmit} className="space-y-6">
         {/* Event Details */}
@@ -784,13 +828,14 @@ export const CreateEventPage: React.FC = () => {
               <FolderOpen className="w-5 h-5" />
               {t('events.settingsTab.source', 'Photo source')}
             </h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3" role="radiogroup" aria-label={t('events.sourceMode', 'Source Mode')}>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3" role="radiogroup" aria-label={t('events.sourceMode', 'Source Mode')} onKeyDown={radioGroupKeyDown}>
               {(['managed', 'reference'] as const).map((sourceMode) => (
                 <button
                   key={sourceMode}
                   type="button"
                   role="radio"
                   aria-checked={formData.source_mode === sourceMode}
+                  tabIndex={formData.source_mode === sourceMode ? 0 : -1}
                   onClick={() => setFormData(prev => ({ ...prev, source_mode: sourceMode }))}
                   className={`flex flex-col items-start gap-1 text-left p-4 rounded-lg border-2 transition-all ${
                     formData.source_mode === sourceMode ? 'tile-selected' : 'border-line hover:border-line-strong'
@@ -817,13 +862,13 @@ export const CreateEventPage: React.FC = () => {
                     value={formData.external_path}
                     onChange={(folder) => setFormData(prev => ({ ...prev, external_path: folder }))}
                   />
-                  {errors.external_path && <p className="text-xs text-red-600 dark:text-red-400 mt-1">{errors.external_path}</p>}
+                  {errors.external_path && <p className="text-xs text-danger-text mt-1">{errors.external_path}</p>}
                 </div>
                 <div className="space-y-4">
                   <label className={`flex items-start gap-2 ${canImport ? 'cursor-pointer' : 'opacity-60 cursor-not-allowed'}`}>
                     <input
                       type="checkbox"
-                      className="mt-0.5 rounded border-line-strong text-accent focus:ring-primary-500"
+                      className="mt-0.5 rounded border-line-strong text-accent focus:ring-accent"
                       checked={canImport && formData.import_now}
                       disabled={!canImport}
                       onChange={(e) => setFormData(prev => ({ ...prev, import_now: e.target.checked }))}
@@ -836,7 +881,7 @@ export const CreateEventPage: React.FC = () => {
                   <label className={`flex items-start gap-2 ${canImport ? 'cursor-pointer' : 'opacity-60 cursor-not-allowed'}`}>
                     <input
                       type="checkbox"
-                      className="mt-0.5 rounded border-line-strong text-accent focus:ring-primary-500"
+                      className="mt-0.5 rounded border-line-strong text-accent focus:ring-accent"
                       checked={canImport && formData.external_watch}
                       disabled={!canImport}
                       onChange={(e) => setFormData(prev => ({ ...prev, external_watch: e.target.checked }))}
@@ -904,6 +949,46 @@ export const CreateEventPage: React.FC = () => {
                 onChange={(next) => setFormData((prev) => ({ ...prev, customer_accounts: next }))}
               />
 
+              {(recipients.inlineEmail || recipients.accounts.length > 0 || (!canAnnounceToAccounts && formData.customer_accounts.length > 0)) && (
+                <div>
+                  <p className="text-xs text-soft mb-1">
+                    {t('events.recipients.previewTitle', 'Notified when you publish the gallery:')}
+                  </p>
+                  <GalleryRecipientsList
+                    inlineEmail={recipients.inlineEmail}
+                    accountNames={recipients.accounts.map(accountName)}
+                    skippedAccountCount={canAnnounceToAccounts ? 0 : galleryRecipients(formData.customer_email, formData.customer_accounts, { portalEnabled }).accounts.length}
+                  />
+                </div>
+              )}
+
+              {/* Team members (issue 743) */}
+              {canPickTeam && (
+                <>
+                  <TeamMemberPicker
+                    value={formData.assigned_admins}
+                    onChange={(next) => setFormData((prev) => ({ ...prev, assigned_admins: next }))}
+                    ownerId={currentAdmin?.id ?? null}
+                  />
+                  <div>
+                    <label className="flex items-center">
+                      <input
+                        type="checkbox"
+                        checked={formData.review_contributor_uploads}
+                        onChange={(e) => setFormData((prev) => ({ ...prev, review_contributor_uploads: e.target.checked }))}
+                        className="w-4 h-4 text-accent border-line-strong rounded focus:ring-accent"
+                      />
+                      <span className="ml-2 text-sm text-body">
+                        {t('events.team.reviewUploads', 'Review team members\' uploads before they are published')}
+                      </span>
+                    </label>
+                    <p className="text-xs text-muted mt-1 ml-6">
+                      {t('events.team.reviewUploadsHelp', 'Holds uploads from team members whose role lacks the “Review Team Uploads” permission: they stay hidden from guests and clients until you or a reviewer approve them on the Photos tab. The Admin, Editor and Solo Photographer roles hold that permission by default, so their uploads are never held.')}
+                    </p>
+                  </div>
+                </>
+              )}
+
               <Input
                 type="email"
                 label={requireAdminEmail ? t('events.adminEmail') : `${t('events.adminEmail')} (${t('common.optional')})`}
@@ -927,7 +1012,7 @@ export const CreateEventPage: React.FC = () => {
                         setFormData(prev => ({ ...prev, admin_email: email }));
                       }
                     }}
-                    className="text-xs px-2 py-1 border border-line-strong bg-panel text-heading rounded focus:ring-2 focus:ring-primary-500 focus:border-accent-dark"
+                    className="text-xs px-2 py-1 border border-line-strong bg-panel text-heading rounded focus:ring-2 focus:ring-accent focus:border-accent-dark"
                   >
                     <option value="">{t('events.adminEmailCustom', 'Custom email')}</option>
                     {activeAdmins.map(a => (
@@ -944,7 +1029,7 @@ export const CreateEventPage: React.FC = () => {
               <label className="flex items-start gap-2">
                 <input
                   type="checkbox"
-                  className="mt-1 w-4 h-4 text-accent border-line-strong rounded focus:ring-primary-500"
+                  className="mt-1 w-4 h-4 text-accent border-line-strong rounded focus:ring-accent"
                   checked={formData.require_password}
                   onChange={(e) => {
                     const checked = e.target.checked;
@@ -970,13 +1055,21 @@ export const CreateEventPage: React.FC = () => {
               </label>
 
               {!formData.require_password && (
-                <div className="rounded-md border border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-900/30 p-3 text-xs text-orange-800 dark:text-orange-300">
-                  {t('events.publicGalleryWarning', 'Public galleries are accessible to anyone with the link. Consider enabling download watermarks and monitoring activity.')} 
-                </div>
+                <Notice tone="warning" size="sm">
+                  {t('events.publicGalleryWarning', 'Public galleries are accessible to anyone with the link. Consider enabling download watermarks and monitoring activity.')}
+                </Notice>
               )}
             </div>
 
-            {formData.require_password && (
+            {formData.require_password && portalOnly && (
+              <Notice tone="neutral" icon={<Key className="w-4 h-4" />}>
+                <span>
+                  {t('events.recipients.generatedPasswordNote', 'Customers sign in through their customer portal, so no gallery password is needed. A strong one is generated to keep the gallery link locked. If you add a customer email later, you set a password then.')}
+                </span>
+              </Notice>
+            )}
+
+            {formData.require_password && !portalOnly && (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <Input
@@ -1041,7 +1134,7 @@ export const CreateEventPage: React.FC = () => {
               <label className="flex items-start gap-2">
                 <input
                   type="checkbox"
-                  className="mt-1 w-4 h-4 text-accent border-line-strong rounded focus:ring-primary-500"
+                  className="mt-1 w-4 h-4 text-accent border-line-strong rounded focus:ring-accent"
                   checked={formData.client_access_enabled}
                   onChange={(e) => setFormData(prev => ({
                     ...prev,
@@ -1101,6 +1194,16 @@ export const CreateEventPage: React.FC = () => {
                   </div>
                   <span className="text-sm text-soft">{t('events.daysAfterEvent')}</span>
                 </div>
+                <div className="mt-2">
+                  <ExpiryPresets
+                    selected={EXPIRY_PRESET_DAYS.find((days) => days === Number(formData.expires_in_days)) ?? null}
+                    onSelect={(days) => {
+                      if (days === 'never') return;
+                      setFormData(prev => ({ ...prev, expires_in_days: days }));
+                      setErrors(prev => ({ ...prev, expires_in_days: undefined }));
+                    }}
+                  />
+                </div>
                 {formData.event_date && (
                   <p className="mt-2 text-sm text-muted">
                     {/* Coerce to Number — handleInputChange stores the
@@ -1113,15 +1216,9 @@ export const CreateEventPage: React.FC = () => {
                 )}
               </div>
             ) : (
-              <div className="rounded-md border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/30 p-3">
-                <div className="flex items-center gap-2 text-blue-800 dark:text-blue-300">
-                  <Clock className="w-4 h-4" />
-                  <span className="text-sm font-medium">{t('events.noExpiration', 'No Expiration')}</span>
-                </div>
-                <p className="mt-1 text-xs text-blue-700 dark:text-blue-400">
-                  {t('events.noExpirationHelp', 'This gallery will remain active until manually archived.')}
-                </p>
-              </div>
+              <Notice tone="info" icon={<Clock className="w-5 h-5" />} title={t('events.noExpiration', 'No Expiration')}>
+                {t('events.noExpirationHelp', 'This gallery will remain active until manually archived.')}
+              </Notice>
             )}
 
             {/* Photo Cap */}
@@ -1184,7 +1281,7 @@ export const CreateEventPage: React.FC = () => {
               <select
                 value={formData.default_photo_sort}
                 onChange={(e) => setFormData({ ...formData, default_photo_sort: e.target.value })}
-                className="w-full px-3 py-2 border border-line-strong bg-panel text-heading rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-accent-dark"
+                className="w-full px-3 py-2 border border-line-strong bg-panel text-heading rounded-lg focus:ring-2 focus:ring-accent focus:border-accent-dark"
               >
                 <option value="upload_date_desc">{t('photoSort.uploadDateNewest', 'Upload Date (Newest First)')}</option>
                 <option value="upload_date_asc">{t('photoSort.uploadDateOldest', 'Upload Date (Oldest First)')}</option>
@@ -1202,7 +1299,7 @@ export const CreateEventPage: React.FC = () => {
                   type="checkbox"
                   checked={formData.allow_user_uploads}
                   onChange={(e) => setFormData({ ...formData, allow_user_uploads: e.target.checked })}
-                  className="rounded border-line-strong text-accent focus:ring-primary-500"
+                  className="rounded border-line-strong text-accent focus:ring-accent"
                 />
                 <div>
                   <span className="text-sm font-medium text-body">
@@ -1225,7 +1322,7 @@ export const CreateEventPage: React.FC = () => {
                       ...formData,
                       upload_category_id: e.target.value ? Number(e.target.value) : null
                     })}
-                    className="w-full px-3 py-2 border border-line-strong rounded-lg focus:ring-2 focus:ring-primary-500 bg-panel text-heading"
+                    className="w-full px-3 py-2 border border-line-strong rounded-lg focus:ring-2 focus:ring-accent bg-panel text-heading"
                   >
                     <option value="">{t('events.selectCategory')}</option>
                     {categories.map(category => (
@@ -1269,7 +1366,7 @@ export const CreateEventPage: React.FC = () => {
                 <input
                   type="checkbox"
                   role="switch"
-                  className="w-4 h-4 text-accent border-line-strong rounded focus:ring-primary-500"
+                  className="w-4 h-4 text-accent border-line-strong rounded focus:ring-accent"
                   checked={formData.custom_theme_enabled}
                   onChange={(e) => {
                     customThemeChosenRef.current = true;

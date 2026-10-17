@@ -11,8 +11,8 @@ module.exports = async function checkKoreanScreens(base, platform, setGalleryThe
   const output = process.env.UI_SCREENSHOT_DIR || '/tmp/picpeak-korean-ui';
   fs.mkdirSync(output, { recursive: true });
   const forbidden = [];
-  async function newPage(viewport) {
-    const context = await browser.newContext({ viewport, locale: 'en-US' });
+  async function newPage(viewport, locale = 'en-US') {
+    const context = await browser.newContext({ viewport, locale });
     const page = await context.newPage();
     page.setDefaultTimeout(60000);
     page.on('request', request => {
@@ -38,6 +38,16 @@ module.exports = async function checkKoreanScreens(base, platform, setGalleryThe
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), `${name}: horizontal overflow at ${width}px`);
   }
   try {
+    const regional = await newPage({ width: 390, height: 844 }, 'ko-KR');
+    await regional.addInitScript(() => {
+      localStorage.setItem('picpeak.screenLanguage', 'ko-KR');
+      localStorage.setItem('i18nextLng', 'de');
+    });
+    await regional.goto(`${base}/customer/login`);
+    await expect(regional.getByRole('button', { name: ko.customer.login.signIn, exact: true })).toBeVisible();
+    await regional.reload();
+    await expect(regional.getByRole('button', { name: ko.customer.login.signIn, exact: true })).toBeVisible();
+    await regional.context().close();
     for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
       console.log(`Checking Korean screens at ${viewport.width}px (${platform}).`);
       const admin = await newPage(viewport);

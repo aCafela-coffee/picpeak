@@ -2,13 +2,15 @@ import { LanguageSelector } from '../../components/common/LanguageSelector';
 import React, { useState, useEffect } from 'react';
 import { Navigate, useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { Lock, Mail, Eye, EyeOff, AlertCircle, ShieldCheck, KeyRound, ArrowLeft } from 'lucide-react';
+import { Lock, Mail, Eye, EyeOff, AlertCircle, ShieldCheck, KeyRound, ArrowLeft, Fingerprint } from 'lucide-react';
 import { toast } from 'react-toastify';
 import { useTranslation } from 'react-i18next';
 
 import { Button, Input, Card, ReCaptcha, PoweredBy } from '../../components/common';
 import { useAdminAuth } from '../../contexts';
 import { authService } from '../../services/auth.service';
+import { passkeyService } from '../../services/passkey.service';
+import { isPasskeySupported, passkeyErrorKind } from '../../utils/webauthn';
 import { isMfaChallenge } from '../../types';
 import { setupService } from '../../services/setup.service';
 import { usePublicSettings } from '../../hooks/usePublicSettings';
@@ -40,8 +42,17 @@ export const AdminLoginPage: React.FC = () => {
   const [mfaCode, setMfaCode] = useState('');
   const [useRecoveryCode, setUseRecoveryCode] = useState(false);
   const [mfaError, setMfaError] = useState<string | null>(null);
+  // Passkeys (issue 1733): offered for a passwordless sign-in and, when the
+  // account has one, in place of the code at the second step.
+  const [mfaPasskeyAvailable, setMfaPasskeyAvailable] = useState(false);
+  const [isPasskeyLoading, setIsPasskeyLoading] = useState(false);
 
   const { data: settingsData } = usePublicSettings();
+  // Only where a passkey can work: this browser supports them and the page
+  // is open on the address they are bound to.
+  const passkeyOffered = isPasskeySupported()
+    && !!settingsData?.passkey_origin
+    && settingsData.passkey_origin === window.location.origin;
   const { isDark } = useAdminDarkMode();
 
   const companyName = settingsData?.branding_company_name?.trim() || 'PicPeak';
@@ -130,6 +141,7 @@ export const AdminLoginPage: React.FC = () => {
       // MFA enabled → move to the second step instead of logging in.
       if (isMfaChallenge(response)) {
         setMfaToken(response.mfaToken);
+        setMfaPasskeyAvailable(response.passkeyAvailable === true);
         setMfaCode('');
         setUseRecoveryCode(false);
         setMfaError(null);
@@ -178,9 +190,47 @@ export const AdminLoginPage: React.FC = () => {
   const backToCredentials = () => {
     setStep('credentials');
     setMfaToken(null);
+    setMfaPasskeyAvailable(false);
     setMfaCode('');
     setMfaError(null);
     setUseRecoveryCode(false);
+  };
+
+  // One handler for both uses; `secondFactor` decides where the error shows
+  // and whether the mfa_pending token rides along.
+  const handlePasskeyLogin = async (secondFactor: boolean) => {
+    toast.dismiss();
+    const showError = (message: string) =>
+      (secondFactor ? setMfaError(message) : setErrors({ form: message }));
+    setIsPasskeyLoading(true);
+    setErrors({});
+    setMfaError(null);
+    try {
+      const response = await passkeyService.login(
+        secondFactor ? { mfaToken } : { rememberMe }
+      );
+      login(response.token, response.user);
+      toast.success(t('adminLogin.loginSuccess'));
+      setLoginSuccess(true);
+    } catch (error: any) {
+      const kind = passkeyErrorKind(error);
+      const data = error.response?.data;
+      if (kind) {
+        showError(t(`adminLogin.passkey.${kind === 'cancelled' ? 'cancelled' : 'unsupported'}`));
+      } else if (error.response?.status === 429) {
+        toast.error(t('adminLogin.tooManyAttempts'));
+      } else if (error.response?.status === 423) {
+        toast.error(t('adminLogin.mfa.locked'));
+        if (secondFactor) backToCredentials();
+      } else if (data?.code === 'MFA_SESSION_EXPIRED') {
+        toast.info(t('adminLogin.mfa.sessionExpired'));
+        backToCredentials();
+      } else {
+        showError(t('adminLogin.passkey.failed'));
+      }
+    } finally {
+      setIsPasskeyLoading(false);
+    }
   };
 
   const handleMfaSubmit = async (e: React.FormEvent) => {
@@ -290,9 +340,9 @@ export const AdminLoginPage: React.FC = () => {
           <form onSubmit={handleSubmit} className="space-y-6">
             {/* Form Error */}
             {errors.form && (
-              <div className="bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3">
-                <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                <p className="text-sm text-red-800">{errors.form}</p>
+              <div className="bg-danger-soft border border-danger-line rounded-lg p-4 flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-danger-text flex-shrink-0 mt-0.5" />
+                <p className="text-sm text-danger-text">{errors.form}</p>
               </div>
             )}
 
@@ -352,7 +402,7 @@ export const AdminLoginPage: React.FC = () => {
                   type="checkbox"
                   checked={rememberMe}
                   onChange={(e) => setRememberMe(e.target.checked)}
-                  className="w-4 h-4 text-accent border-neutral-300 rounded focus:ring-primary-500"
+                  className="w-4 h-4 text-accent border-neutral-300 rounded focus:ring-accent"
                 />
                 <span className="ml-2 text-sm text-neutral-700">{t('adminLogin.rememberMe')}</span>
               </label>
@@ -378,37 +428,50 @@ export const AdminLoginPage: React.FC = () => {
             {/* SSO (#798): plain navigation — the backend route redirects to
                 the IdP; the callback sets the same admin cookie as the local
                 login and lands on the dashboard. */}
+            {(settingsData?.oidc_enabled === true || passkeyOffered) && (
+              <div className="flex items-center gap-3">
+                <div className="flex-1 border-t border-neutral-200" />
+                <span className="text-xs uppercase tracking-wide text-neutral-400">
+                  {t('adminLogin.ssoDivider', 'or')}
+                </span>
+                <div className="flex-1 border-t border-neutral-200" />
+              </div>
+            )}
+            {passkeyOffered && (
+              <Button
+                type="button"
+                variant="outline"
+                size="lg"
+                className="w-full"
+                leftIcon={<Fingerprint className="w-4 h-4" />}
+                isLoading={isPasskeyLoading}
+                onClick={() => handlePasskeyLogin(false)}
+              >
+                {t('adminLogin.passkey.signIn')}
+              </Button>
+            )}
             {settingsData?.oidc_enabled === true && (
-              <>
-                <div className="flex items-center gap-3">
-                  <div className="flex-1 border-t border-neutral-200" />
-                  <span className="text-xs uppercase tracking-wide text-neutral-400">
-                    {t('adminLogin.ssoDivider', 'or')}
-                  </span>
-                  <div className="flex-1 border-t border-neutral-200" />
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="lg"
-                  className="w-full"
-                  leftIcon={<KeyRound className="w-4 h-4" />}
-                  // buildResourceUrl respects an absolute VITE_API_URL, so
-                  // split-origin deployments start the flow on the API host
-                  // (where the state cookie must live) instead of 404ing on
-                  // the frontend origin.
-                  onClick={() => { window.location.href = buildResourceUrl('/api/auth/admin/sso/login'); }}
-                >
-                  {settingsData.oidc_button_label?.trim() || t('adminLogin.ssoSignIn', 'Sign in with SSO')}
-                </Button>
-              </>
+              <Button
+                type="button"
+                variant="outline"
+                size="lg"
+                className="w-full"
+                leftIcon={<KeyRound className="w-4 h-4" />}
+                // buildResourceUrl respects an absolute VITE_API_URL, so
+                // split-origin deployments start the flow on the API host
+                // (where the state cookie must live) instead of 404ing on
+                // the frontend origin.
+                onClick={() => { window.location.href = buildResourceUrl('/api/auth/admin/sso/login'); }}
+              >
+                {settingsData.oidc_button_label?.trim() || t('adminLogin.ssoSignIn', 'Sign in with SSO')}
+              </Button>
             )}
           </form>
           ) : (
           <form onSubmit={handleMfaSubmit} className="space-y-6">
             <div className="text-center">
-              <div className="mx-auto mb-3 w-12 h-12 rounded-full flex items-center justify-center bg-primary-50 dark:bg-primary-900/30">
-                <ShieldCheck className="w-6 h-6" style={{ color: 'var(--color-primary, #5C8762)' }} />
+              <div className="mx-auto mb-3 w-12 h-12 rounded-full flex items-center justify-center bg-accent-soft">
+                <ShieldCheck className="w-6 h-6" style={{ color: 'var(--color-accent-dark)' }} />
               </div>
               <h2 className="text-lg font-semibold" style={{ color: 'var(--color-text, #171717)' }}>
                 {t('adminLogin.mfa.title')}
@@ -419,9 +482,9 @@ export const AdminLoginPage: React.FC = () => {
             </div>
 
             {mfaError && (
-              <div className="bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3">
-                <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                <p className="text-sm text-red-800">{mfaError}</p>
+              <div className="bg-danger-soft border border-danger-line rounded-lg p-4 flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-danger-text flex-shrink-0 mt-0.5" />
+                <p className="text-sm text-danger-text">{mfaError}</p>
               </div>
             )}
 
@@ -455,6 +518,20 @@ export const AdminLoginPage: React.FC = () => {
               {t('adminLogin.mfa.verify')}
             </Button>
 
+            {mfaPasskeyAvailable && passkeyOffered && (
+              <Button
+                type="button"
+                variant="outline"
+                size="lg"
+                className="w-full"
+                leftIcon={<Fingerprint className="w-4 h-4" />}
+                isLoading={isPasskeyLoading}
+                onClick={() => handlePasskeyLogin(true)}
+              >
+                {t('adminLogin.passkey.useInstead')}
+              </Button>
+            )}
+
             <div className="flex items-center justify-between text-sm">
               <button
                 type="button"
@@ -472,7 +549,7 @@ export const AdminLoginPage: React.FC = () => {
                   setMfaError(null);
                 }}
                 className="hover:underline"
-                style={{ color: 'var(--color-primary, #5C8762)' }}
+                style={{ color: 'var(--color-accent-dark)' }}
               >
                 {useRecoveryCode ? t('adminLogin.mfa.useAuthenticator') : t('adminLogin.mfa.useRecoveryCode')}
               </button>
@@ -481,25 +558,29 @@ export const AdminLoginPage: React.FC = () => {
           )}
         </Card>
 
-        {/* Footer */}
+        {/* Footer. The support line only renders once Branding has a
+            support email — publicSettings returns '' until then, and a
+            placeholder address would send visitors nowhere. */}
         <div className="text-center mt-8">
-          <p className="text-sm" style={{ color: 'var(--color-text, #171717)', opacity: 0.7 }}>
-            {t('adminLogin.needHelp')}{' '}
-            <a 
-              href={`mailto:${settingsData?.branding_support_email || 'support@example.com'}`} 
-              className="hover:underline"
-              style={{ color: 'var(--color-primary, #5C8762)' }}
-            >
-              {settingsData?.branding_support_email || 'support@example.com'}
-            </a>
-          </p>
+          {settingsData?.branding_support_email && (
+            <p className="text-sm" style={{ color: 'var(--color-text, #171717)', opacity: 0.7 }}>
+              {t('adminLogin.needHelp')}{' '}
+              <a
+                href={`mailto:${settingsData.branding_support_email}`}
+                className="hover:underline"
+                style={{ color: 'var(--color-accent-dark)' }}
+              >
+                {settingsData.branding_support_email}
+              </a>
+            </p>
+          )}
           <PoweredBy className="text-xs mt-2" style={{ color: 'var(--color-text, #171717)', opacity: 0.5 }} />
         </div>
 
         {/* Development Hint */}
         {import.meta.env.DEV && (
-          <div className="mt-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
-            <p className="text-sm text-blue-800 text-center">
+          <div className="mt-6 p-4 bg-info-soft border border-info-line rounded-lg">
+            <p className="text-sm text-info-text text-center">
               {t('adminLogin.devModeHint')}
             </p>
           </div>

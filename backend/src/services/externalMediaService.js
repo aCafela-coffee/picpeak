@@ -1,7 +1,7 @@
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
-const { safePathJoin } = require('../utils/fileSecurityUtils');
+const { safePathJoin, assertRealpathUnder, assertRealpathUnderSync } = require('../utils/fileSecurityUtils');
 
 let cachedRoot = null;
 
@@ -55,10 +55,22 @@ function isUnderRoot(p) {
   return resolved === root || resolved.startsWith(root + path.sep);
 }
 
-async function list(relativePath = '') {
+async function list(relativePath = '', actor = null) {
+  const access = require('./externalMediaAccess');
+  const admin = await access.principal(actor?.id, 'photos.view');
+  const normalizedPath = access.normalizeSourcePath(relativePath);
+  if (!normalizedPath && admin.roleName !== 'super_admin') {
+    // A virtual root, not a listing of the global mount or grant ancestors.
+    const sources = await access.ownedSources(admin);
+    return { path: '', entries: sources.map((source) => ({ name: source.path, path: source.path, type: 'dir' })), canNavigateUp: false };
+  }
+  const authorized = await access.authorizeSource(admin.id, normalizedPath);
   const root = getExternalMediaRoot();
   // Normalize and ensure safe join under root
-  const targetDir = safePathJoin(root, relativePath || '.');
+  const targetDir = authorized.target;
+  // The lexical check above does not follow symlinks; a link inside the root
+  // would otherwise list whatever it points at.
+  await assertRealpathUnder(root, targetDir);
 
   const entries = [];
   // Required here, not at the top: see externalMediaTypes.
@@ -66,9 +78,11 @@ async function list(relativePath = '') {
   // Errors propagate to the caller to handle (e.g. invalid path).
   const dirents = await fs.readdir(targetDir, { withFileTypes: true });
   for (const d of dirents) {
-    // Skip hidden files and directories
-    if (d.name.startsWith('.')) continue;
+    // Skip hidden files and directories, and symlinks: a link is never
+    // listed, so it can never be chosen.
+    if (d.name.startsWith('.') || d.isSymbolicLink()) continue;
     const full = path.join(targetDir, d.name);
+    await access.authorizeSelectedFile(authorized, full);
     const stat = await fs.stat(full).catch(() => null);
     if (!stat) continue;
 
@@ -123,7 +137,11 @@ function resolveExternalPath(event, relpath) {
  */
 function resolveExternalPhotoPath(photo) {
   const root = getExternalMediaRoot();
-  return safePathJoin(root, photo?.external_relpath || '');
+  const resolved = safePathJoin(root, photo?.external_relpath || '');
+  // Imports never follow a symlink (see externalImportService), but the row
+  // is read long after the import, and the tree can have changed under it.
+  assertRealpathUnderSync(root, resolved);
+  return resolved;
 }
 
 module.exports = {

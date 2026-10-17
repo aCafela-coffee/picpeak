@@ -4,7 +4,36 @@ const validator = require('validator');
 const { IDENTITY_PRESERVING_NORMALIZE_EMAIL } = require('./emailNormalization');
 const { REACTION_EMOJIS } = require('../constants/reactions');
 const { COLOR_LABELS } = require('../constants/colorLabels');
+const { PHOTO_DECISIONS, DECISION_REASON_MAX_LENGTH } = require('../constants/photoDecisions');
 const { KEYBIND_MODES } = require('../services/feedbackDefaults');
+
+/**
+ * Runs before checkGuestName wherever it runs. One stored form per name:
+ * "Jörg" typed with a precomposed ö and with o + a combining diaeresis is the
+ * same guest, and the name is stored as it is checked (trimmed), so no edge
+ * line break slips past.
+ */
+function normalizeGuestName(value) {
+  return typeof value === 'string' ? value.normalize('NFC').trim() : value;
+}
+
+/**
+ * The guest name the feedback routes take, and the hand-over with them
+ * (issue 1984): blank, or up to 100 characters of a plain set.
+ */
+function checkGuestName(value) {
+  // Allow empty or whitespace-only strings
+  if (!value || value.trim() === '') return true;
+  // If not empty, check length and pattern
+  const trimmed = value.trim();
+  if (trimmed.length > 100) throw new Error('Name must be less than 100 characters');
+  // Letters and combining marks of any script ("Jörg", "Łukasz"), digits,
+  // space separators (not tabs or line breaks), hyphen, both apostrophes
+  // and the period, with at least one letter or digit (marks or punctuation
+  // alone name nobody). Markup and control characters stay out.
+  if (!/^(?=.*[\p{L}0-9])[\p{L}\p{M}0-9\p{Zs}\-'’.]+$/u.test(trimmed)) throw new Error('Name contains invalid characters');
+  return true;
+}
 
 /**
  * Validation rules for feedback submission
@@ -116,14 +145,14 @@ const validateFeedbackType = param('feedbackType')
  * Validate photo ID parameter
  */
 const validatePhotoId = param('photoId')
-  .isInt({ min: 1 })
+  .isInt({ min: 1, max: 2147483647 })
   .withMessage('Invalid photo ID');
 
 /**
  * Validate event ID parameter
  */
 const validateEventId = param('eventId')
-  .isInt({ min: 1 })
+  .isInt({ min: 1, max: 2147483647 })
   .withMessage('Invalid event ID');
 
 /**
@@ -138,7 +167,7 @@ function getValidationRules(feedbackType) {
  */
 const validateFeedbackSubmission = [
   body('feedback_type')
-    .isIn(['rating', 'like', 'comment', 'favorite', 'reaction', 'color_label'])
+    .isIn(['rating', 'like', 'comment', 'favorite', 'reaction', 'color_label', 'decision'])
     .withMessage('Invalid feedback type'),
 
   // Conditional validation based on feedback type. 0 clears the guest's
@@ -163,6 +192,23 @@ const validateFeedbackSubmission = [
     .if(body('feedback_type').equals('color_label'))
     .custom((value) => COLOR_LABELS.includes(value))
     .withMessage('Invalid color label'),
+
+  // Approve / reject (issue 744). The reason is optional and travels in
+  // comment_text; omitting it entirely is what lets the same decision again
+  // toggle off, so it is only sanitised when present.
+  body('decision')
+    .if(body('feedback_type').equals('decision'))
+    .custom((value) => PHOTO_DECISIONS.includes(value))
+    .withMessage('Invalid decision'),
+  body('comment_text')
+    .if(body('feedback_type').equals('decision'))
+    .optional({ nullable: true })
+    .isString()
+    .withMessage('Reason must be text')
+    .trim()
+    .isLength({ max: DECISION_REASON_MAX_LENGTH })
+    .withMessage(`Reason must be at most ${DECISION_REASON_MAX_LENGTH} characters`)
+    .customSanitizer(value => sanitizeComment(value)),
   
   body('comment_text')
     .if(body('feedback_type').equals('comment'))
@@ -175,15 +221,8 @@ const validateFeedbackSubmission = [
   
   body('guest_name')
     .optional()
-    .custom((value) => {
-      // Allow empty or whitespace-only strings
-      if (!value || value.trim() === '') return true;
-      // If not empty, check length and pattern
-      const trimmed = value.trim();
-      if (trimmed.length > 100) throw new Error('Name must be less than 100 characters');
-      if (!/^[a-zA-Z0-9\s\-'.]+$/.test(trimmed)) throw new Error('Name contains invalid characters');
-      return true;
-    }),
+    .customSanitizer(normalizeGuestName)
+    .custom(checkGuestName),
   
   body('guest_email')
     .optional()
@@ -207,6 +246,9 @@ const validateFeedbackSettings = [
   body('allow_favorites').optional().isBoolean(),
   body('allow_reactions').optional().isBoolean(),
   body('allow_color_labels').optional().isBoolean(),
+  body('allow_decisions').optional().isBoolean(),
+  body('allow_selection_submit').optional().isBoolean(),
+  body('allow_annotations').optional().isBoolean(),
   body('keybind_mode').optional().isIn(KEYBIND_MODES)
     .withMessage(`keybind_mode must be one of: ${KEYBIND_MODES.join(', ')}`),
   body('require_name_email').optional().isBoolean(),
@@ -306,5 +348,7 @@ module.exports = {
   checkValidation,
   getValidationRules,
   sanitizeComment,
-  validateGuestRequirements
+  validateGuestRequirements,
+  checkGuestName,
+  normalizeGuestName
 };

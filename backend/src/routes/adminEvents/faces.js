@@ -9,6 +9,7 @@
 
 const { body, validationResult } = require('express-validator');
 const { db, logActivity } = require('../../database/db');
+const { joinLivePhotos } = require('../../utils/photoVisibility');
 const { adminAuth } = require('../../middleware/auth');
 const { requirePermission } = require('../../middleware/permissions');
 const { requireFeatureFlag } = require('../../middleware/requireFeatureFlag');
@@ -47,7 +48,7 @@ function buildPersonFacesQuery(dbi, eventId, personId) {
     })
     .orderBy('det_score', 'desc')
     .limit(PERSON_FACES_LIMIT)
-    .join('photos', 'photos.id', 'photo_faces.photo_id')
+    .modify(joinLivePhotos, 'photos.id', 'photo_faces.photo_id')
     .select(
       'photo_faces.id', 'photo_faces.photo_id',
       'photo_faces.bbox_x', 'photo_faces.bbox_y',
@@ -161,12 +162,8 @@ module.exports = (router) => {
             .update({ faces_last_scan_at: new Date().toISOString() });
         }
 
-        await logActivity('event_faces_updated', {
-          actorType: 'admin',
-          actorId: req.admin.id,
-          eventId: event.id,
-          metadata: { ...update, queued },
-        }).catch(() => {});
+        await logActivity('event_faces_updated', { ...update, queued }, event.id,
+          { type: 'admin', id: req.admin.id, name: req.admin.username }).catch(() => {});
 
         res.json({ success: true, queued });
       } catch (error) {
@@ -413,9 +410,8 @@ module.exports = (router) => {
         await db('events').where({ id: event.id })
           .update({ faces_last_scan_at: new Date().toISOString() });
 
-        await logActivity('event_faces_rescan', {
-          actorType: 'admin', actorId: req.admin.id, eventId: event.id, metadata: { queued },
-        }).catch(() => {});
+        await logActivity('event_faces_rescan', { queued }, event.id,
+          { type: 'admin', id: req.admin.id, name: req.admin.username }).catch(() => {});
 
         res.json({ success: true, queued });
       } catch (error) {
@@ -434,9 +430,8 @@ module.exports = (router) => {
         if (!event) return res.status(404).json({ error: 'Event not found' });
 
         const people = await faceClustering.recluster(event.id);
-        await logActivity('event_faces_recluster', {
-          actorType: 'admin', actorId: req.admin.id, eventId: event.id, metadata: { people },
-        }).catch(() => {});
+        await logActivity('event_faces_recluster', { people }, event.id,
+          { type: 'admin', id: req.admin.id, name: req.admin.username }).catch(() => {});
 
         res.json({ success: true, people });
       } catch (error) {
@@ -488,9 +483,8 @@ module.exports = (router) => {
           });
         }
 
-        await logActivity('face_auto_categories_toggled', {
-          actorType: 'admin', actorId: req.admin.id, metadata: { enabled },
-        }).catch(() => {});
+        await logActivity('face_auto_categories_toggled', { enabled }, null,
+          { type: 'admin', id: req.admin.id, name: req.admin.username }).catch(() => {});
 
         res.json({ success: true, enabled });
       } catch (error) {
@@ -532,9 +526,8 @@ module.exports = (router) => {
         const { undoEvent } = require('../../services/faceAutoCategories');
         const result = await undoEvent(event.id);
 
-        await logActivity('event_faces_categories_undone', {
-          actorType: 'admin', actorId: req.admin.id, eventId: event.id, metadata: result,
-        }).catch(() => {});
+        await logActivity('event_faces_categories_undone', result, event.id,
+          { type: 'admin', id: req.admin.id, name: req.admin.username }).catch(() => {});
 
         res.json({ success: true, ...result });
       } catch (error) {
@@ -554,9 +547,8 @@ module.exports = (router) => {
         const result = await faceProcessor.purgeEvent(event.id);
         await db('events').where({ id: event.id }).update({ faces_last_scan_at: null });
 
-        await logActivity('event_faces_purged', {
-          actorType: 'admin', actorId: req.admin.id, eventId: event.id, metadata: result,
-        }).catch(() => {});
+        await logActivity('event_faces_purged', result, event.id,
+          { type: 'admin', id: req.admin.id, name: req.admin.username }).catch(() => {});
 
         logger.info(`adminEvents: face data purged for event ${event.id} by admin ${req.admin.id}`);
         res.json({ success: true, ...result });

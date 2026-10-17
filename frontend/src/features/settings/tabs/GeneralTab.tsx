@@ -1,6 +1,6 @@
 import { selectScreenLanguage, normalizeScreenLanguage } from '../../../i18n/screenLanguage';
 import React from 'react';
-import { Globe, Mail, User } from 'lucide-react';
+import { Camera, Globe, Mail, User } from 'lucide-react';
 import { Card, Input, Loading } from '../../../components/common';
 import { useTranslation } from 'react-i18next';
 import { SettingsSaveBar } from '../../../components/admin/SettingsSaveBar';
@@ -8,6 +8,7 @@ import type { GeneralSettings } from '../hooks/useSettingsState';
 import { MAX_FILES_PER_UPLOAD_LIMIT } from '../hooks/useSettingsState';
 import { SUPPORTED_LANGUAGES, SUPPORTED_UI_LANGUAGES } from "../../../components/common/LanguageSelector.tsx";
 import { MfaSettingsCard } from '../components/MfaSettingsCard';
+import { PasskeysCard } from '../components/PasskeysCard';
 import { isAbsoluteHttpUrl } from '../../../utils/url';
 
 interface GeneralTabProps {
@@ -21,9 +22,9 @@ interface GeneralTabProps {
   onDiscard: () => void;
   accountDirty: boolean;
   onDiscardAccount: () => void;
-  accountForm: { username: string; email: string };
+  accountForm: { username: string; email: string; creditName: string };
   accountErrors: Record<string, string>;
-  handleAccountChange: (field: 'username' | 'email') => (e: React.ChangeEvent<HTMLInputElement>) => void;
+  handleAccountChange: (field: 'username' | 'email' | 'creditName') => (e: React.ChangeEvent<HTMLInputElement>) => void;
   handleAccountSubmit: (e?: React.FormEvent<HTMLFormElement>) => void;
   updateAdminProfileMutation: { isPending: boolean };
   adminProfileLoading: boolean;
@@ -86,7 +87,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
                 value={accountForm.username}
                 onChange={handleAccountChange('username')}
                 placeholder="admin"
-                leftIcon={<User className="w-5 h-5 text-neutral-400" />}
+                leftIcon={<User className="w-5 h-5 text-faint" />}
                 error={accountErrors.username}
               />
               <p className="text-xs text-muted mt-1">
@@ -104,11 +105,29 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
                 value={accountForm.email}
                 onChange={handleAccountChange('email')}
                 placeholder="admin@example.com"
-                leftIcon={<Mail className="w-5 h-5 text-neutral-400" />}
+                leftIcon={<Mail className="w-5 h-5 text-faint" />}
                 error={accountErrors.email}
               />
               <p className="text-xs text-muted mt-1">
                 {t('settings.general.accountEmailHelp')}
+              </p>
+            </div>
+
+            <div>
+              <label htmlFor="admin-account-credit-name" className="block text-sm font-medium text-body mb-1">
+                {t('settings.general.accountCreditName', 'Photo credit')}
+              </label>
+              <Input
+                id="admin-account-credit-name"
+                type="text"
+                value={accountForm.creditName}
+                onChange={handleAccountChange('creditName')}
+                maxLength={100}
+                leftIcon={<Camera className="w-5 h-5 text-faint" />}
+                error={accountErrors.credit_name}
+              />
+              <p className="text-xs text-muted mt-1">
+                {t('settings.general.accountCreditNameHelp', 'Credited on photos you upload when the file has no photographer name in its metadata. Leave empty for no credit.')}
               </p>
             </div>
 
@@ -121,6 +140,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
       {/* Per-user two-factor authentication (issue #738) — lives beside the
           admin's own account details rather than the admin-wide Security tab. */}
       <MfaSettingsCard />
+      <PasskeysCard />
 
       <Card padding="md">
         <h2 className="text-lg font-semibold text-heading mb-4">{t('settings.general.siteConfiguration')}</h2>
@@ -135,7 +155,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
               value={generalSettings.site_url}
               onChange={(e) => setGeneralSettings(prev => ({ ...prev, site_url: e.target.value }))}
               placeholder="https://yourdomain.com"
-              leftIcon={<Globe className="w-5 h-5 text-neutral-400" />}
+              leftIcon={<Globe className="w-5 h-5 text-faint" />}
               disabled={generalSettings.site_url_env_pinned}
               error={siteUrlError}
             />
@@ -188,6 +208,57 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
               </p>
             </div>
             <div>
+              <label className="flex items-center">
+                <input
+                  type="checkbox"
+                  checked={generalSettings.video_web_rendition}
+                  onChange={(e) => setGeneralSettings(prev => ({ ...prev, video_web_rendition: e.target.checked }))}
+                  className="w-4 h-4 text-accent rounded focus:ring-accent"
+                  data-testid="general-video-web-rendition"
+                />
+                <span className="ml-2 text-sm text-body">
+                  {t('settings.general.videoWebRendition', 'Browser-playable copies of videos')}
+                </span>
+              </label>
+              <p className="text-xs text-muted ml-6 mt-1">
+                {t('settings.general.videoWebRenditionHelp', 'Re-encodes videos a browser cannot play (HEVC, QuickTime, MP4s that are not streamable) into an H.264 MP4 for playback. The original stays the download. Costs CPU per video and a second file; switching it on queues the videos already uploaded.')}
+              </p>
+            </div>
+            <div>
+              <label className="flex items-center">
+                <input
+                  type="checkbox"
+                  checked={generalSettings.video_strip_metadata}
+                  onChange={(e) => setGeneralSettings(prev => ({ ...prev, video_strip_metadata: e.target.checked }))}
+                  className="w-4 h-4 text-accent rounded focus:ring-accent"
+                  data-testid="general-video-strip-metadata"
+                />
+                <span className="ml-2 text-sm text-body">
+                  {t('settings.general.videoStripMetadata', 'Strip location and device data from played videos')}
+                </span>
+              </label>
+              <p className="text-xs text-muted ml-6 mt-1">
+                {t('settings.general.videoStripMetadataHelp', 'Videos that already play in a browser get a copy without the recording location, camera and other metadata, made without re-encoding; guests play that copy. Stores one extra file per such video, about the size of the original. The original stays the download. Switching it off keeps the copies already made.')}
+              </p>
+            </div>
+            <div>
+              <label className="flex items-center">
+                <input
+                  type="checkbox"
+                  checked={generalSettings.video_adaptive_streaming}
+                  onChange={(e) => setGeneralSettings(prev => ({ ...prev, video_adaptive_streaming: e.target.checked }))}
+                  className="w-4 h-4 text-accent rounded focus:ring-accent"
+                  data-testid="general-video-adaptive-streaming"
+                />
+                <span className="ml-2 text-sm text-body">
+                  {t('settings.general.videoAdaptiveStreaming', 'Adaptive video streaming')}
+                </span>
+              </label>
+              <p className="text-xs text-muted ml-6 mt-1">
+                {t('settings.general.videoAdaptiveStreamingHelp', 'Converts each video into a stream in up to three qualities (480p, 720p, 1080p), so playback starts quickly and adapts to the viewer’s connection. The original stays the download. Costs CPU per video and roughly as much storage again; videos longer than 30 minutes keep playing as before.')}
+              </p>
+            </div>
+            <div>
               <label className="block text-sm font-medium text-body mb-1">
                 {t('settings.general.maxFilesPerUpload')}
               </label>
@@ -232,6 +303,31 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
                 {t('settings.general.maxUploadBatchSizeHelp')}
               </p>
             </div>
+            <div>
+              <label htmlFor="general-photo-trash-retention" className="block text-sm font-medium text-body mb-1">
+                {t('settings.general.photoTrashRetention')}
+              </label>
+              <Input
+                id="general-photo-trash-retention"
+                type="number"
+                value={generalSettings.photo_trash_retention_days}
+                onChange={(e) => {
+                  // 0 is a real choice here (delete at once), so no `|| default`.
+                  const parsed = parseInt(e.target.value, 10);
+                  setGeneralSettings(prev => ({
+                    ...prev,
+                    photo_trash_retention_days: Number.isFinite(parsed)
+                      ? Math.min(365, Math.max(0, parsed))
+                      : prev.photo_trash_retention_days
+                  }));
+                }}
+                min="0"
+                max="365"
+              />
+              <p className="text-xs text-muted mt-1">
+                {t('settings.general.photoTrashRetentionHelp')}
+              </p>
+            </div>
           </div>
 
           <div>
@@ -260,7 +356,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
               type="checkbox"
               checked={generalSettings.enable_analytics}
               onChange={(e) => setGeneralSettings(prev => ({ ...prev, enable_analytics: e.target.checked }))}
-              className="w-4 h-4 text-primary-600 rounded focus:ring-primary-500"
+              className="w-4 h-4 text-accent rounded focus:ring-accent"
             />
             <span className="ml-2 text-sm text-body">{t('settings.general.enableAnalytics')}</span>
           </label>
@@ -270,7 +366,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
               type="checkbox"
               checked={generalSettings.enable_registration}
               onChange={(e) => setGeneralSettings(prev => ({ ...prev, enable_registration: e.target.checked }))}
-              className="w-4 h-4 text-primary-600 rounded focus:ring-primary-500"
+              className="w-4 h-4 text-accent rounded focus:ring-accent"
             />
             <span className="ml-2 text-sm text-body">{t('settings.general.enableRegistration')}</span>
           </label>
@@ -280,7 +376,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
               type="checkbox"
               checked={generalSettings.maintenance_mode}
               onChange={(e) => setGeneralSettings(prev => ({ ...prev, maintenance_mode: e.target.checked }))}
-              className="w-4 h-4 text-primary-600 rounded focus:ring-primary-500"
+              className="w-4 h-4 text-accent rounded focus:ring-accent"
             />
             <span className="ml-2 text-sm text-body">{t('settings.general.maintenanceMode')}</span>
           </label>
@@ -291,7 +387,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
                 type="checkbox"
                 checked={generalSettings.short_gallery_urls}
                 onChange={(e) => setGeneralSettings(prev => ({ ...prev, short_gallery_urls: e.target.checked }))}
-                className="w-4 h-4 text-primary-600 rounded focus:ring-primary-500"
+                className="w-4 h-4 text-accent rounded focus:ring-accent"
               />
               <span className="ml-2 text-sm text-body">{t('settings.general.enableShortGalleryUrls')}</span>
             </label>
@@ -306,7 +402,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
                 type="checkbox"
                 checked={generalSettings.use_original_filenames_for_downloads}
                 onChange={(e) => setGeneralSettings(prev => ({ ...prev, use_original_filenames_for_downloads: e.target.checked }))}
-                className="w-4 h-4 text-primary-600 rounded focus:ring-primary-500"
+                className="w-4 h-4 text-accent rounded focus:ring-accent"
               />
               <span className="ml-2 text-sm text-body">{t('settings.general.useOriginalFilenames')}</span>
             </label>
@@ -338,7 +434,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
               id="admin-language"
               value={normalizeScreenLanguage(i18n.language) || 'en'}
               onChange={(e) => { void selectScreenLanguage(i18n, e.target.value); }}
-              className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+              className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent"
             >
               {SUPPORTED_UI_LANGUAGES.map(lang => (
                 <option key={lang.code} value={lang.code}>{lang.name}</option>
@@ -358,7 +454,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
               id="gallery-language"
               value={generalSettings.default_language}
               onChange={(e) => setGeneralSettings(prev => ({ ...prev, default_language: e.target.value }))}
-              className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+              className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent"
             >
               {SUPPORTED_LANGUAGES.map(lang => (
                 <option key={lang.code} value={lang.code}>{lang.name}</option>
@@ -389,7 +485,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
                   date_format: { format, locale }
                 }));
               }}
-              className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+              className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent"
             >
               <option value="dd/MM/yyyy">DD/MM/YYYY (European)</option>
               <option value="MM/dd/yyyy">MM/DD/YYYY (US)</option>
@@ -411,7 +507,7 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
                 const time_format = e.target.value === '12h' ? '12h' : '24h';
                 setGeneralSettings(prev => ({ ...prev, time_format }));
               }}
-              className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+              className="w-full px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent"
             >
               <option value="24h">{t('settings.general.timeFormat24h', '24-hour (14:30)')}</option>
               <option value="12h">{t('settings.general.timeFormat12h', '12-hour (2:30 PM)')}</option>

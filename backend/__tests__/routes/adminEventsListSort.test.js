@@ -193,6 +193,30 @@ describe('admin events list — ordering and type filter', () => {
     });
   });
 
+  describe('awaiting delivery (PR 1826 follow-up)', () => {
+    it('orders partial galleries by due date server-side, so the soonest five are right past the first page', async () => {
+      // 23 partial galleries inserted latest-due first: the old dashboard
+      // fetched 20 by created_at and sorted those, missing the three soonest.
+      for (let i = 0; i < 23; i += 1) {
+        await mkEvent({
+          slug: `due-${i}`, event_name: `Due ${String(i).padStart(2, '0')}`,
+          delivery_status: 'partial', delivery_due_at: inDays(40 - i),
+        });
+      }
+      await mkEvent({ slug: 'due-none', event_name: 'Due None', delivery_status: 'partial', delivery_due_at: null });
+      const res = await request(app)
+        .get('/api/admin/events')
+        .query({ limit: 5, status: 'awaiting_delivery', sortBy: 'delivery_due_at', sortOrder: 'asc' })
+        .set('Authorization', `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.events.map((e) => e.event_name)).toEqual(['Due 22', 'Due 21', 'Due 20', 'Due 19', 'Due 18']);
+      expect(res.body.pagination.total).toBe(24);
+
+      const all = await listNames({ status: 'awaiting_delivery', sortBy: 'delivery_due_at', sortOrder: 'asc' });
+      expect(all[all.length - 1]).toBe('Due None');
+    });
+  });
+
   describe('type filter', () => {
     it('narrows the rows and the pagination total together', async () => {
       const res = await request(app)
@@ -252,6 +276,33 @@ describe('admin events list — ordering and type filter', () => {
 
     it('no longer accepts capture_date, which is a photo column and threw', async () => {
       await expectSameOrder({ sortBy: 'capture_date' }, {});
+    });
+  });
+
+  describe('mixed expires_at shapes on SQLite (issue 1733)', () => {
+    // The extend endpoint bound a Date, which SQLite stored as epoch ms,
+    // next to the ISO text normal creation writes. Numbers sort below every
+    // text, so the raw column put a later epoch-ms expiry ahead of an
+    // earlier ISO one and ranked it wrongly in the status sort.
+    beforeAll(async () => {
+      await mkEvent({ slug: 'mx-iso-2d', event_name: 'M Iso2d', expires_at: inDays(2) });
+      await mkEvent({ slug: 'mx-ms-5d', event_name: 'M Ms5d', expires_at: Date.now() + 5 * DAY });
+      await mkEvent({ slug: 'mx-iso-9d', event_name: 'M Iso9d', expires_at: inDays(9) });
+      await mkEvent({ slug: 'mx-ms-past', event_name: 'M MsPast', expires_at: Date.now() - DAY });
+    });
+
+    it('orders expires_at by the point in time, not by the stored type', async () => {
+      const names = (await listNames({ sortBy: 'expires_at', sortOrder: 'asc' }))
+        .filter((n) => n.startsWith('M '));
+      expect(names).toEqual(['M MsPast', 'M Iso2d', 'M Ms5d', 'M Iso9d']);
+    });
+
+    it('ranks an epoch-ms expiry in the status sort like an ISO one', async () => {
+      const names = (await listNames({ sortBy: 'status', sortOrder: 'asc' }))
+        .filter((n) => n.startsWith('M '));
+      // active → expiring (within 7 days, ties by id desc) → expired: the
+      // epoch-ms rows land in the same ranks as their ISO neighbours.
+      expect(names).toEqual(['M Iso9d', 'M Ms5d', 'M Iso2d', 'M MsPast']);
     });
   });
 });

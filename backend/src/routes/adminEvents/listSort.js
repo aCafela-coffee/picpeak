@@ -28,7 +28,7 @@
  * sent it.
  */
 
-const { formatBoolean } = require('../../utils/dbCompat');
+const { formatBoolean, isPostgreSQL, sqliteTimestampMs } = require('../../utils/dbCompat');
 
 /**
  * How each sortable key is turned into an ORDER BY.
@@ -52,10 +52,17 @@ const SORTABLE = {
   // one would land (SQLite ASC first, Postgres ASC last), so it is pinned.
   updated_at: 'nullable',
   expires_at: 'nullable',
+  // Two-stage delivery (issue 1562): the date the full gallery is promised
+  // by. The dashboard's "awaiting delivery" card asks for the soonest first;
+  // sorting here, before LIMIT, keeps it right past the first page.
+  delivery_due_at: 'nullable',
   slug: 'plain',
   photo_count: 'photos',
   status: 'status',
 };
+
+/** Nullable keys SQLite must order as timestamps, not as stored text. */
+const TIMESTAMP_KEYS = new Set(['expires_at', 'delivery_due_at']);
 
 const DEFAULT_SORT_BY = 'created_at';
 const DEFAULT_SORT_ORDER = 'desc';
@@ -119,17 +126,30 @@ function applyEventListSort(query, sortBy, sortOrder) {
     // for. Expressed as a leading 0/1 flag rather than `NULLS LAST`, which
     // SQLite only learned in 3.30 — and which the two engines default to
     // opposite ways without.
-    query = query
-      .orderByRaw('case when ?? is null then 1 else 0 end asc', [key])
-      .orderBy(key, dir);
+    query = query.orderByRaw('case when ?? is null then 1 else 0 end asc', [key]);
+    if (TIMESTAMP_KEYS.has(key) && !isPostgreSQL()) {
+      // SQLite holds expires_at as ISO text or as epoch ms (the extend path
+      // bound a Date), and orders every number below every text; sort the
+      // value as a timestamp, like the status filter compares it.
+      // delivery_due_at is written as ISO text today; read the same way so a
+      // future epoch-ms writer cannot reorder it.
+      const ms = sqliteTimestampMs(key);
+      query = query.orderByRaw(`${ms.sql} ${dir}`, ms.bindings);
+    } else {
+      query = query.orderBy(key, dir);
+    }
   } else if (kind === 'photos') {
     query = query.orderByRaw(
-      `(select count(*) from photos where photos.event_id = events.id) ${dir}`,
+      `(select count(*) from photos where photos.event_id = events.id and photos.deleted_at is null) ${dir}`,
     );
   } else if (kind === 'status') {
     const now = new Date();
-    const nowIso = now.toISOString();
-    const expiringUntilIso = new Date(now.getTime() + EXPIRING_WINDOW_MS).toISOString();
+    const expiringUntil = new Date(now.getTime() + EXPIRING_WINDOW_MS);
+    // PostgreSQL compares the timestamp column; SQLite reads the stored
+    // shape (ISO text or epoch ms) as epoch ms, see sqliteTimestampMs.
+    const expiry = isPostgreSQL()
+      ? { sql: '??', bindings: ['expires_at'], now: now.toISOString(), until: expiringUntil.toISOString() }
+      : { ...sqliteTimestampMs('expires_at'), now: now.getTime(), until: expiringUntil.getTime() };
     // Branch order is load-bearing: it is getEventStatus's precedence, where a
     // draft reads as a draft even once archived and an archived event never
     // reads as expired.
@@ -139,8 +159,8 @@ function applyEventListSort(query, sortBy, sortOrder) {
          when ?? = ? then ${STATUS_RANK.archived}
          when ?? is null or ?? = ? then ${STATUS_RANK.inactive}
          when ?? is null then ${STATUS_RANK.active}
-         when ?? <= ? then ${STATUS_RANK.expired}
-         when ?? <= ? then ${STATUS_RANK.expiring}
+         when ${expiry.sql} <= ? then ${STATUS_RANK.expired}
+         when ${expiry.sql} <= ? then ${STATUS_RANK.expiring}
          else ${STATUS_RANK.active}
        end ${dir}`,
       [
@@ -148,8 +168,8 @@ function applyEventListSort(query, sortBy, sortOrder) {
         'is_archived', formatBoolean(true),
         'is_active', 'is_active', formatBoolean(false),
         'expires_at',
-        'expires_at', nowIso,
-        'expires_at', expiringUntilIso,
+        ...expiry.bindings, expiry.now,
+        ...expiry.bindings, expiry.until,
       ],
     );
   } else {

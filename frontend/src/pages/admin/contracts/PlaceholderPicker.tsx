@@ -11,6 +11,7 @@ import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { Braces } from 'lucide-react';
 import { contractTemplatesService, type ContractPlaceholder } from '../../../services/contractTemplates.service';
+import { isImeComposing } from '../../../utils/imeComposition';
 
 export const PLACEHOLDER_CATEGORIES: ContractPlaceholder['category'][] = ['customer', 'event', 'contract', 'pricing', 'issuer'];
 const CATEGORY_LABELS: Record<ContractPlaceholder['category'], string> = {
@@ -86,6 +87,8 @@ export const PlaceholderPicker: React.FC<{
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
+    // Keys of an IME composition in the editor are the editor's.
+    if (isImeComposing(e)) return;
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
@@ -111,7 +114,7 @@ export const PlaceholderPicker: React.FC<{
         aria-expanded={open}
         aria-haspopup="dialog"
         onClick={() => (open ? close(false) : setOpen(true))}
-        className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs border border-line-strong text-body hover:bg-hover disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-600"
+        className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs border border-line-strong text-body hover:bg-hover disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
       >
         <Braces className="w-3.5 h-3.5" aria-hidden="true" />
         {t('contracts.templates.picker.open', 'Insert placeholder')}
@@ -160,7 +163,7 @@ export const PlaceholderPicker: React.FC<{
                         onMouseEnter={() => setActive(index)}
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => choose(p)}
-                        className={`px-1 py-1 rounded cursor-pointer text-sm ${index === active ? 'bg-primary-50 dark:bg-primary-900/40' : ''}`}
+                        className={`px-1 py-1 rounded cursor-pointer text-sm ${index === active ? 'bg-accent-soft' : ''}`}
                       >
                         <span className="block text-heading">{p.label[lang]}</span>
                         <span className="block text-xs text-soft">

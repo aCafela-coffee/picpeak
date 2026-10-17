@@ -12,6 +12,7 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret-at-least-32-char
 const fs = require('fs');
 const path = require('path');
 const { bootCrmDb } = require('./helpers/crmDb');
+const { decodeSettingValue } = require('../helpers/settingValue');
 
 let db;
 let cleanup;
@@ -20,6 +21,10 @@ let createPicpeak;
 let importFromPicpeak;
 let validateManifest;
 let superAdminRoleId;
+
+// importFromPicpeak runs the coordinated portable restore, which needs a Linux
+// host (portableRestoreCapability); elsewhere it refuses before restoring.
+const linuxIt = process.platform === 'linux' ? it : it.skip;
 
 beforeAll(async () => {
   ({ db, cleanup, tmpDir } = await bootCrmDb());
@@ -52,11 +57,11 @@ async function setMarker(value) {
 }
 async function getMarker() {
   const row = await db('app_settings').where({ setting_key: 'roundtrip_marker' }).first();
-  return row ? JSON.parse(row.setting_value) : null;
+  return row ? decodeSettingValue(db, row.setting_value) : null;
 }
 
 describe('.picpeak roundtrip (export → import)', () => {
-  it('restores backup data and preserves the current account', async () => {
+  linuxIt('restores backup data and preserves the current account', async () => {
     // 1. Seed the "source" instance.
     await db('admin_users').del();
     await db('admin_users').insert(adminRow('backup-admin@old.example', 'HASH_A'));
@@ -94,7 +99,7 @@ describe('.picpeak roundtrip (export → import)', () => {
     }
   });
 
-  it('overwrites a backup admin that collides with the current account email', async () => {
+  linuxIt('overwrites a backup admin that collides with the current account email', async () => {
     // Source has an admin at the SAME email the current operator will use.
     await db('admin_users').del();
     await db('admin_users').insert(adminRow('shared@example.com', 'OLD_HASH'));
@@ -118,7 +123,50 @@ describe('.picpeak roundtrip (export → import)', () => {
     }
   });
 
-  it('restores files/ and reports filesRestored', async () => {
+  // Passkeys (issue 1733) sign in without the password: the operator keeps
+  // their own, and an archived key on the same account must not survive.
+  linuxIt('keeps the current account\'s passkeys and drops the archive\'s for that account', async () => {
+    const passkey = (adminId, credentialId) => ({
+      admin_user_id: adminId, credential_id: credentialId, public_key: `PUB_${credentialId}`,
+      counter: 0, name: credentialId, created_at: new Date().toISOString(),
+    });
+    const insertAdmin = async (email, hash) => {
+      const [id] = await db('admin_users').insert(adminRow(email, hash)).returning('id');
+      return typeof id === 'object' ? id.id : id;
+    };
+
+    await db('admin_webauthn_credentials').del();
+    await db('admin_users').del();
+    const archivedSharedId = await insertAdmin('pk-shared@example.com', 'OLD_HASH');
+    const colleagueId = await insertAdmin('pk-colleague@example.com', 'COLLEAGUE_HASH');
+    await db('admin_webauthn_credentials').insert([
+      passkey(archivedSharedId, 'archived-key'), passkey(colleagueId, 'colleague-key'),
+    ]);
+    const { filePath } = await createPicpeak({ includePhotos: false });
+
+    try {
+      await db('admin_webauthn_credentials').del();
+      await db('admin_users').del();
+      const currentAdminId = await insertAdmin('pk-shared@example.com', 'NEW_HASH');
+      await db('admin_webauthn_credentials').insert(passkey(currentAdminId, 'current-key'));
+
+      await importFromPicpeak({ picpeakPath: filePath, currentAdminId });
+
+      const operator = await db('admin_users').whereRaw('lower(email) = lower(?)', ['pk-shared@example.com']).first();
+      expect(operator.password_hash).toBe('NEW_HASH');
+      const colleague = await db('admin_users').whereRaw('lower(email) = lower(?)', ['pk-colleague@example.com']).first();
+      const keys = await db('admin_webauthn_credentials').select('admin_user_id', 'credential_id', 'public_key').orderBy('credential_id');
+      expect(keys).toEqual([
+        { admin_user_id: colleague.id, credential_id: 'colleague-key', public_key: 'PUB_colleague-key' },
+        { admin_user_id: operator.id, credential_id: 'current-key', public_key: 'PUB_current-key' },
+      ]);
+    } finally {
+      await db('admin_webauthn_credentials').del();
+      fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
+    }
+  });
+
+  linuxIt('restores files/ and reports filesRestored', async () => {
     // A business-doc that lives in storage → travels in the backup.
     const docDir = path.join(tmpDir, 'business-docs');
     const marker = path.join(docDir, 'roundtrip-doc.txt');

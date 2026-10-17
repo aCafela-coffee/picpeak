@@ -19,14 +19,17 @@ import type { TFunction } from 'i18next';
 import { toast } from 'react-toastify';
 import {
   Plus, Send, Link2, Download, Trash2, Upload, X, Copy, Image as ImageIcon,
-  Clock, Ban, RefreshCw, Mail, Paperclip, FileText, Inbox, KeyRound, ShieldAlert,
+  Clock, Ban, RefreshCw, Mail, Paperclip, FileText, Files, Inbox, KeyRound, ShieldAlert,
 } from 'lucide-react';
 
-import { Button, Input, Card, CardContent, Loading, useConfirm } from '../../../components/common';
+import { Badge, Button, Input, Card, EmptyState, ErrorState, Loading, Modal, Tabs, Table, TableHead, TableBody, TableRow, TableHeaderCell, TableCell, useConfirm } from '../../../components/common';
+import type { BadgeTone } from '../../../components/common';
+import { SectionPageHeader } from '../../../components/admin/SectionPageHeader';
 import { AdminAuthenticatedImage } from '../../../components/admin/AdminAuthenticatedImage';
 import { TransferPhotoPicker, type PickedPhoto } from '../../../components/admin/TransferPhotoPicker';
 import { useMutationWithToast } from '../../../hooks/useMutationWithToast';
 import { usePermission } from '../../../hooks/usePermission';
+import { parseWholeNumber } from '../../../utils/wholeNumber';
 import { useLocalizedDate } from '../../../hooks/useLocalizedDate';
 import {
   transfersService,
@@ -34,6 +37,9 @@ import {
   type TransferKind,
   type TransferWriteResult,
 } from '../../../services/transfers.service';
+
+// Mirrors MAX_FILES_CEILING in backend/src/services/transferUploadPolicy.js.
+const MAX_FILES_CEILING = 1000;
 
 function formatBytes(bytes: number | null | undefined): string {
   if (!bytes) return '0 B';
@@ -48,10 +54,10 @@ function uploadUrl(token: string): string {
   return `${window.location.origin}/transfer-upload/${token}`;
 }
 
-const STATUS_STYLES: Record<string, string> = {
-  active: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
-  expired: 'bg-fill text-body',
-  deleted: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+const STATUS_TONES: Record<string, BadgeTone> = {
+  active: 'success',
+  expired: 'neutral',
+  deleted: 'danger',
 };
 
 type TabKey = 'all' | 'send' | 'request';
@@ -102,7 +108,7 @@ export const TransfersPage: React.FC = () => {
   const canEdit = usePermission('events.edit');
   const canView = usePermission('events.view');
 
-  const { data: transfers, isLoading, refetch } = useQuery({
+  const { data: transfers, isLoading, isError, isRefetching, refetch } = useQuery({
     queryKey: ['admin-transfers'],
     queryFn: () => transfersService.list(),
     // Hiding the control is not enough — the list endpoint is events.view, so
@@ -136,121 +142,115 @@ export const TransfersPage: React.FC = () => {
     { key: 'request', label: t('transfers.tab.requested', 'Requested') },
   ];
 
+  const createButtons = canEdit ? (
+    <>
+      <Button
+        variant="outline"
+        leftIcon={<Inbox className="h-4 w-4" />}
+        onClick={() => setCreateKind('request')}
+      >
+        {t('transfers.newRequest', 'Request files')}
+      </Button>
+      <Button leftIcon={<Plus className="h-4 w-4" />} onClick={() => setCreateKind('send')}>
+        {t('transfers.newSend', 'Send files')}
+      </Button>
+    </>
+  ) : null;
+
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="flex items-center gap-2 text-2xl font-bold text-heading">
-            <Send className="h-6 w-6" /> {t('transfers.title', 'PicTransfer')}
-          </h1>
-          <p className="mt-1 text-sm text-muted">
-            {t('transfers.subtitle', 'Send files to a client, or ask a client to send files to you.')}
-          </p>
-        </div>
-        {canEdit && (
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              leftIcon={<Inbox className="h-4 w-4" />}
-              onClick={() => setCreateKind('request')}
-            >
-              {t('transfers.newRequest', 'Request files')}
-            </Button>
-            <Button leftIcon={<Plus className="h-4 w-4" />} onClick={() => setCreateKind('send')}>
-              {t('transfers.newSend', 'Send files')}
-            </Button>
-          </div>
-        )}
-      </div>
+      <SectionPageHeader
+        icon={Send}
+        title={t('transfers.title', 'PicTransfer')}
+        description={t('transfers.subtitle', 'Send files to a client, or ask a client to send files to you.')}
+        feature="transfers"
+        className=""
+        actions={createButtons}
+      />
 
       {/* Kind filter. Shown whenever there is anything to filter, so the two
           flows stay visible to someone who has only ever used one of them. */}
       {!isLoading && counts.all > 0 && (
-        <div className="flex gap-1 border-b border-line">
-          {TABS.map((tb) => (
-            <button
-              key={tb.key}
-              onClick={() => setTab(tb.key)}
-              className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium transition ${
-                tab === tb.key
-                  ? 'border-primary-600 text-primary-700 dark:text-primary-400'
-                  : 'border-transparent text-muted hover:text-body'
-              }`}
-            >
-              {tb.label} <span className="text-muted">({counts[tb.key]})</span>
-            </button>
-          ))}
-        </div>
+        <Tabs
+          items={TABS.map((tb) => ({ id: tb.key, label: tb.label, count: counts[tb.key] }))}
+          value={tab}
+          onChange={setTab}
+          aria-label={t('transfers.title', 'PicTransfer')}
+        />
       )}
 
       {isLoading ? (
         <Loading />
+      ) : isError && !transfers ? (
+        <Card>
+          <ErrorState
+            size="inline"
+            title={t('transfers.loadFailed', 'Could not load the transfers')}
+            onRetry={() => refetch()}
+            retrying={isRefetching}
+          />
+        </Card>
       ) : visible.length === 0 ? (
         <Card>
-          <CardContent className="py-12 text-center text-muted">
-            <Send className="mx-auto mb-3 h-10 w-10 text-muted" />
-            <p>
-              {counts.all === 0
-                ? (canEdit
-                  ? t('transfers.empty', 'Nothing here yet. Send files to a client, or ask them to send you some.')
-                  : t('transfers.emptyReadOnly', 'Nothing here yet.'))
-                : t('transfers.emptyTab', 'Nothing in this tab yet.')}
-            </p>
-          </CardContent>
+          <EmptyState
+            size="inline"
+            icon={<Send />}
+            title={counts.all === 0
+              ? (canEdit
+                ? t('transfers.empty', 'Nothing here yet. Send files to a client, or ask them to send you some.')
+                : t('transfers.emptyReadOnly', 'Nothing here yet.'))
+              : t('transfers.emptyTab', 'Nothing in this tab yet.')}
+          />
         </Card>
       ) : (
-        <Card>
-          <div className="overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead>
-                <tr className="border-b border-line text-left text-muted">
-                  <th className="px-4 py-3 font-medium">{t('transfers.col.title', 'Title')}</th>
-                  <th className="px-4 py-3 font-medium">{t('transfers.col.kind', 'Type')}</th>
-                  <th className="px-4 py-3 font-medium">{t('transfers.col.files', 'Files')}</th>
-                  <th className="px-4 py-3 font-medium">{t('transfers.col.status', 'Status')}</th>
-                  <th className="px-4 py-3 font-medium">{t('transfers.col.downloads', 'Downloads')}</th>
-                  <th className="px-4 py-3 font-medium">{t('transfers.col.deadline', 'Deadline')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visible.map((tr) => {
-                  const isRequest = tr.kind === 'request';
-                  return (
-                    <tr
-                      key={tr.id}
-                      className="cursor-pointer border-b border-line-faint hover:bg-neutral-50 dark:hover:bg-neutral-800/50"
-                      onClick={() => setDetailId(tr.id)}
-                    >
-                      <td className="px-4 py-3 font-medium text-heading">
-                        {tr.title || t('transfers.untitled', 'Untitled transfer')}
-                      </td>
-                      <td className="px-4 py-3">
-                        <span className="inline-flex items-center gap-1.5 text-xs text-soft">
-                          {isRequest
-                            ? <><Inbox className="h-3.5 w-3.5" /> {t('transfers.kind.request', 'Request')}</>
-                            : <><Send className="h-3.5 w-3.5" /> {t('transfers.kind.send', 'Send')}</>}
-                        </span>
-                      </td>
-                      {/* A send counts what goes out; a request counts what came in. */}
-                      <td className="px-4 py-3">{isRequest ? tr.upload_count : tr.file_count}</td>
-                      <td className="px-4 py-3">
-                        <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_STYLES[tr.status] || ''}`}>
-                          {t(`transfers.status.${tr.status}`, tr.status)}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3">
-                        {isRequest
-                          ? <span className="text-muted">—</span>
-                          : `${tr.download_count}${tr.max_downloads ? ` / ${tr.max_downloads}` : ''}`}
-                      </td>
-                      <td className="px-4 py-3 text-muted">{fmtDate(tr.expires_at)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </Card>
+        <Table>
+          <TableHead>
+            <tr>
+              <TableHeaderCell>{t('transfers.col.title', 'Title')}</TableHeaderCell>
+              <TableHeaderCell>{t('transfers.col.kind', 'Type')}</TableHeaderCell>
+              <TableHeaderCell>{t('transfers.col.files', 'Files')}</TableHeaderCell>
+              <TableHeaderCell>{t('transfers.col.status', 'Status')}</TableHeaderCell>
+              <TableHeaderCell>{t('transfers.col.downloads', 'Downloads')}</TableHeaderCell>
+              <TableHeaderCell>{t('transfers.col.deadline', 'Deadline')}</TableHeaderCell>
+            </tr>
+          </TableHead>
+          <TableBody>
+            {visible.map((tr) => {
+              const isRequest = tr.kind === 'request';
+              return (
+                <TableRow
+                  key={tr.id}
+                  interactive
+                  onClick={() => setDetailId(tr.id)}
+                >
+                  <TableCell className="font-medium text-heading">
+                    {tr.title || t('transfers.untitled', 'Untitled transfer')}
+                  </TableCell>
+                  <TableCell>
+                    <span className="inline-flex items-center gap-1.5 text-xs text-soft">
+                      {isRequest
+                        ? <><Inbox className="h-3.5 w-3.5" /> {t('transfers.kind.request', 'Request')}</>
+                        : <><Send className="h-3.5 w-3.5" /> {t('transfers.kind.send', 'Send')}</>}
+                    </span>
+                  </TableCell>
+                  {/* A send counts what goes out; a request counts what came in. */}
+                  <TableCell>{isRequest ? tr.upload_count : tr.file_count}</TableCell>
+                  <TableCell>
+                    <Badge tone={STATUS_TONES[tr.status] || 'neutral'}>
+                      {t(`transfers.status.${tr.status}`, tr.status)}
+                    </Badge>
+                  </TableCell>
+                  <TableCell>
+                    {isRequest
+                      ? <span className="text-muted">—</span>
+                      : `${tr.download_count}${tr.max_downloads ? ` / ${tr.max_downloads}` : ''}`}
+                  </TableCell>
+                  <TableCell className="text-muted">{fmtDate(tr.expires_at)}</TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
       )}
 
       {createKind && (
@@ -290,6 +290,13 @@ const CreateTransferModal: React.FC<{
   const [message, setMessage] = useState('');
   const [expiresInDays, setExpiresInDays] = useState('14');
   const [maxDownloads, setMaxDownloads] = useState('');
+  // Empty = follow the global default (issue 1914).
+  const [maxFilesPerUpload, setMaxFilesPerUpload] = useState('');
+  const { data: uploadDefaults } = useQuery({
+    queryKey: ['admin-transfer-upload-defaults'],
+    queryFn: () => transfersService.uploadDefaults(),
+    enabled: isRequest,
+  });
   const [picked, setPicked] = useState<PickedPhoto[]>([]);
   const [showPicker, setShowPicker] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
@@ -311,6 +318,7 @@ const CreateTransferModal: React.FC<{
       message: message.trim() || null,
       expiresInDays: parseInt(expiresInDays, 10) || 14,
       maxDownloads: !isRequest && maxDownloads ? parseInt(maxDownloads, 10) : null,
+      maxFilesPerUpload: isRequest ? ownLimit : null,
       photoIds: isRequest ? [] : picked.map((p) => p.id),
       files: isRequest ? [] : files,
       deliveryMethod,
@@ -348,23 +356,49 @@ const CreateTransferModal: React.FC<{
 
   // A send needs something to send. A request needs somewhere to send the ask,
   // unless the operator is going to hand the link over themselves.
+  // Empty follows the default; anything else has to be the whole number on
+  // screen, in range, or the request would get a limit nobody typed.
+  const ownLimit = parseWholeNumber(maxFilesPerUpload);
+  const ownLimitInvalid = isRequest && maxFilesPerUpload.trim() !== ''
+    && (ownLimit === null || ownLimit < 1 || ownLimit > (uploadDefaults?.max_files_ceiling ?? MAX_FILES_CEILING));
   const canSubmit = isRequest
-    ? !(deliveryMethod === 'email' && parsedEmails.length === 0)
+    ? !ownLimitInvalid && !(deliveryMethod === 'email' && parsedEmails.length === 0)
     : (picked.length > 0 || files.length > 0) && !(deliveryMethod === 'email' && parsedEmails.length === 0);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg bg-shell shadow-xl">
-        <div className="flex items-center justify-between border-b border-line px-5 py-3">
-          <h2 className="flex items-center gap-2 text-lg font-semibold text-heading">
+    <Modal
+      open
+      // The photo picker opens on top; Escape there must not drop this form.
+      onClose={() => { if (!showPicker) onClose(); }}
+      closeOnBackdrop={false}
+      size="lg"
+      title={(
+        <span className="flex items-center gap-2">
+          {isRequest
+            ? <><Inbox className="h-5 w-5" /> {t('transfers.newRequest', 'Request files')}</>
+            : <><Send className="h-5 w-5" /> {t('transfers.newSend', 'Send files')}</>}
+        </span>
+      )}
+      footer={(
+        <>
+          <Button variant="outline" onClick={onClose}>{t('common.cancel', 'Cancel')}</Button>
+          <Button
+            onClick={() => createMutation.mutate()}
+            isLoading={createMutation.isPending}
+            disabled={!canSubmit}
+          >
             {isRequest
-              ? <><Inbox className="h-5 w-5" /> {t('transfers.newRequest', 'Request files')}</>
-              : <><Send className="h-5 w-5" /> {t('transfers.newSend', 'Send files')}</>}
-          </h2>
-          <button onClick={onClose} className="rounded p-1 text-muted hover:bg-hover-soft"><X className="h-5 w-5" /></button>
-        </div>
-
-        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
+              ? (deliveryMethod === 'email'
+                ? t('transfers.createRequestAndSend', 'Create & ask')
+                : t('transfers.createRequest', 'Create request'))
+              : (deliveryMethod === 'email'
+                ? t('transfers.createAndSend', 'Create & send')
+                : t('transfers.create', 'Create transfer'))}
+          </Button>
+        </>
+      )}
+    >
+        <div className="space-y-4">
           <Input
             label={t('transfers.field.title', 'Title')}
             value={title}
@@ -383,7 +417,7 @@ const CreateTransferModal: React.FC<{
               value={message}
               onChange={(e) => setMessage(e.target.value)}
               rows={2}
-              className="w-full rounded-md border border-line-strong px-3 py-2 text-sm dark:bg-neutral-800"
+              className="w-full rounded-md border border-line-strong bg-panel text-heading px-3 py-2 text-sm"
               placeholder={isRequest
                 ? t('transfers.field.requestMessagePlaceholder', 'Shown to the client on the upload page')
                 : t('transfers.field.messagePlaceholder', 'Shown to the recipient on the download page')}
@@ -391,7 +425,7 @@ const CreateTransferModal: React.FC<{
           </div>
 
           {/* A request has one deadline and no download cap. */}
-          <div className={isRequest ? '' : 'grid grid-cols-2 gap-4'}>
+          <div className="grid grid-cols-2 gap-4">
             <Input
               type="number"
               min={1}
@@ -409,6 +443,22 @@ const CreateTransferModal: React.FC<{
                 value={maxDownloads}
                 onChange={(e) => setMaxDownloads(e.target.value)}
                 placeholder="0"
+              />
+            )}
+            {isRequest && (
+              <Input
+                type="number"
+                min={1}
+                max={uploadDefaults?.max_files_ceiling}
+                label={t('transfers.field.maxFilesPerUpload', 'Max files per upload')}
+                value={maxFilesPerUpload}
+                onChange={(e) => setMaxFilesPerUpload(e.target.value)}
+                placeholder={uploadDefaults
+                  ? t('transfers.field.maxFilesDefault', 'Default ({{count}})', { count: uploadDefaults.max_files_per_upload })
+                  : ''}
+                error={ownLimitInvalid
+                  ? t('transfers.field.maxFilesInvalid', 'A whole number from 1 to {{max}}', { max: uploadDefaults?.max_files_ceiling ?? MAX_FILES_CEILING })
+                  : undefined}
               />
             )}
           </div>
@@ -435,8 +485,10 @@ const CreateTransferModal: React.FC<{
                           <AdminAuthenticatedImage src={p.thumbnail_url} alt={p.filename} className="h-full w-full object-cover" />
                         ) : <div className="h-full w-full bg-subtle" />}
                         <button
+                          type="button"
                           onClick={() => setPicked((prev) => prev.filter((x) => x.id !== p.id))}
                           className="absolute right-0.5 top-0.5 rounded-full bg-black/60 p-0.5 text-white"
+                          aria-label={t('common.remove', 'Remove')}
                         ><X className="h-3 w-3" /></button>
                       </div>
                     ))}
@@ -479,6 +531,7 @@ const CreateTransferModal: React.FC<{
                           type="button"
                           onClick={() => setFiles((prev) => prev.filter((_, i) => i !== idx))}
                           className="rounded p-1 text-muted hover:bg-hover hover:text-soft"
+                          aria-label={t('common.remove', 'Remove')}
                         ><X className="h-3.5 w-3.5" /></button>
                       </li>
                     ))}
@@ -522,7 +575,7 @@ const CreateTransferModal: React.FC<{
                   value={emails}
                   onChange={(e) => setEmails(e.target.value)}
                   rows={2}
-                  className="w-full rounded-md border border-line-strong px-3 py-2 text-sm dark:bg-neutral-800"
+                  className="w-full rounded-md border border-line-strong bg-panel text-heading px-3 py-2 text-sm"
                   placeholder={t('transfers.field.recipientsPlaceholder', 'anna@example.com, ben@example.com')}
                 />
                 <p className="mt-1 text-xs text-muted">
@@ -535,24 +588,6 @@ const CreateTransferModal: React.FC<{
           </div>
         </div>
 
-        <div className="flex justify-end gap-2 border-t border-line px-5 py-3">
-          <Button variant="outline" onClick={onClose}>{t('common.cancel', 'Cancel')}</Button>
-          <Button
-            onClick={() => createMutation.mutate()}
-            isLoading={createMutation.isPending}
-            disabled={!canSubmit}
-          >
-            {isRequest
-              ? (deliveryMethod === 'email'
-                ? t('transfers.createRequestAndSend', 'Create & ask')
-                : t('transfers.createRequest', 'Create request'))
-              : (deliveryMethod === 'email'
-                ? t('transfers.createAndSend', 'Create & send')
-                : t('transfers.create', 'Create transfer'))}
-          </Button>
-        </div>
-      </div>
-
       {showPicker && (
         <TransferPhotoPicker
           onClose={() => setShowPicker(false)}
@@ -560,7 +595,7 @@ const CreateTransferModal: React.FC<{
           excludePhotoIds={picked.map((p) => p.id)}
         />
       )}
-    </div>
+    </Modal>
   );
 };
 
@@ -579,6 +614,63 @@ interface DetailProps {
   canView: boolean;
 }
 
+/**
+ * A file request's files-per-upload limit: the number in force, whether it is
+ * this request's own or the global default, and the two ways to change it.
+ */
+const UploadLimitEditor: React.FC<{ transfer: Transfer; canEdit: boolean; onSaved: () => void }> = ({ transfer, canEdit, onSaved }) => {
+  const { t } = useTranslation();
+  const own = transfer.max_files_per_upload ?? null;
+  const [value, setValue] = useState(own ? String(own) : '');
+  const parsed = parseWholeNumber(value);
+  const usable = parsed !== null && parsed >= 1 && parsed <= MAX_FILES_CEILING;
+  const saveMutation = useMutationWithToast({
+    mutationFn: (limit: number | null) => transfersService.update(transfer.id, { maxFilesPerUpload: limit }),
+    successMessage: t('transfers.uploadLimitSaved', 'Upload limit saved'),
+    onSuccess: (saved) => { setValue(saved.max_files_per_upload ? String(saved.max_files_per_upload) : ''); onSaved(); },
+  });
+
+  return (
+    <div className="rounded-lg border border-line p-4">
+      <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold text-body">
+        <Files className="h-4 w-4" /> {t('transfers.uploadLimit', 'Files per upload')}
+      </h3>
+      <p className="text-sm text-muted">
+        {own
+          ? t('transfers.uploadLimitOwn', 'The client can select up to {{count}} files at once. This request has its own limit.', { count: transfer.effective_max_files_per_upload ?? own })
+          : t('transfers.uploadLimitDefault', 'The client can select up to {{count}} files at once (the default from Settings).', { count: transfer.effective_max_files_per_upload ?? 0 })}
+      </p>
+      {canEdit && (
+        <div className="mt-3 flex flex-wrap items-end gap-2">
+          <div className="w-40">
+            <Input
+              type="number"
+              min={1}
+              label={t('transfers.field.maxFilesPerUpload', 'Max files per upload')}
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+            />
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!usable || parsed === own}
+            isLoading={saveMutation.isPending}
+            onClick={() => saveMutation.mutate(parsed)}
+          >
+            {t('common.save', 'Save')}
+          </Button>
+          {own && (
+            <Button size="sm" variant="outline" disabled={saveMutation.isPending} onClick={() => saveMutation.mutate(null)}>
+              {t('transfers.uploadLimitUseDefault', 'Use the default')}
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCopy, confirm, canEdit, canView }) => {
   const { t } = useTranslation();
   const { formatDateTime } = useLocalizedDate();
@@ -591,6 +683,9 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
     enabled: canView,
   });
   const isRequest = transfer?.kind === 'request';
+  const recipients = transfer?.recipients || [];
+  const heldRecipients = isRequest ? [] : recipients.filter((r) => r.held);
+  const sentRecipients = recipients.filter((r) => !heldRecipients.includes(r));
   // The ZIP route is photos.download, NOT events.edit — a different permission
   // from everything else in this modal. It is a plain <a href>, so an admin
   // without it would navigate to raw 403 JSON rather than see an error toast.
@@ -629,7 +724,9 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
   });
   const resendMutation = useMutationWithToast({
     mutationFn: () => transfersService.resendEmail(transferId),
-    successMessage: t('transfers.emailResent', 'Email sent again'),
+    successMessage: (result) => (result.held
+      ? t('transfers.emailHeld', 'Email held until a photo is ready')
+      : t('transfers.emailResent', 'Email sent again')),
     onSuccess: () => refetch(),
   });
   const deleteMutation = useMutationWithToast({
@@ -657,8 +754,11 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
         : t('transfers.deleteConfirmTitle', 'Delete transfer?'),
       message: isRequest
         ? t('transfers.deleteRequestConfirmBody', 'This removes the upload link and permanently deletes every file the client sent.')
-        : t('transfers.deleteConfirmBody', 'This removes the link. Source event photos are not affected.'),
+        : t('transfers.deleteConfirmBody', 'This removes the link. The photos in their galleries are not affected.'),
       variant: 'danger',
+      confirmLabel: isRequest
+        ? t('transfers.deleteRequestAction', 'Delete request')
+        : t('transfers.deleteAction', 'Delete transfer'),
     });
     if (ok) deleteMutation.mutate();
   };
@@ -668,22 +768,23 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
     : '';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg bg-shell shadow-xl">
-        <div className="flex items-center justify-between border-b border-line px-5 py-3">
-          <h2 className="flex min-w-0 items-center gap-2 text-lg font-semibold text-heading">
-            {transfer && (isRequest ? <Inbox className="h-5 w-5 shrink-0" /> : <Send className="h-5 w-5 shrink-0" />)}
-            <span className="truncate">{transfer?.title || t('transfers.untitled', 'Untitled transfer')}</span>
-          </h2>
-          <button onClick={onClose} className="rounded p-1 text-muted hover:bg-hover-soft"><X className="h-5 w-5" /></button>
-        </div>
-
+    <Modal
+      open
+      onClose={() => { if (!showPicker) onClose(); }}
+      size="xl"
+      title={(
+        <span className="flex min-w-0 items-center gap-2">
+          {transfer && (isRequest ? <Inbox className="h-5 w-5 shrink-0" /> : <Send className="h-5 w-5 shrink-0" />)}
+          <span className="truncate">{transfer?.title || t('transfers.untitled', 'Untitled transfer')}</span>
+        </span>
+      )}
+    >
         {isLoading || !transfer ? (
           <div className="p-8"><Loading /></div>
         ) : (
-          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-5">
+          <div className="space-y-5">
             {/* The one link that matters for this kind, up top. */}
-            <div className="rounded-lg border border-line bg-neutral-50 p-4 dark:bg-neutral-800/50">
+            <div className="rounded-lg border border-line bg-subtle p-4">
               <div className="flex flex-wrap items-center gap-2">
                 <Input readOnly value={primaryLink} className="flex-1 min-w-[220px]" />
                 <Button variant="outline" leftIcon={<Copy className="h-4 w-4" />} onClick={() => onCopy(primaryLink)}>
@@ -706,7 +807,7 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
                 ) : (
                   <span>{t('transfers.col.downloads', 'Downloads')}: {transfer.download_count}{transfer.max_downloads ? ` / ${transfer.max_downloads}` : ''}</span>
                 )}
-                <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_STYLES[transfer.status] || ''}`}>{t(`transfers.status.${transfer.status}`, transfer.status)}</span>
+                <Badge tone={STATUS_TONES[transfer.status] || 'neutral'}>{t(`transfers.status.${transfer.status}`, transfer.status)}</Badge>
               </div>
               {canEdit && (
               <div className="mt-3 flex flex-wrap gap-2">
@@ -724,7 +825,7 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
                     {t('transfers.resend', 'Send again')}
                   </Button>
                 )}
-                <Button size="sm" variant="ghost" className="text-red-600" leftIcon={<Trash2 className="h-4 w-4" />} onClick={handleDelete}>
+                <Button size="sm" variant="danger" leftIcon={<Trash2 className="h-4 w-4" />} onClick={handleDelete}>
                   {t('common.delete', 'Delete')}
                 </Button>
               </div>
@@ -795,13 +896,13 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
                           </span>
                           <span className="flex shrink-0 items-center gap-3 text-muted">
                             <span>{formatBytes(f.size_bytes)}</span>
-                            <a href={transfersService.adminExtraFileDownloadUrl(transferId, f.id)} className="text-primary-600 hover:underline">
+                            <a href={transfersService.adminExtraFileDownloadUrl(transferId, f.id)} className="text-accent hover:underline">
                               <Download className="h-4 w-4" />
                             </a>
                             {canEdit && (
                               <button
                                 onClick={() => removeExtraFileMutation.mutate(f.id)}
-                                className="rounded p-1 text-muted hover:bg-hover hover:text-red-600"
+                                className="rounded p-1 text-muted hover:bg-hover hover:text-danger-text"
                                 title={t('common.remove', 'Remove')}
                               ><X className="h-3.5 w-3.5" /></button>
                             )}
@@ -830,7 +931,7 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
                         <Button size="sm" variant="outline" leftIcon={<RefreshCw className="h-4 w-4" />} onClick={() => issueCodeMutation.mutate(true)} isLoading={issueCodeMutation.isPending}>
                           {t('transfers.rotateCode', 'New code')}
                         </Button>
-                        <Button size="sm" variant="ghost" className="text-red-600" onClick={() => revokeCodeMutation.mutate()}>
+                        <Button size="sm" variant="ghost" className="text-danger-text" onClick={() => revokeCodeMutation.mutate()}>
                           {t('transfers.revokeCode', 'Withdraw')}
                         </Button>
                       </div>
@@ -855,11 +956,24 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
                   )}
                 </div>
 
+                {/* How many files one upload round may carry (issue 1914). */}
+                <UploadLimitEditor transfer={transfer} canEdit={canEdit} onSaved={() => refetch()} />
+
                 {/* What the client sent. */}
                 <div className="rounded-lg border border-line p-4">
-                  <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-body">
-                    <Inbox className="h-4 w-4" /> {t('transfers.filesReceived', 'Files received')} · {transfer.upload_count}
-                  </h3>
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="flex items-center gap-2 text-sm font-semibold text-body">
+                      <Inbox className="h-4 w-4" /> {t('transfers.filesReceived', 'Files received')} · {transfer.upload_count}
+                    </h3>
+                    {/* The ZIP route is photos.download, like the outgoing bundle. */}
+                    {canDownload && transfer.uploads && transfer.uploads.length > 0 && (
+                      <a href={transfersService.adminUploadsDownloadUrl(transferId)}>
+                        <Button size="sm" variant="outline" leftIcon={<Download className="h-4 w-4" />}>
+                          {t('transfers.downloadAll', 'Download all')}
+                        </Button>
+                      </a>
+                    )}
+                  </div>
                   {transfer.uploads && transfer.uploads.length > 0 ? (
                     <>
                       <ul className="divide-y divide-line-faint">
@@ -872,7 +986,7 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
                             <span className="flex shrink-0 items-center gap-3 text-muted">
                               <span>{fmtDate(u.uploaded_at)}</span>
                               <span>{formatBytes(u.size_bytes)}</span>
-                              <a href={transfersService.adminUploadDownloadUrl(transferId, u.id)} className="text-primary-600 hover:underline">
+                              <a href={transfersService.adminUploadDownloadUrl(transferId, u.id)} className="text-accent hover:underline">
                                 <Download className="h-4 w-4" />
                               </a>
                             </span>
@@ -893,14 +1007,15 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
               </>
             )}
 
-            {/* Email recipients (both kinds) */}
-            {transfer.recipients && transfer.recipients.length > 0 && (
+            {/* Email recipients (both kinds). A send's ready email can be
+                held while nothing is downloadable yet (issue 2061). */}
+            {sentRecipients.length > 0 && (
               <div className="rounded-lg border border-line p-4">
                 <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-body">
                   <Mail className="h-4 w-4" /> {isRequest ? t('transfers.askedOf', 'Asked of') : t('transfers.sentTo', 'Emailed to')}
                 </h3>
                 <div className="flex flex-wrap gap-2">
-                  {transfer.recipients.map((r) => (
+                  {sentRecipients.map((r) => (
                     <span key={r.id} className="rounded-full bg-subtle px-2.5 py-1 text-xs text-body">
                       {r.email}
                     </span>
@@ -908,9 +1023,26 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
                 </div>
               </div>
             )}
+            {heldRecipients.length > 0 && (
+              <div className="rounded-lg border border-line p-4" data-testid="transfer-held-recipients">
+                <h3 className="mb-2 flex flex-wrap items-center gap-2 text-sm font-semibold text-body">
+                  <Clock className="h-4 w-4" /> {t('transfers.heldHeading', 'Email waits until a photo is ready')}
+                  <Badge tone="warning" appearance="outline" dot>{t('transfers.heldBadge', 'Not sent yet')}</Badge>
+                </h3>
+                <div className="flex flex-wrap gap-2">
+                  {heldRecipients.map((r) => (
+                    <span key={r.id} className="rounded-full bg-subtle px-2.5 py-1 text-xs text-body">
+                      {r.email}
+                    </span>
+                  ))}
+                </div>
+                <p className="mt-2 text-xs text-muted">
+                  {t('transfers.heldHint', 'No photo in this transfer has finished processing yet. The email goes out on its own once one is ready.')}
+                </p>
+              </div>
+            )}
           </div>
         )}
-      </div>
 
       {showPicker && transfer && (
         <TransferPhotoPicker
@@ -920,7 +1052,7 @@ const TransferDetailModal: React.FC<DetailProps> = ({ transferId, onClose, onCop
           isSaving={addFilesMutation.isPending}
         />
       )}
-    </div>
+    </Modal>
   );
 };
 

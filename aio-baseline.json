@@ -1,9 +1,18 @@
 {
   "sourceRepository": "https://github.com/PicPeak/picpeak.git",
-  "sourceCommit": "76492c11836fdf0e79e8cecfbc18e004e0cde9cc",
-  "image": "ghcr.io/picpeak/picpeak/aio@sha256:dde09c55e29bc40065f33d94a18f2cc90a604e5c02c4b62bd1dcd1a504226588",
+  "sourceCommit": "ec7b22354fd6b5a66aec9e2a965e22fbcf7334f2",
+  "image": "ghcr.io/picpeak/picpeak/aio@sha256:efd3fa3473e6ac6f518fdead86c43deaa3eca5ce28abec22928e8e2f6cdca4bc",
   "platformManifestDigests": {
-    "arm64": "sha256:107029dda07617cbdbc0689730a02757a60867f72743810e6ca7c9dc6a755d44",
-    "amd64": "sha256:2fb083e4d19d63268e73bb46332376e6b9533371cdd66e2ae91bf7869202125f"
+    "arm64": "sha256:e64930557a690f7690192504107554f0d4d808e36fa3fe28eb3c370fbc2a00b5",
+    "amd64": "sha256:2eb2659ccbdf8540d2fed2b85888f28063505bba07fa36f7395b14b8a347441f"
+  },
+  "previousBaseline": {
+    "sourceRepository": "https://github.com/PicPeak/picpeak.git",
+    "sourceCommit": "76492c11836fdf0e79e8cecfbc18e004e0cde9cc",
+    "image": "ghcr.io/picpeak/picpeak/aio@sha256:dde09c55e29bc40065f33d94a18f2cc90a604e5c02c4b62bd1dcd1a504226588",
+    "platformManifestDigests": {
+      "arm64": "sha256:107029dda07617cbdbc0689730a02757a60867f72743810e6ca7c9dc6a755d44",
+      "amd64": "sha256:2fb083e4d19d63268e73bb46332376e6b9533371cdd66e2ae91bf7869202125f"
+    }
   }
 }

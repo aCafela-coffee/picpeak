@@ -17,13 +17,20 @@
 
 const path = require('path');
 const mime = require('mime-types');
-const sharp = require('sharp');
+const sharp = require('./isolatedSharp');
+const { retryTransient } = require('./imageResourcePolicy');
 const { resolveCredit } = require('./photoCredit');
+const { exifColumn } = require('./photoExif');
 const { db } = require('../database/db');
 const { formatBoolean } = require('../utils/dbCompat');
 const { getStorage } = require('./storage');
-const { withLocalCopy } = require('./imageProcessor');
+const { withLocalCopy, extractCaptureDate, withProcessableImage } = require('./imageProcessor');
+const { isRawFilename } = require('../utils/rawFormats');
+const { normalizeUploadMimeType } = require('../utils/fileSecurityUtils');
+const { getAllowedExtensions } = require('./uploadSettings');
 const logger = require('../utils/logger');
+const { promotionSettled } = require('./watchFolderClaims');
+const { unfinishedKeys } = require('./publicUploadQuota');
 
 const POLL_INTERVAL_MS = parseInt(process.env.STORAGE_AUTO_IMPORT_INTERVAL_MS || `${5 * 60 * 1000}`, 10);
 const ENABLED = process.env.STORAGE_AUTO_IMPORT === 'true';
@@ -78,6 +85,11 @@ async function processEvent(event, storage) {
       k.startsWith(eventsActivePrefix) ? k.slice(eventsActivePrefix.length) : k
     );
 
+    // Objects an upload stored but has not written a row for yet, or never
+    // will (issue 1970): read BEFORE the photos, because commitObject writes
+    // the row and settles the record in one transaction.
+    const unfinished = await unfinishedKeys(stableKeyList);
+
     const existing = await db('photos')
       .where({ event_id: event.id })
       .whereIn('path', relativePaths)
@@ -89,6 +101,7 @@ async function processEvent(event, storage) {
         ? entry.key.slice(eventsActivePrefix.length)
         : entry.key;
       if (existingPaths.has(relativePath)) continue;
+      if (unfinished.has(entry.key) || promotionSettled(entry.key)) continue;
 
       // Skip generated artifacts (thumbnails get their own keys; we don't
       // want to re-register them as photos).
@@ -96,9 +109,21 @@ async function processEvent(event, storage) {
       if (filename.startsWith('thumb_') || filename.startsWith('hero_')) continue;
       if (filename.startsWith('.')) continue; // dotfiles like .download-cache
 
-      const mimeType = mime.lookup(filename) || 'application/octet-stream';
-      const isImage = mimeType.startsWith('image/');
-      const isVideo = mimeType.startsWith('video/');
+      // A camera RAW is typed from its extension, as the file watcher does:
+      // mime-db knows few RAW types (only .dng as an image, .dcr as a
+      // Director file), so the lookup alone skipped nearly all of them. RAW
+      // is opt-in, the same switch the upload gate reads; a skip is only
+      // logged at debug level because every poll would repeat it.
+      const isRaw = isRawFilename(filename);
+      if (isRaw && !(await getAllowedExtensions()).has(path.extname(filename).slice(1).toLowerCase())) {
+        logger.debug(`[s3AutoImporter] skipping ${entry.key}: not in general_allowed_file_types`);
+        continue;
+      }
+      const mimeType = isRaw
+        ? (normalizeUploadMimeType(filename, '') || 'application/octet-stream')
+        : (mime.lookup(filename) || 'application/octet-stream');
+      const isImage = isRaw || mimeType.startsWith('image/');
+      const isVideo = !isRaw && mimeType.startsWith('video/');
       if (!isImage && !isVideo) continue;
 
       // Capture image dimensions so aspect-aware layouts (masonry /
@@ -107,21 +132,32 @@ async function processEvent(event, storage) {
       // a tmp local copy via withLocalCopy — withLocalCopy handles the
       // S3 download + cleanup. Skip videos (would need ffprobe).
       //
-      // The EXIF credit (#1561) is read from the same local copy, so the
-      // object is only fetched once.
+      // The EXIF credit (#1561) and the camera details (issue 1733, D1) are
+      // read from the same local copy, so the object is only fetched once.
       let dimensions = null;
       let credit = {};
+      let exif = {};
+      let capturedAt = null;
       if (isImage) {
         try {
           dimensions = await withLocalCopy(entry.key, async (localPath) => {
             credit = await resolveCredit({ localPath });
-            const metadata = await sharp(localPath).metadata();
-            // Oriented, not raw — see imageProcessor.orientedDimensions (#1185).
-            const dims = require('./imageProcessor').orientedDimensions(metadata);
-            if (dims.width && dims.height) {
-              return { width: dims.width, height: dims.height };
+            exif = await exifColumn(localPath);
+            // The row is inserted complete, so the worker never reads it.
+            capturedAt = await extractCaptureDate(localPath);
+            // sharp cannot decode a RAW, so measure its embedded preview.
+            const proc = await withProcessableImage(localPath, filename);
+            try {
+              const metadata = await retryTransient(() => sharp(proc.path).metadata());
+              // Oriented, not raw — see imageProcessor.orientedDimensions (#1185).
+              const dims = require('./imageProcessor').orientedDimensions(metadata);
+              if (dims.width && dims.height) {
+                return { width: dims.width, height: dims.height };
+              }
+              return null;
+            } finally {
+              await proc.cleanup();
             }
-            return null;
           });
         } catch (err) {
           logger.debug(`[s3AutoImporter] could not read dimensions for ${entry.key}: ${err.message}`);
@@ -140,12 +176,24 @@ async function processEvent(event, storage) {
           mime_type: mimeType,
           source_origin: 'managed',
           uploaded_at: new Date().toISOString(),
+          captured_at: capturedAt ? capturedAt.toISOString() : null,
           ...(dimensions && { width: dimensions.width, height: dimensions.height }),
           ...credit,
+          ...exif,
         }).returning('id');
         const photoId = insertResult[0]?.id || insertResult[0];
 
         logger.info(`[s3AutoImporter] imported s3://.../${entry.key} → photo #${photoId} for event ${event.slug}`);
+
+        // Scene tagging (issue 1733): same as fileWatcher, a finished row
+        // that never passes photoProcessor's enqueue.
+        if (isImage) {
+          try {
+            await require('./tagSettings').enqueueFinishedPhotos(event.id, [photoId]);
+          } catch (err) {
+            logger.warn(`[s3AutoImporter] could not queue photo #${photoId} for tagging: ${err.message}`);
+          }
+        }
 
         // Webhook (#327): same shape as fileWatcher.
         try {

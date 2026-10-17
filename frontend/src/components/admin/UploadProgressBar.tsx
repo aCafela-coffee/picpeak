@@ -2,15 +2,17 @@ import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { clsx } from 'clsx';
-import { AlertTriangle, CheckCircle2, Cog, Upload, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Cog, Copy, Upload, X } from 'lucide-react';
 import { useUploadSession } from '../../contexts/UploadSessionContext';
 
 // Sits under the admin header for the life of an upload session: transfer
 // progress, then processing progress, then the outcome. Failures list every
 // file with its reason and stay until dismissed; a clean finish clears itself.
+// Files the gallery already holds are listed apart from the failures, with
+// "upload anyway" (issue 1733, C2).
 export const UploadProgressBar: React.FC = () => {
   const { t } = useTranslation();
-  const { session, dismiss } = useUploadSession();
+  const { session, dismiss, uploadDuplicates } = useUploadSession();
   const { pathname } = useLocation();
 
   if (!session) return null;
@@ -19,6 +21,8 @@ export const UploadProgressBar: React.FC = () => {
   const onEventPage = pathname === eventPath || pathname.startsWith(`${eventPath}/`);
   const { phase } = session;
   const hasFailures = session.failures.length > 0;
+  const hasDuplicates = session.duplicates.length > 0;
+  const anywayClass = 'text-accent-dark hover:underline whitespace-nowrap disabled:opacity-50 disabled:no-underline disabled:cursor-not-allowed';
 
   const processingPct =
     session.processing.total === 0
@@ -33,20 +37,24 @@ export const UploadProgressBar: React.FC = () => {
       className={clsx(
         'sticky top-16 z-20 border-b px-4 sm:px-6 lg:px-8 py-2.5 text-sm',
         phase.kind === 'done' && hasFailures
-          ? 'bg-amber-50 dark:bg-amber-900/20 border-amber-200 dark:border-amber-800/60'
+          ? 'bg-warning-soft border-warning-line'
           : 'bg-shell border-line'
       )}
     >
       <div className="flex items-center gap-3">
         {phase.kind === 'transferring' && <Upload className="w-4 h-4 text-accent-dark flex-shrink-0" />}
-        {phase.kind === 'processing' && <Cog className="w-4 h-4 text-amber-600 dark:text-amber-400 animate-spin flex-shrink-0" />}
-        {phase.kind === 'done' && !hasFailures && <CheckCircle2 className="w-4 h-4 text-green-600 dark:text-green-400 flex-shrink-0" />}
-        {phase.kind === 'done' && hasFailures && <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-300 flex-shrink-0" />}
+        {phase.kind === 'processing' && <Cog className="w-4 h-4 text-warning-text animate-spin flex-shrink-0" />}
+        {phase.kind === 'done' && !hasFailures && !hasDuplicates && <CheckCircle2 className="w-4 h-4 text-success-text flex-shrink-0" />}
+        {phase.kind === 'done' && !hasFailures && hasDuplicates && <Copy className="w-4 h-4 text-muted flex-shrink-0" />}
+        {phase.kind === 'done' && hasFailures && <AlertTriangle className="w-4 h-4 text-warning-text flex-shrink-0" />}
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-3">
             <p className="truncate font-medium text-heading">
-              {phase.kind === 'transferring' && (
+              {phase.kind === 'transferring' && session.waitingForCapacity && (
+                <span data-testid="upload-waiting-for-capacity">{t('upload.adminCapacity.waiting', session.waitingForCapacity)}</span>
+              )}
+              {phase.kind === 'transferring' && !session.waitingForCapacity && (
                 <>
                   {t('upload.bar.uploading', { count: session.fileCount })}
                   {session.totalChunks > 1 && (
@@ -100,7 +108,7 @@ export const UploadProgressBar: React.FC = () => {
                   type="button"
                   onClick={dismiss}
                   aria-label={t('common.dismiss', 'Dismiss')}
-                  className="p-1 -m-1 rounded text-neutral-500 hover:text-body hover:bg-hover-soft"
+                  className="p-1 -m-1 rounded text-muted hover:text-body hover:bg-hover-soft"
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -113,7 +121,7 @@ export const UploadProgressBar: React.FC = () => {
               <div
                 className={clsx(
                   'h-full rounded-full transition-all duration-300',
-                  phase.kind === 'processing' ? 'bg-amber-500' : 'bg-accent-dark'
+                  phase.kind === 'processing' ? 'bg-warning' : 'bg-accent-dark'
                 )}
                 style={{ width: `${phase.kind === 'processing' ? processingPct : session.progress}%` }}
               />
@@ -133,9 +141,9 @@ export const UploadProgressBar: React.FC = () => {
               <span
                 className={clsx(
                   'flex-shrink-0 mt-0.5 px-1.5 py-0.5 rounded font-medium whitespace-nowrap',
-                  f.kind === 'rejected' && 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
-                  f.kind === 'transfer' && 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300',
-                  f.kind === 'processing' && 'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300'
+                  f.kind === 'rejected' && 'bg-danger-soft text-danger-text',
+                  f.kind === 'transfer' && 'bg-inset text-chart-8',
+                  f.kind === 'processing' && 'bg-inset text-chart-4'
                 )}
               >
                 {f.kind === 'rejected' && t('upload.failures.kindRejected', 'Rejected')}
@@ -149,6 +157,49 @@ export const UploadProgressBar: React.FC = () => {
             </li>
           ))}
         </ul>
+      )}
+
+      {/* Duplicates — not stored because the gallery already holds the same
+          bytes. Each can be uploaded anyway once the session is through. */}
+      {hasDuplicates && (
+        <div data-testid="upload-duplicate-report" className="mt-2 ml-7">
+          <div className="flex items-center justify-between gap-3 text-xs">
+            <p className="font-medium text-body">
+              {t('upload.duplicates.title', { count: session.duplicates.length })}
+            </p>
+            {session.duplicates.length > 1 && (
+              <button
+                type="button"
+                onClick={() => uploadDuplicates()}
+                disabled={phase.kind !== 'done'}
+                className={anywayClass}
+              >
+                {t('upload.duplicates.uploadAllAnyway', 'Upload all anyway')}
+              </button>
+            )}
+          </div>
+          <ul className="mt-1.5 max-h-48 overflow-y-auto space-y-1.5">
+            {session.duplicates.map((d, i) => (
+              <li key={`${d.filename}-${i}`} className="flex items-start gap-2 text-xs">
+                <span className="flex-shrink-0 mt-0.5 px-1.5 py-0.5 rounded font-medium whitespace-nowrap bg-inset text-body">
+                  {t('upload.duplicates.badge', 'Duplicate')}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="font-medium text-body break-all">{d.filename}</span>
+                  <span className="text-muted"> — {t('upload.duplicates.sameAs', 'same content as {{name}}', { name: d.duplicateOf })}</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => uploadDuplicates([i])}
+                  disabled={phase.kind !== 'done'}
+                  className={clsx(anywayClass, 'mt-0.5')}
+                >
+                  {t('upload.duplicates.uploadAnyway', 'Upload anyway')}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   );

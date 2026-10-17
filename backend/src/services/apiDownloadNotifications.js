@@ -20,6 +20,7 @@
 
 const { db, logActivity } = require('../database/db');
 const logger = require('../utils/logger');
+const applicationWork = require('./activeApplicationWork');
 
 const SUMMARY_TYPE = 'api_photos_downloaded';
 const AUDIT_TYPE = 'api_photo_downloaded';
@@ -92,14 +93,23 @@ async function bumpSummary({ tokenId, tokenName, eventId, actor }) {
 
     // Compare-and-set: the in-process chain serialises one replica, this
     // keeps a second replica's increment of the same row from being lost.
-    const updated = await db('activity_logs')
-      .where({ id: open.id })
-      .whereRaw('CAST(metadata AS TEXT) = ?', [open.text])
-      .update({
-        metadata: JSON.stringify({ ...open.metadata, count: (Number(open.metadata.count) || 0) + 1 }),
-        // Back to unread, so the bell shows the grown count.
-        read_at: null
-      });
+    // The per-admin dismissals (migration 261) go in the same transaction,
+    // for the same reason read_at is reset: an admin who cleared the bell
+    // during this hour's window must see the row again once it grows, and
+    // a Clear all landing between the two writes must not hide the grown
+    // count behind a dismissal the increment never saw.
+    const updated = await db.transaction(async (trx) => {
+      const n = await trx('activity_logs')
+        .where({ id: open.id })
+        .whereRaw('CAST(metadata AS TEXT) = ?', [open.text])
+        .update({
+          metadata: JSON.stringify({ ...open.metadata, count: (Number(open.metadata.count) || 0) + 1 }),
+          // Back to unread, so the bell shows the grown count.
+          read_at: null
+        });
+      if (n) await trx('notification_dismissals').where({ activity_log_id: open.id }).del();
+      return n;
+    });
     if (updated) return;
   }
   logger.warn('API download notification lost an increment under contention', { eventId });
@@ -108,9 +118,9 @@ async function bumpSummary({ tokenId, tokenName, eventId, actor }) {
 /** Count one single download into its token/event/hour bell entry. */
 function recordSingleDownload({ tokenId, tokenName, eventId, actor }) {
   const key = `${tokenId}:${eventId}`;
-  const next = (chains.get(key) || Promise.resolve())
+  const next = applicationWork.track('API download notification', () => (chains.get(key) || Promise.resolve())
     .then(() => bumpSummary({ tokenId, tokenName, eventId, actor }))
-    .catch((err) => logger.warn('API download notification could not be recorded', { error: err.message }));
+  ).catch((err) => logger.warn('API download notification could not be recorded', { error: err.message }));
   chains.set(key, next);
   next.then(() => {
     if (chains.get(key) === next) chains.delete(key);

@@ -5,7 +5,7 @@
  * "Run Backup Now" will include, skip, or silently miss.
  *
  * Test surface:
- *   1. Empty / fresh install → default seed (7 paths), inline mode,
+ *   1. Empty / fresh install → default seed (8 paths), inline mode,
  *      no DB dump on file yet, no drift
  *   2. Toggle `include_in_default=false` → coverage flips to
  *      'skipped-by-toggle'
@@ -86,7 +86,7 @@ describe('GET /api/admin/system-health/backup-coverage', () => {
     await db('app_settings').where('setting_type', 'backup').del().catch(() => {});
   });
 
-  it('returns the canonical 7 paths + database block on a fresh install', async () => {
+  it('returns the canonical 10 paths + database block on a fresh install', async () => {
     const res = await request(app).get('/api/admin/system-health/backup-coverage');
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('report');
@@ -100,6 +100,9 @@ describe('GET /api/admin/system-health/backup-coverage', () => {
       'heroes',
       'uploads',
       'business-docs',
+      'videos',
+      'transfers',
+      'watermarks',
     ]);
 
     // Default mode is inline — no inline_dump setting present means
@@ -108,7 +111,7 @@ describe('GET /api/admin/system-health/backup-coverage', () => {
     expect(report.database.ok).toBe(true);
 
     expect(report.summary).toMatchObject({
-      configuredCount: 7,
+      configuredCount: 10,
       tableMissingFallbackInUse: false,
     });
   });
@@ -161,6 +164,17 @@ describe('GET /api/admin/system-health/backup-coverage', () => {
 
     rmdir('plugin-store');
     rmdir('shiny-new-feature');
+  });
+
+  it('never flags the adaptive streaming ladders as drift (issue 1733)', async () => {
+    // hls/<photoId>/... is rebuilt from the originals and deliberately not
+    // backed up; the coverage card must not call that a missed directory.
+    mkdir('hls/7');
+
+    const res = await request(app).get('/api/admin/system-health/backup-coverage');
+    expect(res.body.report.drift.unconfiguredOnDisk).not.toContain('hls');
+
+    rmdir('hls');
   });
 
   it('never flags backups/ or tmp/ as drift (allow-list)', async () => {

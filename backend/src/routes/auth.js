@@ -1,6 +1,7 @@
 const { isGalleryAvailable } = require('../utils/galleryLifecycle');
 const { publicThemeFields } = require('../services/galleryTheme');
 const express = require('express');
+const { toDateOnly } = require('../utils/dateOnly');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
@@ -10,6 +11,7 @@ const { db, logActivity } = require('../database/db');
 const { formatBoolean } = require('../utils/dbCompat');
 const { verifyRecaptcha } = require('../services/recaptcha');
 const mfaService = require('../services/mfaService');
+const passkeyService = require('../services/passkeyService');
 const { 
   trackFailedAttempt,
   trackSuccessfulLogin,
@@ -147,8 +149,10 @@ router.post('/admin/login', [
       return res.status(403).json({ error: 'Local login is disabled — sign in through SSO', code: 'LOCAL_LOGIN_DISABLED' });
     }
 
-    // Check account lockout first
-    const lockoutStatus = await checkAccountLockout(username);
+    // Check account lockout first. Scoped to identifier + source IP like the
+    // gallery/client paths: anonymous failures from one address must not
+    // deny a correct login from every other address.
+    const lockoutStatus = await checkAccountLockout(username, ipAddress);
     if (lockoutStatus.isLocked) {
       logger.warn('Login attempt on locked account', { username, ipAddress });
       return res.status(423).json({ 
@@ -206,9 +210,10 @@ router.post('/admin/login', [
     // Second factor: if this admin has TOTP enabled, do NOT complete the login
     // yet. Issue a short-lived, single-purpose mfa_pending token and require the
     // code via /admin/login/mfa. We deliberately don't reset the lockout counter
-    // (trackSuccessfulLogin) or stamp last_login until the second factor passes,
-    // so MFA brute-force is still gated by the account lockout. `loginId` carries
-    // the typed identifier so the verify step tracks the same lockout bucket.
+    // (trackSuccessfulLogin) or stamp last_login until the second factor passes.
+    // MFA guessing is gated by the verify step's own account-wide bucket
+    // (`mfa:<id>`); `loginId` carries the typed identifier for the success
+    // record once the second factor passes.
     if (mfaService.isEnrolled(admin)) {
       const mfaToken = jwt.sign({
         id: admin.id,
@@ -224,7 +229,11 @@ router.post('/admin/login', [
         expiresIn: '5m',
         issuer: 'picpeak-auth'
       });
-      return res.json({ mfaRequired: true, mfaToken });
+      // Whether the second step may offer a passkey instead of a code. Only
+      // told to a caller who has just proven the password.
+      const passkeyAvailable = (await passkeyService.getRelyingParty(req)).available
+        && (await passkeyService.countForAdmin(admin.id)) > 0;
+      return res.json({ mfaRequired: true, mfaToken, passkeyAvailable });
     }
 
     return await completeAdminLogin(req, res, admin, ipAddress, userAgent, username, { rememberMe });
@@ -275,7 +284,14 @@ router.post('/admin/login/mfa', [
     }
 
     const lockoutKey = decoded.loginId || decoded.username;
-    const lockoutStatus = await checkAccountLockout(lockoutKey);
+    // The second factor has a bucket of its own, counted across every source
+    // address. Per-IP (like the password step) would hand a holder of the
+    // mfa_pending token a fresh batch of six-digit guesses for each address
+    // they rotate to; sharing the password step's bucket would let anonymous
+    // password failures lock the owner out of this step. Only someone who
+    // already passed the password can add to it.
+    const mfaLockoutKey = `mfa:${decoded.id}`;
+    const lockoutStatus = await checkAccountLockout(mfaLockoutKey);
     if (lockoutStatus.isLocked) {
       return res.status(423).json({
         error: 'Account temporarily locked due to too many failed attempts',
@@ -326,7 +342,7 @@ router.post('/admin/login/mfa', [
     }
 
     if (!ok) {
-      await trackFailedAttempt(lockoutKey, ipAddress, userAgent);
+      await trackFailedAttempt(mfaLockoutKey, ipAddress, userAgent);
       return res.status(401).json({ error: 'Invalid verification code', code: 'MFA_INVALID' });
     }
 
@@ -346,7 +362,7 @@ router.post('/admin/login/mfa', [
           updated_at: new Date()
         });
       if (consumed !== 1) {
-        await trackFailedAttempt(lockoutKey, ipAddress, userAgent);
+        await trackFailedAttempt(mfaLockoutKey, ipAddress, userAgent);
         return res.status(401).json({ error: 'Invalid verification code', code: 'MFA_INVALID' });
       }
       await logActivity('admin_mfa_recovery_used',
@@ -372,6 +388,181 @@ router.post('/admin/login/mfa', [
   } catch (error) {
     logger.error('MFA verification error:', error);
     res.status(500).json({ error: 'Verification failed' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Passkey login (WebAuthn), issue 1733.
+//
+// Two uses of the same pair of routes:
+//   - primary: no body. The browser offers the passkeys it holds for this
+//     address (discoverable credentials), so no username is ever sent and the
+//     options cannot depend on whether an account exists. User verification
+//     is required, which makes one gesture both factors.
+//   - second factor: with the mfa_pending token from /admin/login, as an
+//     alternative to the TOTP code.
+// Both end in completeAdminLogin, like every other admin login.
+//
+// A failed verify always answers with the same 401, whatever went wrong
+// (unknown credential, inactive account, bad signature, counter).
+// ──────────────────────────────────────────────────────────────────────────
+
+const PASSKEY_LOGIN_FAILED = { error: 'Passkey sign-in failed', code: 'PASSKEY_INVALID' };
+
+function readMfaPendingToken(mfaToken) {
+  try {
+    const decoded = jwt.verify(mfaToken, process.env.JWT_SECRET, { algorithms: ['HS256'], issuer: 'picpeak-auth' });
+    return decoded.type === 'mfa_pending' ? decoded : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+const MFA_SESSION_EXPIRED = {
+  error: 'Your verification session expired. Please sign in again.',
+  code: 'MFA_SESSION_EXPIRED'
+};
+
+router.post('/admin/passkey/options', [
+  body('mfaToken').optional().isString().isLength({ max: 2048 }),
+  body('remember_me').optional().isBoolean().toBoolean()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: safeValidationErrors(errors) });
+    }
+    // SSO-only mode disables every local login, this one included.
+    if (await require('../services/oidcService').isLocalLoginDisabled()) {
+      return res.status(403).json({ error: 'Local login is disabled — sign in through SSO', code: 'LOCAL_LOGIN_DISABLED' });
+    }
+
+    let admin = null;
+    let rememberMe = req.body.remember_me === true;
+    if (req.body.mfaToken) {
+      const decoded = readMfaPendingToken(req.body.mfaToken);
+      if (!decoded) return res.status(401).json(MFA_SESSION_EXPIRED);
+      admin = await db('admin_users').where('id', decoded.id).first();
+      if (!admin || !admin.is_active || (await passkeyService.countForAdmin(admin.id)) === 0) {
+        return res.status(401).json({ error: getGenericAuthError() });
+      }
+      // The session length was chosen at the password step.
+      rememberMe = decoded.rememberMe === true;
+    }
+
+    const options = await passkeyService.beginAuthentication(req, res, { admin, rememberMe });
+    return res.json({ options });
+  } catch (error) {
+    if (error instanceof passkeyService.PasskeyError) {
+      return res.status(error.status).json({ error: error.message, code: error.code });
+    }
+    logger.error('Passkey login options error:', error);
+    return res.status(500).json({ error: 'Passkey sign-in failed' });
+  }
+});
+
+router.post('/admin/passkey/verify', [
+  body('response').isObject(),
+  body('mfaToken').optional().isString().isLength({ max: 2048 })
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: safeValidationErrors(errors) });
+    }
+    const { response, mfaToken } = req.body;
+    const ipAddress = getClientIp(req);
+    const userAgent = req.headers['user-agent'] || '';
+
+    if (await require('../services/oidcService').isLocalLoginDisabled()) {
+      logger.warn('Passkey login refused — disabled by SSO policy', { ipAddress });
+      return res.status(403).json({ error: 'Local login is disabled — sign in through SSO', code: 'LOCAL_LOGIN_DISABLED' });
+    }
+
+    let pending = null;
+    if (mfaToken) {
+      pending = readMfaPendingToken(mfaToken);
+      if (!pending) return res.status(401).json(MFA_SESSION_EXPIRED);
+    }
+
+    // Consumed before anything else is looked at: a challenge is spent by the
+    // first verify that presents it, successful or not.
+    let challenge;
+    try {
+      challenge = await passkeyService.takeChallenge(req, res, pending ? 'mfa' : 'login');
+    } catch (error) {
+      if (!(error instanceof passkeyService.PasskeyError)) throw error;
+      return res.status(error.status).json({ error: error.message, code: error.code });
+    }
+    if (pending && challenge.adminId !== pending.id) {
+      return res.status(401).json(PASSKEY_LOGIN_FAILED);
+    }
+
+    const credential = await passkeyService.findCredential(response.id);
+    const admin = credential ? await db('admin_users')
+      .leftJoin('roles', 'roles.id', 'admin_users.role_id')
+      .where('admin_users.id', credential.admin_user_id)
+      .select('admin_users.*', 'roles.name as role_name', 'roles.display_name as role_display_name')
+      .first() : null;
+
+    // Same buckets as the steps this replaces: the password step's
+    // identifier + address bucket for a primary login, the account-wide
+    // second-factor bucket at the MFA step.
+    const failureKey = pending ? `mfa:${pending.id}` : (admin ? admin.username : 'passkey:unknown');
+    const fail = async (reason, detail) => {
+      await trackFailedAttempt(failureKey, ipAddress, userAgent);
+      logger.warn('Passkey login rejected', { reason, detail, adminId: admin?.id, ipAddress });
+      return res.status(401).json(PASSKEY_LOGIN_FAILED);
+    };
+
+    if (pending || admin) {
+      const lockoutStatus = pending
+        ? await checkAccountLockout(failureKey)
+        : await checkAccountLockout(failureKey, ipAddress);
+      if (lockoutStatus.isLocked) {
+        return res.status(423).json({
+          error: 'Account temporarily locked due to too many failed attempts',
+          retryAfter: lockoutStatus.remainingTime
+        });
+      }
+    }
+
+    if (!credential || !admin) return await fail('unknown_credential');
+    // An account the identity provider owns never signs in locally (#798).
+    if (!admin.is_active || admin.auth_provider === 'oidc') return await fail('account_not_eligible');
+    if (pending && (admin.id !== pending.id || !mfaService.isEnrolled(admin))) {
+      return await fail('wrong_account');
+    }
+
+    const result = await passkeyService.verifyAssertion(req, credential, response, challenge.challenge);
+    if (!result.ok) {
+      if (result.reason === 'counter_regression') {
+        // A counter that went backwards means a cloned authenticator or a
+        // replayed assertion: worth more than a log line.
+        logger.error('Passkey signature counter did not advance', {
+          adminId: admin.id, passkeyId: credential.id, detail: result.detail, ipAddress
+        });
+        await logActivity('admin_passkey_counter_regression',
+          { admin_id: admin.id, passkey_id: credential.id },
+          null,
+          { type: 'admin', id: admin.id, name: admin.username }
+        );
+      }
+      return await fail(result.reason, result.detail);
+    }
+
+    await logActivity(pending ? 'admin_mfa_login' : 'admin_passkey_login',
+      { admin_id: admin.id, method: 'passkey' },
+      null,
+      { type: 'admin', id: admin.id, name: admin.username }
+    );
+
+    return await completeAdminLogin(req, res, admin, ipAddress, userAgent,
+      pending ? (pending.loginId || pending.username) : admin.username,
+      { rememberMe: challenge.rememberMe });
+  } catch (error) {
+    logger.error('Passkey login error:', error);
+    res.status(500).json({ error: 'Passkey sign-in failed' });
   }
 });
 
@@ -548,7 +739,7 @@ router.post('/gallery/verify', [
         id: event.id,
         event_name: event.event_name,
         event_type: event.event_type,
-        event_date: event.event_date,
+        event_date: toDateOnly(event.event_date),
         welcome_message: event.welcome_message,
         color_theme: (await publicThemeFields(event)).color_theme,
         expires_at: event.expires_at,
@@ -574,7 +765,7 @@ router.post('/gallery/:slug/client-login', [
     }
 
     const { slug } = req.params;
-    const { password } = req.body;
+    const { password, token: clientShareToken } = req.body;
     const ipAddress = getClientIp(req);
     const userAgent = req.headers['user-agent'] || '';
 
@@ -593,6 +784,14 @@ router.post('/gallery/:slug/client-login', [
         error: 'Too many failed attempts. Please try again later.',
         retryAfter: lockoutStatus.remainingTime
       });
+    }
+
+    const validLinkToken = typeof clientShareToken === 'string'
+      && typeof event.client_share_token === 'string'
+      && timingSafeEqualStr(clientShareToken, event.client_share_token);
+    if (!validLinkToken) {
+      await trackFailedAttempt(`client:${slug}`, ipAddress, userAgent);
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const validPassword = await bcrypt.compare(password, event.client_password_hash);
@@ -626,7 +825,7 @@ router.post('/gallery/:slug/client-login', [
         id: event.id,
         event_name: event.event_name,
         event_type: event.event_type,
-        event_date: event.event_date,
+        event_date: toDateOnly(event.event_date),
         welcome_message: event.welcome_message,
         color_theme: (await publicThemeFields(event)).color_theme,
         expires_at: event.expires_at,
@@ -725,7 +924,7 @@ router.post('/gallery/share-login', [
         id: event.id,
         event_name: event.event_name,
         event_type: event.event_type,
-        event_date: event.event_date,
+        event_date: toDateOnly(event.event_date),
         welcome_message: event.welcome_message,
         color_theme: (await publicThemeFields(event)).color_theme,
         expires_at: event.expires_at,
@@ -771,9 +970,16 @@ router.get('/session', async (req, res) => {
     // through to the per-event password prompt — even though the
     // gallery_token_<slug> cookie was correctly set on the prior
     // /api/customer/events/:slug/access-token response.
-    const token = slug
+    let token = slug
       ? (getGalleryTokenFromRequest(req, slug) || getAdminTokenFromRequest(req))
       : (getAdminTokenFromRequest(req) || getGalleryTokenFromRequest(req, slug));
+    // A session opened before the gallery was renamed names the old slug.
+    let carried = null;
+    if (slug) {
+      const { carryRenamedGallerySession } = require('../services/galleryRenameSession');
+      carried = await carryRenamedGallerySession(req, res, slug, token);
+      token = carried || token;
+    }
 
     if (!token) {
       return res.status(401).json({ error: 'No token provided' });
@@ -837,7 +1043,11 @@ router.get('/session', async (req, res) => {
         // Full admin payload (or null) — lets the SPA hydrate its user
         // state after a redirect-established session (SSO, #798) where no
         // login JSON response ever reached it.
-        adminUser
+        adminUser,
+        // A session found in a cookie other than the one the page would
+        // send (renamed gallery): handed back so the page can replace a
+        // stale token it keeps for this slug, which would win as a Bearer.
+        ...(carried && { token: carried }),
       });
     } catch (err) {
       res.json({
@@ -911,13 +1121,11 @@ router.post('/password-strength', [
 
 const OIDC_STATE_COOKIE = 'oidc_state';
 
-function oidcStateCookieOptions(req) {
+function oidcStateCookieOptions(res) {
   return {
-    httpOnly: true,
-    secure: Boolean(req.secure),
+    ...buildCookieOptionsWithExpiry(res, 10 * 60 * 1000),
     sameSite: 'Lax',
     path: '/api/auth/admin/sso',
-    maxAge: 10 * 60 * 1000,
   };
 }
 
@@ -953,7 +1161,7 @@ router.get('/admin/sso/login', async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '10m', issuer: 'picpeak-auth' }
     );
-    res.cookie(OIDC_STATE_COOKIE, stash, oidcStateCookieOptions(req));
+    res.cookie(OIDC_STATE_COOKIE, stash, oidcStateCookieOptions(res));
     return res.redirect(url);
   } catch (error) {
     if (error.code === 'OIDC_NOT_CONFIGURED') {
@@ -980,7 +1188,11 @@ router.get('/admin/sso/callback', async (req, res) => {
   const fail = (key) => res.redirect(`${frontendBase}/admin/login?sso_error=${key}`);
 
   const stashCookie = req.cookies?.[OIDC_STATE_COOKIE];
-  res.clearCookie(OIDC_STATE_COOKIE, { ...oidcStateCookieOptions(req), maxAge: undefined });
+  res.clearCookie(OIDC_STATE_COOKIE, {
+    ...buildClearCookieOptions(),
+    sameSite: 'Lax',
+    path: '/api/auth/admin/sso',
+  });
   if (!stashCookie) return fail('state');
 
   let stash;

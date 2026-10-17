@@ -49,6 +49,7 @@ describe('archive restore rebuilds the photo row faithfully', () => {
     }));
     jest.doMock('../../src/middleware/ownership', () => ({
       requireEventOwnership: (_req, _res, next) => next(),
+      requireEventOwner: (_req, _res, next) => next(),
     }));
 
     ({ db, cleanup } = await require('./helpers/crmDb').bootCrmDb());
@@ -520,8 +521,8 @@ describe('archive restore rebuilds the photo row faithfully', () => {
     }
 
     await archiveEvent(await db('events').where('id', eventId).first());
-    // The originals are gone (the directory itself is left behind).
-    expect(await fs.promises.readdir(dir)).toEqual([]);
+    // The originals are gone, and the folders they were in with them.
+    await expect(fs.promises.readdir(dir)).rejects.toMatchObject({ code: 'ENOENT' });
 
     await restore(eventId);
 
@@ -530,6 +531,104 @@ describe('archive restore rebuilds the photo row faithfully', () => {
     for (const [name, bytes] of Object.entries(seeded)) {
       expect(Buffer.compare(await fs.promises.readFile(path.join(dir, name)), bytes)).toBe(0);
     }
+  });
+
+  it('drops the browser-playable copy on archive and queues it again on restore (issue 1430)', async () => {
+    jest.doMock('../../src/services/emailProcessor', () => ({
+      queueEmail: async () => {},
+      getSupportEmail: async () => 'support@example.com',
+    }));
+    const { archiveEvent } = require('../../src/services/archiveService');
+    const videoRendition = require('../../src/services/videoRenditionService');
+
+    const slug = 'web-copy-round-trip';
+    const [row] = await db('events').insert({
+      slug,
+      event_type: 'wedding',
+      event_name: slug,
+      event_date: '2026-06-27',
+      host_email: 'h@example.com',
+      admin_email: null,
+      password_hash: 'x',
+      share_link: `${slug}-share`,
+      expires_at: new Date().toISOString(),
+    }).returning('id');
+    const eventId = typeof row === 'object' ? row.id : row;
+    const dir = path.join(storagePath, 'events/active', slug, 'individual');
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.mkdir(path.join(storagePath, 'videos'), { recursive: true });
+    const seed = async (name, extra) => {
+      const videoBytes = require('../fixtures/admissionVideo').admissionVideo();
+      await fs.promises.writeFile(path.join(dir, name), videoBytes);
+      const [r] = await db('photos').insert({
+        event_id: eventId,
+        filename: name,
+        original_filename: name,
+        path: `events/active/${slug}/individual/${name}`,
+        type: 'individual',
+        size_bytes: videoBytes.length,
+        media_type: 'video',
+        mime_type: 'video/quicktime',
+        processing_status: 'complete',
+        ...extra,
+      }).returning('id');
+      return typeof r === 'object' ? r.id : r;
+    };
+    // One video with a copy, one the probe had passed as playable.
+    const copied = await seed('phone.mov', { web_path: 'videos/web_x_phone.mp4', web_status: 'complete' });
+    const playable = await seed('cam.mov', { web_status: 'skipped' });
+    await fs.promises.writeFile(path.join(storagePath, 'videos/web_x_phone.mp4'), BYTES);
+
+    await archiveEvent(await db('events').where('id', eventId).first());
+
+    // The copy is gone with the originals, and the row no longer names it:
+    // a `complete` row pointing at nothing could never be queued again.
+    await expect(fs.promises.access(path.join(storagePath, 'videos/web_x_phone.mp4'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await db('photos').where('id', copied).first()).toMatchObject({ web_path: null, web_status: null });
+    // No copy to lose, and the original comes back byte for byte: the verdict stays.
+    expect(await db('photos').where('id', playable).first()).toMatchObject({ web_status: 'skipped' });
+
+    // Restore with the setting on queues the video again.
+    await db('app_settings').insert({ setting_key: 'general_video_web_rendition', setting_value: JSON.stringify(true), setting_type: 'general' }).catch(async () => {
+      await db('app_settings').where({ setting_key: 'general_video_web_rendition' }).update({ setting_value: JSON.stringify(true) });
+    });
+    videoRendition.clearCache();
+    try {
+      await restore(eventId);
+      expect(await db('photos').where('id', copied).first()).toMatchObject({ web_status: 'pending' });
+      // Metadata stripping is on by default (issue 2102): the playable video
+      // is queued for its metadata-free remux too.
+      expect(await db('photos').where('id', playable).first()).toMatchObject({ web_status: 'pending' });
+    } finally {
+      await db('app_settings').where({ setting_key: 'general_video_web_rendition' }).del();
+      videoRendition.clearCache();
+    }
+  });
+
+  it('brings a team upload archived under review back hidden and under review (issue 743)', async () => {
+    const [uploaderRow] = await db('admin_users').insert({
+      username: 'restore-uploader', email: 'restore-uploader@example.com', password_hash: 'x',
+    }).returning('id');
+    const uploaderId = typeof uploaderRow === 'object' ? uploaderRow.id : uploaderRow;
+    const archiveRelPath = await writeArchive('review.zip', {
+      'individual/pending.jpg': BYTES,
+      'individual/rejected.jpg': BYTES,
+      'individual/approved.jpg': BYTES,
+      'photos_manifest.json': manifestOf([
+        { filename: 'pending.jpg', type: 'individual', moderation_status: 'pending', uploaded_by_admin_id: uploaderId },
+        { filename: 'rejected.jpg', type: 'individual', moderation_status: 'rejected', uploaded_by_admin_id: 987654 },
+        { filename: 'approved.jpg', type: 'individual', moderation_status: null },
+      ]),
+    });
+    const eventId = await seedArchivedEvent(archiveRelPath, 'review-event');
+
+    await restore(eventId);
+
+    const rows = Object.fromEntries((await db('photos').where('event_id', eventId)).map((p) => [p.filename, p]));
+    expect(rows['pending.jpg']).toMatchObject({ moderation_status: 'pending', visibility: 'hidden', uploaded_by_admin_id: uploaderId });
+    // An uploader deleted since is not written back (a foreign key on PostgreSQL).
+    expect(rows['rejected.jpg']).toMatchObject({ moderation_status: 'rejected', visibility: 'hidden', uploaded_by_admin_id: null });
+    expect(rows['approved.jpg']).toMatchObject({ moderation_status: null, visibility: 'visible' });
   });
 
   it('keeps the original upload time rather than stamping the restore time', async () => {

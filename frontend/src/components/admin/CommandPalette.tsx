@@ -14,6 +14,7 @@ import { Search, CornerDownLeft } from 'lucide-react';
 import { searchScore } from '../../features/settings/settingsNav';
 import { useLeaveGuard } from '../../contexts/UnsavedChangesContext';
 import { useAdminSearchIndex, type AdminSearchEntry } from './adminSearchIndex';
+import { isImeComposing } from '../../utils/imeComposition';
 
 const MAX_RESULTS = 12;
 
@@ -84,6 +85,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
+    // Escape, the arrows and Enter drive an IME composition in the search
+    // field: none of them may close the palette or jump to a result. Tab
+    // still stays trapped.
+    if (e.key !== 'Tab' && isImeComposing(e)) return;
     if (e.key === 'Escape') { e.preventDefault(); onClose(); return; }
     if (e.key === 'ArrowDown') {
       e.preventDefault();
@@ -143,7 +148,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose 
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-3 px-4 border-b border-line">
-          <Search className="w-4 h-4 text-neutral-400 flex-shrink-0" />
+          <Search className="w-4 h-4 text-faint flex-shrink-0" />
           <input
             ref={inputRef}
             type="text"

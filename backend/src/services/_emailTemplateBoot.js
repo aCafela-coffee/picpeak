@@ -32,6 +32,8 @@
 const { ensureCrmEmailTemplatesSeeded } = require('./crmEmailTemplates');
 const { ensureContractEmailTemplatesSeeded } = require('./contractEmailTemplates');
 const { ensureEventReminderTemplatesSeeded } = require('./eventReminderTemplates');
+const { ensureGalleryDeliveryTemplatesSeeded } = require('./galleryDeliveryTemplates');
+const { PROTECTED_PENDING_STATUS } = require('../utils/emailQueueEncryption');
 
 /**
  * Run all three template seeders, then recover any email_queue rows
@@ -54,6 +56,7 @@ async function seedEmailTemplatesAndRecoverQueue(db, logger) {
     ensureCrmEmailTemplatesSeeded,
     ensureContractEmailTemplatesSeeded,
     ensureEventReminderTemplatesSeeded,
+    ensureGalleryDeliveryTemplatesSeeded,
   ]) {
     try {
       const inserted = await seedFn(db, log);
@@ -79,7 +82,7 @@ async function seedEmailTemplatesAndRecoverQueue(db, logger) {
   if (await db.schema.hasTable('email_queue')) {
     try {
       recovered = await db('email_queue')
-        .where('status', 'pending')
+        .whereIn('status', ['pending', PROTECTED_PENDING_STATUS])
         .where('retry_count', '>=', 3)
         .whereIn('email_type', seeded)
         .update({ retry_count: 0, error_message: null });

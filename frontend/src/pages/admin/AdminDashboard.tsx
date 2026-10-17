@@ -13,7 +13,9 @@ import {
   Heart,
   Inbox,
   Check,
-  X
+  X,
+  Sparkles,
+  LayoutDashboard
 } from 'lucide-react';
 import { parseISO } from 'date-fns';
 import { useQueryClient } from '@tanstack/react-query';
@@ -25,13 +27,16 @@ import { useMutationWithToast } from '../../hooks';
 
 import { Button, Card, Loading } from '../../components/common';
 import { UpdateNotification } from '../../components/admin/UpdateNotification';
+import { SectionPageHeader } from '../../components/admin/SectionPageHeader';
 import { WhatsNewBanner } from '../../components/admin/WhatsNewBanner';
 import { CrmOverviewSection } from '../../components/admin/CrmOverviewSection';
 import { useQuery } from '@tanstack/react-query';
 import { eventsService } from '../../services/events.service';
+import { useDeliveryDue } from './event-details/deliveryStatus';
 import { adminService, ActivityType, type Activity } from '../../services/admin.service';
 import { mediaSplitLabel, splitMediaCount } from '../../utils/mediaCounts';
 import { workflowsService } from '../../services/workflows.service';
+import { approvalEntityHref, approvalPrompt } from '../../utils/workflowApprovals';
 import { useFeatureFlags } from '../../contexts/FeatureFlagsContext';
 
 interface StatCard {
@@ -58,18 +63,37 @@ export function buildActivityParams(activity: Activity): Record<string, unknown>
   const t = i18n.t;
   return {
     ...activity.metadata,
-    eventName: activity.eventName || t('common.unknown'),
+    // Team and review lines (issue 743) also record the name, which outlives
+    // a deleted gallery; event_deleted records it as event_name.
+    eventName: activity.eventName || activity.metadata?.eventName || activity.metadata?.event_name
+      || t('common.unknown'),
     email: activity.metadata?.email || activity.actorName || '',
     count: activity.metadata?.count || 0,
     template: activity.metadata?.template_key || '',
     categoryName: activity.metadata?.category_name || '',
+    // "9 photos · 3 videos" for an upload that carried videos (issue 1430,
+    // item 3); activityMessageKey picks the line that interpolates it.
+    media: mediaSplitLabel(t, splitMediaCount(activity.metadata?.count, activity.metadata?.videoCount)),
   };
+}
+
+/**
+ * The `admin.activities.*` key for an activity. An upload is worded by its
+ * type split: the backend records videoCount next to count, and a line that
+ * says "2 photos uploaded" for two clips is the wording this fixes.
+ */
+export function activityMessageKey(activity: Activity): string {
+  if (activity.type === 'photos_uploaded' && Number(activity.metadata?.videoCount) > 0) {
+    return 'admin.activities.media_uploaded';
+  }
+  return `admin.activities.${activity.type}`;
 }
 
 export const AdminDashboard: React.FC = () => {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { format, formatDistanceToNow } = useLocalizedDate();
+  const { format, formatExpiry, formatDistanceToNow } = useLocalizedDate();
+  const deliveryDue = useDeliveryDue();
 
   // Fetch dashboard statistics
   const { data: dashboardStats, isLoading: statsLoading } = useQuery({
@@ -110,6 +134,19 @@ export const AdminDashboard: React.FC = () => {
     queryFn: () => eventsService.getEvents({ limit: 5, status: 'expiring', sortBy: 'expires_at', sortOrder: 'asc' }),
   });
 
+  // Two-stage delivery (issue 1562): galleries whose first look is out and
+  // whose full delivery is still owed, soonest promise first. The card only
+  // renders when there are any.
+  // The server orders by due date (no date last) before LIMIT, so these five
+  // are the soonest of all of them, not of whichever 20 came back first.
+  const { data: awaitingData } = useQuery({
+    queryKey: ['admin-events-summary', 'awaiting_delivery'],
+    queryFn: () => eventsService.getEvents({
+      limit: 5, status: 'awaiting_delivery', sortBy: 'delivery_due_at', sortOrder: 'asc',
+    }),
+  });
+  const awaitingEvents = awaitingData?.events ?? [];
+
   // Keep the "expiring soon" card honest when a row crosses its expiry while
   // the dashboard sits open (#909 review). Filtering client-side desynced the
   // list from the cached total/stat; instead we refetch the whole set at the
@@ -142,17 +179,6 @@ export const AdminDashboard: React.FC = () => {
     errorMessage: t('common.error', 'Something went wrong') as string,
   });
 
-  // Admin detail route for an approval's run entity, so clicking opens the
-  // document under review. Mirrors WorkflowApprovalsPage (`invoice` → /bills).
-  const approvalEntityHref = (a: { entity_type?: string | null; entity_id?: number | null }): string | null => {
-    if (!a.entity_type || a.entity_id == null) return null;
-    const base: Record<string, string> = {
-      quote: 'quotes', invoice: 'bills', event: 'events', contract: 'contracts', customer: 'customers',
-    };
-    const seg = base[a.entity_type];
-    return seg ? `/admin/${seg}/${a.entity_id}` : null;
-  };
-
   const isLoading = statsLoading || eventsLoading;
 
   if (isLoading) {
@@ -181,14 +207,14 @@ export const AdminDashboard: React.FC = () => {
       title: t('admin.activeEvents'),
       value: dashboardStats?.activeEvents || 0,
       icon: Calendar,
-      color: 'text-green-600',
+      color: 'text-success-text',
     },
     {
       title: t('admin.expiringSoon'),
       value: dashboardStats?.expiringEvents || 0,
       change: t('admin.next7Days'),
       icon: AlertTriangle,
-      color: 'text-orange-600',
+      color: 'text-warning-text',
     },
     {
       // An install that holds videos counts media and shows the split; one
@@ -197,7 +223,7 @@ export const AdminDashboard: React.FC = () => {
       value: formatNumber(dashboardStats?.totalPhotos || 0),
       change: installMedia.hasVideos ? mediaSplitLabel(t, installMedia) : undefined,
       icon: Image,
-      color: 'text-blue-600',
+      color: 'text-info-text',
     },
     {
       // Real bytes under the storage root (#1164). This used to be the summed
@@ -224,33 +250,33 @@ export const AdminDashboard: React.FC = () => {
           : t('admin.catalogedMedia', { size: adminService.formatBytes(dashboardStats.catalogedBytes) }))
         : undefined,
       icon: HardDrive,
-      color: 'text-purple-600',
+      color: 'text-chart-4',
     },
     {
       title: t('admin.totalViews'),
       value: formatNumber(dashboardStats?.totalViews || 0),
       change: dashboardStats?.viewsTrend ? t('admin.percentFromLastWeek', { percent: `${dashboardStats.viewsTrend > 0 ? '+' : ''}${dashboardStats.viewsTrend}` }) : undefined,
       icon: Eye,
-      color: 'text-indigo-600',
+      color: 'text-chart-1',
     },
     {
       title: t('admin.downloads'),
       value: formatNumber(dashboardStats?.totalDownloads || 0),
       change: dashboardStats?.downloadsTrend ? t('admin.percentFromLastWeek', { percent: `${dashboardStats.downloadsTrend > 0 ? '+' : ''}${dashboardStats.downloadsTrend}` }) : undefined,
       icon: Download,
-      color: 'text-pink-600',
+      color: 'text-chart-5',
     },
     {
       title: t('admin.archivedEvents'),
       value: dashboardStats?.archivedEvents || 0,
       icon: Archive,
-      color: 'text-gray-600',
+      color: 'text-soft',
     },
     {
       title: t('admin.systemHealth'),
       value: systemHealth ? t(`admin.health.${systemHealth.overall}`) : t('admin.health.checking'),
       icon: Heart,
-      color: systemHealth?.overall === 'healthy' ? 'text-green-600' : systemHealth?.overall === 'warning' ? 'text-yellow-600' : 'text-red-600',
+      color: systemHealth?.overall === 'healthy' ? 'text-success-text' : systemHealth?.overall === 'warning' ? 'text-warning-text' : 'text-danger-text',
     },
   ];
 
@@ -261,20 +287,21 @@ export const AdminDashboard: React.FC = () => {
       {/* Update Notification */}
       <UpdateNotification />
 
-      {/* Page Header */}
-      <div className="flex justify-between items-center mb-8">
-        <div>
-          <h1 className="text-2xl font-bold text-heading">{t('navigation.dashboard')}</h1>
-          <p className="text-soft mt-1">{t('admin.dashboardSubtitle')}</p>
-        </div>
-        <Button
-          variant="primary"
-          leftIcon={<Plus className="w-5 h-5" />}
-          onClick={() => navigate('/admin/events/new')}
-        >
-          {t('events.createEvent')}
-        </Button>
-      </div>
+      <SectionPageHeader
+        icon={LayoutDashboard}
+        title={t('navigation.dashboard')}
+        description={t('admin.dashboardSubtitle')}
+        className="mb-8"
+        actions={(
+          <Button
+            variant="primary"
+            leftIcon={<Plus className="w-5 h-5" />}
+            onClick={() => navigate('/admin/events/new')}
+          >
+            {t('events.createEvent')}
+          </Button>
+        )}
+      />
 
       {/* Statistics Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
@@ -303,7 +330,7 @@ export const AdminDashboard: React.FC = () => {
           <Card padding="md">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-heading">{t('admin.eventsExpiringSoon')}</h2>
-              <AlertTriangle className="w-5 h-5 text-orange-600" />
+              <AlertTriangle className="w-5 h-5 text-warning-text" />
             </div>
 
             {expiringEvents.length === 0 ? (
@@ -319,7 +346,7 @@ export const AdminDashboard: React.FC = () => {
                   return (
                     <div
                       key={event.id}
-                      className="flex items-center justify-between p-4 bg-orange-50 dark:bg-orange-900/30 rounded-lg border border-orange-200 dark:border-orange-800 cursor-pointer hover:bg-orange-100 dark:hover:bg-orange-900/50 transition-colors"
+                      className="flex items-center justify-between p-4 bg-warning-soft rounded-lg border border-warning-line cursor-pointer transition-colors"
                       onClick={() => navigate(`/admin/events/${event.id}`)}
                     >
                       <div>
@@ -331,11 +358,11 @@ export const AdminDashboard: React.FC = () => {
                         )}
                       </div>
                       <div className="text-right">
-                        <p className="text-sm font-medium text-orange-600 dark:text-orange-400">
+                        <p className="text-sm font-medium text-warning-text">
                           {t('admin.daysLeft', { count: daysLeft })}
                         </p>
                         <p className="text-xs text-muted">
-                          {t('gallery.expires')} {format(parseISO(event.expires_at!), 'PP')}
+                          {t('gallery.expires')} {formatExpiry(event.expires_at!, 'PP')}
                         </p>
                       </div>
                     </div>
@@ -354,33 +381,81 @@ export const AdminDashboard: React.FC = () => {
             )}
           </Card>
 
+          {awaitingEvents.length > 0 && (
+            <Card padding="md" className="mt-6">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-lg font-semibold text-heading">{t('events.delivery.awaitingFilter', 'Awaiting full gallery')}</h2>
+                <Sparkles className="w-5 h-5 text-accent" />
+              </div>
+              <div className="space-y-3">
+                {awaitingEvents.map((event) => {
+                  const due = deliveryDue(event.delivery_due_at);
+                  const tone = due?.tone === 'overdue'
+                    ? 'text-danger-text'
+                    : due?.tone === 'soon' ? 'text-warning-text' : 'text-body';
+                  return (
+                    <div
+                      key={event.id}
+                      className="flex items-center justify-between p-4 bg-inset rounded-lg border border-line cursor-pointer hover:bg-hover transition-colors"
+                      onClick={() => navigate(`/admin/events/${event.id}`)}
+                    >
+                      <div>
+                        <h3 className="font-medium text-heading">{event.event_name}</h3>
+                        <p className="text-sm text-soft">
+                          {event.delivery_expected_count
+                            ? t('events.delivery.progressShort', '{{count}} of ~{{expected}} photos', { count: event.photo_count || 0, expected: event.delivery_expected_count })
+                            : t('events.delivery.progressNoExpected', '{{count}} photos so far', { count: event.photo_count || 0 })}
+                        </p>
+                      </div>
+                      {due && (
+                        <p className={`text-sm font-medium text-right ${tone}`}>
+                          {due.tone === 'overdue'
+                            ? t('events.delivery.overdueShort', 'Overdue since {{date}}', { date: format(due.date) })
+                            : t('events.delivery.dueShort', 'Due {{date}}', { date: format(due.date) })}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {(awaitingData?.pagination?.total ?? awaitingEvents.length) > awaitingEvents.length && (
+                <button
+                  onClick={() => navigate('/admin/events?filter=awaiting_delivery')}
+                  className="w-full mt-4 text-sm text-accent hover:opacity-80 font-medium"
+                >
+                  {t('events.delivery.viewAllAwaiting', 'Show all')} →
+                </button>
+              )}
+            </Card>
+          )}
+
           {/* Pending workflow approvals — the human-in-the-loop gates. Only
               rendered when the workflow engine is live and something is waiting. */}
           {!!flags.workflows && pendingApprovals && pendingApprovals.length > 0 && (
             <Card padding="md" className="mt-6">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-lg font-semibold text-heading">{t('workflows.approvals.pendingTitle', 'Pending approvals')}</h2>
-                <Inbox className="w-5 h-5 text-purple-600 dark:text-purple-400" />
+                <Inbox className="w-5 h-5 text-warning-text" />
               </div>
               <div className="space-y-3">
                 {pendingApprovals.slice(0, 5).map((a) => {
-                  const prompt = (a.payload as any)?.prompt as string | undefined;
+                  const prompt = approvalPrompt(a);
                   const href = approvalEntityHref(a);
                   const info = (
                     <>
                       <h3 className="font-medium text-heading truncate">{a.workflow_name}</h3>
                       <p className="text-sm text-soft truncate">
-                        {prompt || a.type}{a.entity_type ? ` · ${a.entity_type} #${a.entity_id}` : ''}
+                        {prompt || t('workflows.approvals.defaultPrompt', 'A workflow needs your confirmation.')}{a.entity_type ? ` · ${a.entity_type} #${a.entity_id}` : ''}
                       </p>
                     </>
                   );
                   return (
-                    <div key={a.id} className="flex items-center justify-between gap-3 p-4 bg-purple-50 dark:bg-purple-900/20 rounded-lg border border-purple-200 dark:border-purple-800">
+                    <div key={a.id} className="flex items-center justify-between gap-3 p-4 bg-warning-soft rounded-lg border border-warning-line">
                       {href ? (
                         <button
                           type="button"
                           onClick={() => navigate(href)}
-                          className="min-w-0 text-left rounded -m-1 p-1 hover:bg-purple-100/60 dark:hover:bg-purple-900/40 transition-colors cursor-pointer"
+                          className="min-w-0 text-left rounded -m-1 p-1 hover:bg-warning-line transition-colors cursor-pointer"
                           title={t('workflows.approvals.openEntity', 'Open {{type}} #{{id}}', { type: a.entity_type, id: a.entity_id }) as string}
                         >
                           {info}
@@ -431,27 +506,28 @@ export const AdminDashboard: React.FC = () => {
                 // Get color based on activity type
                 const getActivityColor = (type: ActivityType) => {
                   const colors: Partial<Record<ActivityType, string>> = {
-                    'event_created': 'bg-green-500',
-                    'photos_uploaded': 'bg-blue-500',
-                    'event_archived': 'bg-purple-500',
-                    'archive_restored': 'bg-indigo-500',
-                    'archive_deleted': 'bg-red-500',
-                    'bulk_download': 'bg-blue-500',
-                    'email_config_updated': 'bg-yellow-500',
-                    'branding_updated': 'bg-pink-500',
-                    'theme_updated': 'bg-purple-500',
-                    'gallery_password_entry': 'bg-gray-500',
+                    'event_created': 'bg-success',
+                    'photos_uploaded': 'bg-info',
+                    'event_archived': 'bg-chart-4',
+                    'archive_restored': 'bg-chart-1',
+                    'archive_deleted': 'bg-danger',
+                    'bulk_download': 'bg-info',
+                    'email_config_updated': 'bg-chart-3',
+                    'branding_updated': 'bg-chart-5',
+                    'theme_updated': 'bg-chart-4',
+                    'gallery_password_entry': 'bg-faint',
                   };
-                  return colors[type] || 'bg-gray-500';
+                  return colors[type] || 'bg-faint';
                 };
 
                 // Format activity message with translations
                 const getActivityMessage = (): string => {
                   const params = buildActivityParams(activity);
-                  const translated = t(`admin.activities.${activity.type}`, params);
+                  const key = activityMessageKey(activity);
+                  const translated = t(key, params);
 
                   // Translate; if key missing i18n returns the key string itself
-                  if (!translated || translated === `admin.activities.${activity.type}`) {
+                  if (!translated || translated === key) {
                     // Fallback: format a readable English message
                     return adminService.formatActivityMessage(activity);
                   }

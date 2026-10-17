@@ -5,11 +5,15 @@ import { toast } from 'react-toastify';
 import { Button, Input } from '../common';
 import { api } from '../../config/api';
 import { usePublicSettings } from '../../hooks/usePublicSettings';
-import { extensionsToMimeTypes, buildUploadAcceptString, extensionsToLabel, normalizeFileMimeType } from '../../utils/fileTypes';
+import { extensionsToMimeTypes, buildUploadAcceptString, extensionsToLabel, isAllowedUploadFile } from '../../utils/fileTypes';
 import { useGuestIdentityOptional } from '../../contexts/GuestIdentityContext';
 import { guestsService, type GuestIdentity } from '../../services/guests.service';
 import { clearGuestIdentity, getGuestIdentity, getGuestToken, storeGuestIdentity } from '../../utils/guestIdentityStorage';
 import type { GuestNameMode } from '../../types';
+import { useGalleryDialog } from './hooks/useGalleryDialog';
+import { imageLimitMessage, publicUploadErrorKey } from '../../utils/publicUploadErrors';
+import { prepareGuestUpload } from '../../utils/guestUploadDownscale';
+import { getGalleryToken } from '../../utils/galleryAuthStorage';
 
 interface UserPhotoUploadProps {
   eventId: number;
@@ -28,6 +32,9 @@ interface UserPhotoUploadProps {
   // The feedback setting "require name and email" applies to the one guest
   // identity, so registering it from here has to ask for the address too.
   requireEmail?: boolean;
+  // Longest edge photos are scaled to before upload (issue 1733); empty sends
+  // originals.
+  maxEdge?: number | null;
 }
 
 // Signing an established identity out re-keys everything under the
@@ -45,6 +52,7 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
   nameMode = 'off',
   creditsVisible = false,
   requireEmail = false,
+  maxEdge = null,
 }) => {
   const { t } = useTranslation();
 
@@ -151,8 +159,10 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
   // Shared filter pipeline for both <input> change and drag-and-drop (#504).
   const addFiles = (incoming: File[]) => {
     const validFiles = incoming.filter((file) => {
-      if (!allowedMimeTypes.includes(normalizeFileMimeType(file.name, file.type))) {
-        toast.error(`Invalid file type: ${file.name}`);
+      // Matches on the extension when the browser reports no type, which is
+      // what it does for camera RAW on macOS and Windows.
+      if (!isAllowedUploadFile(file, allowedMimeTypes)) {
+        toast.error(t('upload.invalidFileType', { names: file.name }));
         return false;
       }
       // Check file size against the configured per-file limit.
@@ -317,6 +327,12 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
     // Set when the server no longer knows the stored uploader; the name field
     // is back on screen and says why.
     let stoppedForName = false;
+    let stoppedForCapacity = false;
+    // Set when the gallery holds uploads for approval (issue 1733): the
+    // photos are stored, but will not show up until they are approved.
+    let heldForReview = false;
+
+    const galleryToken = slug ? getGalleryToken(slug) : null;
 
     for (const [index, file] of files.entries()) {
       // The gallery's photo limit refuses this file and every one after it:
@@ -326,16 +342,22 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
         failedCount += files.length - index;
         toast.error(t('upload.photoCapReached', { limit }));
       };
+      // Inside the loop, so only one decoded image is in memory at a time.
+      const prepared = await prepareGuestUpload(file, maxEdge);
       const formData = new FormData();
-      formData.append('photos', file);
+      formData.append('photos', prepared.file);
       if (categoryId) {
         formData.append('category_id', categoryId.toString());
+      }
+      if (prepared.capturedAt) {
+        formData.append('captured_at', prepared.capturedAt);
       }
 
       try {
         const response = await api.post<{
           upload_id?: string;
           count?: number;
+          held_for_review?: boolean;
           errors?: Array<{ filename?: string; error?: string; code?: string; limit?: number }>;
         }>(`/gallery/${eventId}/upload`, formData, {
           headers: {
@@ -344,6 +366,10 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
             // event id where the interceptor looks for a slug, so it would
             // look the guest token up under the wrong key (#1561).
             ...(uploader.token ? { 'x-guest-token': uploader.token } : {}),
+            // The gallery token too, for the same reason: without it the
+            // server falls back to any gallery cookie, which with a second
+            // gallery open in another tab is that one's, and answers 403.
+            ...(galleryToken ? { Authorization: `Bearer ${galleryToken}` } : {}),
           },
           onUploadProgress: (progressEvent) => {
             if (progressEvent.total) {
@@ -377,7 +403,8 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
             break;
           }
           failedCount++;
-          const reason = firstError?.error || t('upload.someFilesFailed');
+          const capacityKey = publicUploadErrorKey(firstError?.code);
+          const reason = imageLimitMessage(t, firstError) ?? (capacityKey ? t(capacityKey) : firstError?.error || t('upload.someFilesFailed'));
           toast.error(`${file.name}: ${reason}`);
           continue;
         }
@@ -387,6 +414,7 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
         if (response.data?.upload_id) {
           uploadIds.push(response.data.upload_id);
         }
+        if (response.data?.held_for_review) heldForReview = true;
         successCount++;
       } catch (error: any) {
         if (error.response?.data?.code === 'PHOTO_CAP_REACHED') {
@@ -404,6 +432,16 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
           setFiles(unsent);
           break;
         }
+        const capacityKey = publicUploadErrorKey(error.response?.data?.code);
+        if (capacityKey) {
+          failedCount += files.length - index;
+          toast.error(t(capacityKey));
+          // Do not turn a capacity refusal into hundreds of repeated requests.
+          // Leave unsent files selected and retain earlier processing groups.
+          stoppedForCapacity = true;
+          setFiles(files.slice(index));
+          break;
+        }
         // Upload error handled - user notified via UI
         failedCount++;
         
@@ -418,8 +456,11 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
 
     if (successCount > 0) {
       toast.success(t('toast.uploadSuccess') + ` (${successCount} ${t('common.photos')})`);
+      // Said once, and left up longer: nothing else explains why the grid
+      // does not change.
+      if (heldForReview) toast.info(t('upload.heldForReview'), { autoClose: 10000 });
     }
-    if (stoppedForName) {
+    if (stoppedForName || stoppedForCapacity) {
       // onUploadComplete closes the dialog, and the guest has a name to enter
       // and files left to send. Report these groups with the next attempt.
       pendingUploadIdsRef.current = [...pendingUploadIdsRef.current, ...uploadIds];
@@ -428,7 +469,7 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
       pendingUploadIdsRef.current = [];
     }
     
-    if (failedCount > 0 && !stoppedAtPhotoCap && !stoppedForName) {
+    if (failedCount > 0 && !stoppedAtPhotoCap && !stoppedForName && !stoppedForCapacity) {
       toast.error(`${failedCount} ${t('upload.someFilesFailed')}`);
     }
 
@@ -436,6 +477,10 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
       onClose();
     }
   };
+
+  const panelRef = useRef<HTMLDivElement>(null);
+  // Escape closes like Cancel does, and like Cancel not while files are sending.
+  useGalleryDialog({ open: true, onClose, panelRef, dismissible: !uploading });
 
   const formatBytes = (bytes: number): string => {
     if (bytes === 0) return '0 Bytes';
@@ -446,14 +491,22 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-end sm:items-center justify-center z-50 p-0 sm:p-4">
-      <div className="w-full sm:max-w-2xl bg-surface flex flex-col max-h-[100vh] sm:max-h-[90vh] rounded-2xl shadow-xl overflow-hidden">
+    <div className="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center z-50 p-0 sm:p-4">
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="user-photo-upload-title"
+        className="w-full sm:max-w-2xl bg-surface text-theme flex flex-col max-h-[100vh] sm:max-h-[90vh] rounded-2xl shadow-xl overflow-hidden"
+      >
         {/* Fixed Header */}
-        <div className="flex items-center justify-between p-4 sm:p-6 border-b border-surface flex-shrink-0">
-          <h2 className="text-lg sm:text-xl font-semibold text-theme">{t('upload.uploadPhotos')}</h2>
+        <div className="flex items-center justify-between p-4 sm:p-6 border-b border-border-token flex-shrink-0">
+          <h2 id="user-photo-upload-title" className="text-lg sm:text-xl font-semibold text-theme">{t('upload.uploadPhotos')}</h2>
           <button
+            type="button"
             onClick={onClose}
-            className="p-1.5 sm:p-2 hover:bg-black/10 rounded-lg transition-colors"
+            aria-label={t('common.close', 'Close')}
+            className="p-1.5 sm:p-2 hover-surface rounded-lg transition-colors"
           >
             <X className="w-5 h-5 text-muted-theme" />
           </button>
@@ -463,7 +516,7 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
         <div className="flex-1 p-4 sm:p-6 overflow-y-auto min-h-0">
             {/* Uploader name (#1561) */}
             {askName && (
-              <div className="mb-4 sm:mb-6 rounded-lg border border-surface p-3 sm:p-4" data-testid="uploader-name-step">
+              <div className="mb-4 sm:mb-6 rounded-lg border border-border-token p-3 sm:p-4" data-testid="uploader-name-step">
                 {identity ? (
                   <div className="flex items-center justify-between gap-3">
                     <p className="flex items-center gap-2 text-sm text-theme min-w-0">
@@ -510,7 +563,7 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
                   </div>
                 )}
                 {identity && nameError && (
-                  <p className="mt-2 text-xs text-red-600">{nameError}</p>
+                  <p className="mt-2 text-xs text-status hue-danger">{nameError}</p>
                 )}
                 <p className="mt-2 text-xs text-muted-theme">
                   {creditsVisible ? t('upload.namePrivacyShown') : t('upload.namePrivacyHidden')}
@@ -523,14 +576,14 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
               <label className="block">
                 <div
                   className={`border-2 border-dashed rounded-lg p-6 sm:p-8 text-center hover:border-accent-dark transition-colors cursor-pointer ${
-                    isDragOver ? 'border-accent-dark bg-accent-dark/10' : 'border-surface'
+                    isDragOver ? 'border-accent-dark bg-accent-soft' : 'border-border-token'
                   }`}
                   onDragOver={handleDragOver}
                   onDragEnter={handleDragOver}
                   onDragLeave={handleDragLeave}
                   onDrop={handleDrop}
                 >
-                  <Upload className="w-10 h-10 sm:w-12 sm:h-12 text-neutral-400 mx-auto mb-3" />
+                  <Upload className="w-10 h-10 sm:w-12 sm:h-12 text-muted-theme mx-auto mb-3" />
                   <p className="text-sm font-medium text-muted-theme mb-1">
                     {t('upload.clickToUpload')}
                   </p>
@@ -587,7 +640,7 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
                 {files.map((file, index) => (
                   <div
                     key={index}
-                    className="flex items-center justify-between p-3 bg-surface rounded-lg"
+                    className="flex items-center justify-between p-3 bg-elevated rounded-lg"
                   >
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium text-theme truncate">
@@ -604,12 +657,12 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
                           // resolved yet because the backend is still
                           // generating thumbnails / reading EXIF. Show
                           // a spinner so it doesn't look stuck at 100%.
-                          <Loader2 className="w-5 h-5 text-amber-600 animate-spin" />
+                          <Loader2 className="w-5 h-5 text-status hue-warning animate-spin" />
                         ) : uploadProgress[file.name] === 100 ? (
-                          <CheckCircle className="w-5 h-5 text-green-600" />
+                          <CheckCircle className="w-5 h-5 text-status hue-success" />
                         ) : (
                           <div className="w-20">
-                            <div className="bg-neutral-200 rounded-full h-2">
+                            <div className="bg-border-token rounded-full h-2">
                               <div
                                 className="bg-accent-dark h-2 rounded-full transition-all"
                                 style={{ width: `${uploadProgress[file.name]}%` }}
@@ -620,8 +673,10 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
                       </div>
                     ) : (
                       <button
+                        type="button"
                         onClick={() => removeFile(index)}
-                        className="p-1 hover:bg-black/10 rounded transition-colors"
+                        aria-label={t('upload.removeFile', 'Remove {{name}}', { name: file.name })}
+                        className="p-1 hover-surface rounded transition-colors"
                         disabled={uploading}
                       >
                         <X className="w-4 h-4 text-muted-theme" />
@@ -634,7 +689,7 @@ export const UserPhotoUpload: React.FC<UserPhotoUploadProps> = ({
         </div>
 
         {/* Fixed Footer */}
-        <div className="flex items-center justify-end gap-2 sm:gap-3 p-4 sm:p-6 border-t border-surface bg-surface flex-shrink-0">
+        <div className="flex items-center justify-end gap-2 sm:gap-3 p-4 sm:p-6 border-t border-border-token bg-surface flex-shrink-0">
           <Button
             variant="outline"
             onClick={onClose}

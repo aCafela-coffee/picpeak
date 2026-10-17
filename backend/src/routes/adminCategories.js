@@ -4,13 +4,16 @@ const express = require('express');
 const { body, validationResult } = require('express-validator');
 const { safeValidationErrors } = require('../utils/routeHelpers');
 const { db, logActivity } = require('../database/db');
+const { livePhotos } = require('../utils/photoVisibility');
 const { formatBoolean } = require('../utils/dbCompat');
 const { parseBooleanInput } = require('../utils/parsers');
 const { adminAuth } = require('../middleware/auth');
-const { requirePermission } = require('../middleware/permissions');
+const { requirePermission, userHasAllPermissions } = require('../middleware/permissions');
+const folderTree = require('../services/folderTreeService');
 const { requireEventOwnership, canAccessEvent } = require('../middleware/ownership');
 const { getEventCategoriesOrdered } = require('../utils/categoryOrder');
 const logger = require('../utils/logger');
+const { isUniqueViolation } = require('../utils/dbErrors');
 const router = express.Router();
 
 /**
@@ -19,6 +22,46 @@ const router = express.Router();
  * Global categories are shared and stay on settings.edit alone. Answers the
  * refusal itself and returns true when the caller may not continue.
  */
+/**
+ * Folders (issue 1786) are edited with folders.manage, on top of the
+ * settings.edit these routes already require. Answers the refusal itself.
+ */
+async function refuseWithoutFolderPermission(req, res) {
+  if (await userHasAllPermissions(req.admin.id, ['folders.manage'])) return false;
+  res.status(403).json({ error: 'The folders.manage permission is required to change folders' });
+  return true;
+}
+
+const sendFolderError = (res, err) => res.status(err.status).json({ error: err.message, code: err.code, ...(err.details || {}) });
+
+/**
+ * A category becoming a top-level folder (create with is_folder, or the
+ * filter → folder flip) goes past folderTreeService.createFolder, so the
+ * tree's rules are applied here: the per-event folder cap and one name per
+ * sibling level (migration 285's index would otherwise turn a clash into a
+ * 500). Responds and returns true when refused.
+ */
+async function refuseNewTopLevelFolder(res, eventId, name, excludeId = null) {
+  try {
+    await folderTree.assertFolderCapacity(eventId);
+    if (await folderTree.findSiblingByName(eventId, null, name, db, { excludeId })) throw folderTree.folderExistsError();
+    return false;
+  } catch (err) {
+    if (!(err instanceof folderTree.FolderError)) throw err;
+    sendFolderError(res, err);
+    return true;
+  }
+}
+
+/** A unique violation that is the sibling-name index losing a race → 409. */
+async function siblingRaceError(err, eventId, name, excludeId = null) {
+  if (isUniqueViolation(err) && eventId
+    && await folderTree.findSiblingByName(eventId, null, name, db, { excludeId })) {
+    return folderTree.folderExistsError();
+  }
+  return null;
+}
+
 async function refuseForeignCategoryEvent(req, res, eventId) {
   if (eventId === null || eventId === undefined) return false;
   const event = await db('events').where('id', eventId).first();
@@ -31,6 +74,21 @@ async function refuseForeignCategoryEvent(req, res, eventId) {
     return true;
   }
   return false;
+}
+
+/**
+ * A photo that may become this category's cover (GHSA-j2f4: it must belong to
+ * the category). For a folder that is any photo in the folder or below it.
+ */
+async function heroCandidate(category, photoId) {
+  if (parseBooleanInput(category.is_folder, false) && category.event_id) {
+    const ids = await folderTree.subtreeIds(category.event_id, category.id);
+    return livePhotos(db).where('id', photoId).whereIn('folder_id', ids)
+      .whereNull('moderation_status').first();
+  }
+  // A team upload still under review (issue 743) cannot be a hero yet.
+  return livePhotos(db).where({ id: photoId, category_id: category.id })
+    .whereNull('moderation_status').first();
 }
 
 // Get all global categories
@@ -79,8 +137,23 @@ router.post('/', adminAuth, requirePermission('settings.edit'), [
       return res.status(400).json({ errors: safeValidationErrors(errors) });
     }
     
-    const { name, slug, is_global = true, event_id = null, is_folder = false } = req.body;
-    if (!is_global && await refuseForeignCategoryEvent(req, res, event_id)) return;
+    const { slug, is_global = true, event_id = null, is_folder = false } = req.body;
+    let { name } = req.body;
+    // parseBooleanInput, like the other flags: the string "false" is truthy.
+    if (!parseBooleanInput(is_global, true) && await refuseForeignCategoryEvent(req, res, event_id)) return;
+    if (parseBooleanInput(is_folder, false)) {
+      // Folders belong to one gallery (issue 1160, option b); a global folder
+      // would restructure every gallery at once.
+      if (parseBooleanInput(is_global, true) || !event_id) {
+        return res.status(400).json({ error: 'Folders belong to one gallery; create them on the event' });
+      }
+      if (await refuseWithoutFolderPermission(req, res)) return;
+      // The same name rules as the folder tree (NFC, trimmed, no path
+      // characters), so the sibling check and the index see one spelling.
+      name = folderTree.normalizeSegment(name);
+      if (!name) return res.status(400).json({ error: 'Folder name is invalid' });
+      if (await refuseNewTopLevelFolder(res, event_id, name)) return;
+    }
     
     // Generate slug if not provided
     const categorySlug = slug || name
@@ -133,7 +206,10 @@ router.post('/', adminAuth, requirePermission('settings.edit'), [
       // STRINGS "false" and "0", and `!!'false'` is true — a form-encoded caller
       // asking for a filter would silently get a folder.
       is_folder: formatBoolean(parseBooleanInput(is_folder, false))
-    }).returning('id');
+    }).returning('id').catch(async (err) => {
+      const raced = parseBooleanInput(is_folder, false) && await siblingRaceError(err, event_id, name);
+      throw raced || err;
+    });
     
     const categoryId = insertResult[0]?.id || insertResult[0];
     
@@ -149,6 +225,7 @@ router.post('/', adminAuth, requirePermission('settings.edit'), [
     capabilityEvidence(res, 'category_editing');
     res.json(category);
   } catch (error) {
+    if (error instanceof folderTree.FolderError) return sendFolderError(res, error);
     logger.error('Error creating category:', error);
     res.status(500).json({ error: 'Failed to create category' });
   }
@@ -172,15 +249,49 @@ router.put('/:id', adminAuth, requirePermission('settings.edit'), [
     }
 
     const { id } = req.params;
-    const { name, hero_photo_id } = req.body;
+    const { hero_photo_id } = req.body;
+    let { name } = req.body;
 
     const category = await db('photo_categories').where('id', id).first();
     if (!category) {
       return res.status(404).json({ error: 'Category not found' });
     }
     if (await refuseForeignCategoryEvent(req, res, category.event_id)) return;
+    const wasFolder = parseBooleanInput(category.is_folder, false);
+    const togglesFolder = Object.prototype.hasOwnProperty.call(req.body, 'is_folder')
+      && parseBooleanInput(req.body.is_folder, false) !== wasFolder;
+    if ((wasFolder || togglesFolder) && await refuseWithoutFolderPermission(req, res)) return;
+    if (togglesFolder && !wasFolder && (parseBooleanInput(category.is_global, false) || !category.event_id)) {
+      return res.status(400).json({ error: 'Folders belong to one gallery; global categories cannot become folders' });
+    }
+    if (togglesFolder && wasFolder) {
+      const child = await db('photo_categories').where('parent_id', id).first('id');
+      if (child) {
+        return res.status(400).json({ error: 'Move or delete the subfolders first; a filter category cannot contain folders' });
+      }
+    }
+    // Filter → folder: it becomes a top-level folder under its (new) name,
+    // spelled by the folder tree's rules.
+    if (togglesFolder && !wasFolder) {
+      name = folderTree.normalizeSegment(name);
+      if (!name) return res.status(400).json({ error: 'Folder name is invalid' });
+      if (await refuseNewTopLevelFolder(res, category.event_id, name, category.id)) return;
+    }
 
-    const updateData = {
+    // A folder (issue 1786) renames through the tree service: sibling-name
+    // clash as 409, path-joined slug. The generic slug below would collide
+    // for "Activity A" under two different parents.
+    const staysFolder = wasFolder && !togglesFolder && category.event_id;
+    if (staysFolder && name !== category.name) {
+      try {
+        await folderTree.renameFolder(category.event_id, category.id, name);
+      } catch (err) {
+        if (err instanceof folderTree.FolderError) return res.status(err.status).json({ error: err.message, code: err.code });
+        throw err;
+      }
+    }
+
+    const updateData = staysFolder ? {} : {
       name,
       slug: name
         .normalize('NFD').replace(/[̀-ͯ]/g, '')
@@ -196,9 +307,7 @@ router.put('/:id', adminAuth, requirePermission('settings.edit'), [
     // update path previously wrote it with no membership check at all.
     if (Object.prototype.hasOwnProperty.call(req.body, 'hero_photo_id')) {
       if (hero_photo_id) {
-        const heroPhoto = await db('photos')
-          .where({ id: hero_photo_id, category_id: id })
-          .first();
+        const heroPhoto = await heroCandidate(category, hero_photo_id);
         if (!heroPhoto) {
           return res.status(404).json({ error: 'Photo not found in this category' });
         }
@@ -218,11 +327,34 @@ router.put('/:id', adminAuth, requirePermission('settings.edit'), [
       updateData.is_folder = formatBoolean(parseBooleanInput(req.body.is_folder, false));
     }
 
-    await db('photo_categories')
-      .where('id', id)
-      .update(updateData);
+    await db.transaction(async (trx) => {
+      if (Object.keys(updateData).length > 0) {
+        await trx('photo_categories')
+          .where('id', id)
+          .update(updateData);
+      }
+      // Since migration 265 a folder holds its photos in folder_id and a
+      // filter category in category_id, so the flip moves them across.
+      if (togglesFolder && !wasFolder) {
+        await trx('photos').where('category_id', id).update({ folder_id: Number(id), category_id: null });
+      } else if (togglesFolder && wasFolder) {
+        await trx('photos').where('folder_id', id).whereNull('category_id').update({ category_id: Number(id), folder_id: null });
+        await trx('photos').where('folder_id', id).update({ folder_id: null });
+        // A filter category is no tree node: without this the next upload of
+        // its old path collides on the source_path index and lands photos in
+        // a "folder" that is a filter category.
+        await trx('photo_categories').where('id', id).update({ parent_id: null, source_path: null });
+      }
+    }).catch(async (err) => {
+      const raced = togglesFolder && !wasFolder && await siblingRaceError(err, category.event_id, name, category.id);
+      throw raced || err;
+    });
 
     const updated = await db('photo_categories').where('id', id).first();
+    // Folder moves and download flags change what the guest ZIP may hold.
+    if (category.event_id && (togglesFolder || Object.prototype.hasOwnProperty.call(req.body, 'allow_downloads'))) {
+      require('../services/downloadZipService').invalidate(Number(category.event_id));
+    }
 
     // Log activity
     await logActivity('category_updated',
@@ -235,6 +367,7 @@ router.put('/:id', adminAuth, requirePermission('settings.edit'), [
       ['name', 'slug', 'hero_photo_id', 'allow_downloads', 'is_folder']);
     res.json(updated);
   } catch (error) {
+    if (error instanceof folderTree.FolderError) return sendFolderError(res, error);
     logger.error('Error updating category:', error);
     res.status(500).json({ error: 'Failed to update category' });
   }
@@ -267,9 +400,7 @@ router.put('/:id/hero', adminAuth, requirePermission('settings.edit'), [
     // category's hero at a photo from a different category or event
     // (GHSA-j2f4).
     if (hero_photo_id) {
-      const photo = await db('photos')
-        .where({ id: hero_photo_id, category_id: id })
-        .first();
+      const photo = await heroCandidate(category, hero_photo_id);
       if (!photo) {
         return res.status(404).json({ error: 'Photo not found in this category' });
       }
@@ -306,15 +437,29 @@ router.delete('/:id', adminAuth, requirePermission('settings.edit'), async (req,
       return res.status(404).json({ error: 'Category not found' });
     }
     if (await refuseForeignCategoryEvent(req, res, category.event_id)) return;
+
+    // A folder (issue 1786) is deleted without deleting anything in it: its
+    // photos and subfolders move up to its parent.
+    if (parseBooleanInput(category.is_folder, false) && category.event_id) {
+      if (await refuseWithoutFolderPermission(req, res)) return;
+      const moved = await folderTree.deleteFolder(category.event_id, category.id);
+      require('../services/downloadZipService').invalidate(Number(category.event_id));
+      await logActivity('folder_deleted', { name: category.name, movedPhotos: moved }, category.event_id,
+        { type: 'admin', id: req.admin.id, name: req.admin.username });
+      capabilityEvidence(res, 'category_editing');
+      return res.json({ message: 'Folder deleted successfully', moved_photos: moved });
+    }
     
     // Check if category has photos
-    const photoCount = await db('photos').where('category_id', id).count('id as count').first();
+    const photoCount = await livePhotos(db).where('category_id', id).count('id as count').first();
     if (photoCount.count > 0) {
       return res.status(400).json({ 
         error: 'Cannot delete category with photos. Please reassign photos first.' 
       });
     }
     
+    // Only photos in the trash are left in it: they come back uncategorised.
+    await db('photos').where('category_id', id).update({ category_id: null });
     await db('photo_categories').where('id', id).delete();
     
     // Log activity

@@ -10,6 +10,7 @@ import { PhotoLightbox } from './PhotoLightbox';
 import { Button, AuthenticatedImage } from '../common';
 import { galleryService } from '../../services/gallery.service';
 import { analyticsService } from '../../services/analytics.service';
+import { hasVideoItems, selectLabel } from '../../utils/mediaCounts';
 
 interface PhotoGridProps {
   photos: Photo[];
@@ -136,7 +137,7 @@ export const PhotoGrid: React.FC<PhotoGridProps> = ({
               title={t('gallery.selectPhotosHint')}
               className="text-xs sm:text-sm"
             >
-              {isSelectionMode ? t('gallery.cancelSelection') : t('gallery.selectPhotos')}
+              {isSelectionMode ? t('gallery.cancelSelection') : selectLabel(t, hasVideoItems(photos))}
             </Button>
             {!isSelectionMode && (
               <Button
@@ -246,6 +247,7 @@ const PhotoThumbnail: React.FC<PhotoThumbnailProps> = ({
   slug,
   feedbackEnabled = false
 }) => {
+  const { t } = useTranslation();
   const { ref, inView } = useInView({
     triggerOnce: true,
     threshold: 0.1,
@@ -268,13 +270,7 @@ const PhotoThumbnail: React.FC<PhotoThumbnailProps> = ({
             slug={slug}
             onProtectionViolation={(violationType) => {
               // Track analytics
-              if (typeof window !== 'undefined' && (window as any).umami) {
-                (window as any).umami.track('thumbnail_protection_violation', {
-                  photoId: photo.id,
-                  violationType,
-                  protectionLevel
-                });
-              }
+              analyticsService.track('thumbnail_protection_violation', { violationType, protectionLevel });
             }}
           />
           
@@ -289,7 +285,7 @@ const PhotoThumbnail: React.FC<PhotoThumbnailProps> = ({
               )}
               {(photo.average_rating ?? 0) > 0 && (
                 <div className="bg-white/90 backdrop-blur-sm rounded-full px-2 py-1 flex items-center gap-1" title={`Rating: ${Number(photo.average_rating ?? 0).toFixed(1)}`}>
-                  <Star className="w-3.5 h-3.5 text-yellow-500" fill="currentColor" />
+                  <Star className="w-3.5 h-3.5 text-rating" fill="currentColor" />
                   <span className="text-xs font-medium text-muted-theme">{Number(photo.average_rating ?? 0).toFixed(1)}</span>
                 </div>
               )}
@@ -300,7 +296,7 @@ const PhotoThumbnail: React.FC<PhotoThumbnailProps> = ({
               #1263: `md:opacity-0` hides the pixels but not the hit area, so
               on a narrow pointer-device window the buttons stayed tappable
               while invisible. pointer-events tracks opacity. */}
-          <div className="absolute inset-0 bg-black/40 opacity-100 pointer-events-auto md:opacity-0 md:pointer-events-none md:group-hover:opacity-100 md:group-hover:pointer-events-auto transition-opacity duration-200 rounded-lg flex items-center justify-center gap-2">
+          <div className="absolute inset-0 bg-black/40 opacity-100 pointer-events-auto md:opacity-0 md:pointer-events-none md:group-hover:opacity-100 md:group-hover:pointer-events-auto md:has-[:focus-visible]:opacity-100 md:has-[:focus-visible]:pointer-events-auto transition-opacity duration-200 rounded-lg flex items-center justify-center gap-2">
             {!isSelectionMode && (
               <>
                 <button
@@ -309,7 +305,7 @@ const PhotoThumbnail: React.FC<PhotoThumbnailProps> = ({
                     e.stopPropagation();
                     onClick(e);
                   }}
-                  aria-label="View full size"
+                  aria-label={t('gallery.tile.viewFullSize', 'View full size')}
                 >
                   <Maximize2 className="w-5 h-5 text-theme" />
                 </button>
@@ -322,7 +318,7 @@ const PhotoThumbnail: React.FC<PhotoThumbnailProps> = ({
                       e.stopPropagation();
                       onDownload(e);
                     }}
-                    aria-label="Download photo"
+                    aria-label={t('gallery.tile.downloadPhoto', 'Download photo')}
                   >
                     <Download className="w-5 h-5 text-theme" />
                   </button>
@@ -361,7 +357,7 @@ const PhotoThumbnail: React.FC<PhotoThumbnailProps> = ({
           </div>
         </>
       ) : (
-        <div className="skeleton aspect-square w-full" />
+        <div className="skeleton bg-border-token aspect-square w-full" />
       )}
     </div>
   );

@@ -51,7 +51,7 @@ const PreviewPhoto: React.FC<{
 }) => (
   <div className={`relative overflow-hidden rounded-lg bg-gradient-to-br from-neutral-200 to-neutral-300 ${aspectRatio} ${className}`}>
     <div className="absolute inset-0 flex items-center justify-center">
-      <Camera className="w-8 h-8 text-neutral-400" />
+      <Camera className="w-8 h-8 text-faint" />
     </div>
     <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/60 to-transparent p-2">
       <p className="text-white text-xs truncate">{photo.filename}</p>
@@ -184,7 +184,7 @@ export const GalleryPreview: React.FC<GalleryPreviewProps> = ({
           <div className="space-y-6">
             {['Today', 'Yesterday'].map((date, dateIdx) => (
               <div key={date}>
-                <h4 className="text-sm font-medium text-neutral-700 mb-2">{date}</h4>
+                <h4 className="text-sm font-medium text-body mb-2">{date}</h4>
                 <div className={`grid grid-cols-3 ${gapClass}`}>
                   {mockPhotos.slice(dateIdx * 3, (dateIdx * 3) + 3).map((photo) => (
                     <PreviewPhoto key={photo.id} photo={photo} />
@@ -207,14 +207,77 @@ export const GalleryPreview: React.FC<GalleryPreviewProps> = ({
           </div>
         );
       
+      // The full-page layouts open on a full-bleed hero photo with the event
+      // title over it and bring their own grid below.
+      case 'gallery-premium':
+        return (
+          <div className="space-y-3">
+            {renderFullPageHero()}
+            <div className={`columns-3 ${gapClass}`}>
+              {mockPhotos.slice(1, 7).map((photo, idx) => (
+                <div key={photo.id} className={`break-inside-avoid mb-${spacing === 'tight' ? '1' : spacing === 'relaxed' ? '4' : '2'}`}>
+                  <PreviewPhoto
+                    photo={photo}
+                    aspectRatio={idx % 3 === 0 ? 'aspect-[4/5]' : idx % 3 === 1 ? 'aspect-[4/3]' : 'aspect-square'}
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+
+      // Story: the hero, then one scene per category, alternating a grid with
+      // a featured first photo and a sideways carousel.
+      case 'gallery-story':
+        return (
+          <div className="space-y-4">
+            {renderFullPageHero()}
+            <div>
+              <h4 className="text-center text-sm font-medium mb-2" style={{ fontFamily: headingFont }}>
+                {mockPhotos[0].category_name}
+              </h4>
+              <div className={`grid grid-cols-3 ${gapClass}`}>
+                <PreviewPhoto photo={mockPhotos[0]} className="col-span-2 row-span-2" aspectRatio="aspect-auto h-full" />
+                <PreviewPhoto photo={mockPhotos[4]} />
+                <PreviewPhoto photo={mockPhotos[8]} />
+              </div>
+            </div>
+            <div>
+              <h4 className="text-center text-sm font-medium mb-2" style={{ fontFamily: headingFont }}>
+                {mockPhotos[1].category_name}
+              </h4>
+              <div className={`flex overflow-hidden ${gapClass}`}>
+                {[1, 5, 9].map((idx) => (
+                  <PreviewPhoto key={idx} photo={mockPhotos[idx]} className="w-2/5 shrink-0" aspectRatio="aspect-[3/4]" />
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+
       default:
         return null;
     }
   };
+
+  const headingFont = theme.headingFontFamily || theme.fontFamily || 'Inter, sans-serif';
+  const renderFullPageHero = () => (
+    <div className="relative">
+      <PreviewPhoto photo={mockPhotos[0]} aspectRatio="aspect-[16/7]" />
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+        <p
+          className="text-white text-lg font-semibold"
+          style={{ fontFamily: headingFont, textShadow: '0 2px 4px rgba(0, 0, 0, 0.3)' }}
+        >
+          Sample Event
+        </p>
+      </div>
+    </div>
+  );
   
   return (
     <div
-      className={`bg-white rounded-lg shadow-sm overflow-hidden ${className}`}
+      className={`bg-panel rounded-lg shadow-sm overflow-hidden ${className}`}
       style={{
         backgroundColor: theme.backgroundColor || '#ffffff',
         color: theme.textColor || '#171717',
@@ -291,8 +354,8 @@ export const GalleryPreview: React.FC<GalleryPreviewProps> = ({
                   className="h-8 w-auto object-contain"
                 />
               ) : (
-                <div className="h-8 w-8 rounded-full bg-neutral-200 flex items-center justify-center">
-                  <Camera className="w-4 h-4 text-neutral-500" />
+                <div className="h-8 w-8 rounded-full bg-fill flex items-center justify-center">
+                  <Camera className="w-4 h-4 text-muted" />
                 </div>
               )
             )}
@@ -300,7 +363,7 @@ export const GalleryPreview: React.FC<GalleryPreviewProps> = ({
               <div>
                 <p className="text-sm font-semibold leading-tight">{brandName}</p>
                 {brandTagline && (
-                  <p className="text-xs text-neutral-500 leading-tight">{brandTagline}</p>
+                  <p className="text-xs text-muted leading-tight">{brandTagline}</p>
                 )}
               </div>
             )}
@@ -334,13 +397,13 @@ export const GalleryPreview: React.FC<GalleryPreviewProps> = ({
       {/* (isNoHeader renders nothing here — goes straight to layout bar) */}
 
       {/* Layout info bar */}
-      <div className="px-4 py-1 border-b text-xs text-neutral-500 flex justify-between" style={{ borderColor: theme.primaryColor ? `${theme.primaryColor}20` : '#e5e7eb' }}>
+      <div className="px-4 py-1 border-b text-xs text-muted flex justify-between" style={{ borderColor: theme.primaryColor ? `${theme.primaryColor}20` : '#e5e7eb' }}>
         <span>Gallery preview</span>
         <span className="capitalize">{isHeroHeader ? `Hero + ${activeLayout}` : isMinimalHeader ? `Minimal + ${activeLayout}` : isNoHeader ? `No header + ${activeLayout}` : `${activeLayout} layout`}</span>
       </div>
 
       {/* Preview Content */}
-      <div className="p-4" style={{ maxHeight: '400px', overflowY: 'auto' }}>
+      <div className="p-4" style={{ maxHeight: '400px', overflowY: 'auto' }} data-testid="gallery-preview-content">
         {renderLayout()}
       </div>
     </div>

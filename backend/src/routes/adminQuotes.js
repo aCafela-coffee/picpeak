@@ -58,6 +58,7 @@ async function requireQuotesFlag(req, res, next) {
 
 router.use(adminAuth);
 router.use(requireQuotesFlag);
+router.use('/:id', require('../database/crmAccess').requireCrmDocument('quotes'));
 
 // ---------------------------------------------------------------------
 // Transforms (snake_case DB → camelCase API)
@@ -80,6 +81,16 @@ function parseSelectionChanges(raw) {
   }
 }
 
+function parseInstallmentsOverride(raw) {
+  if (!raw) return null;
+  try {
+    const value = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return Array.isArray(value) && value.length > 0 ? value : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function transformQuote(q) {
   if (!q) return null;
   return {
@@ -97,6 +108,9 @@ function transformQuote(q) {
       // Passive customers (admin-only, no portal access) flagged
       // by null password_hash. Hash itself is dropped here.
       isPassive: q.customer_password_hash == null,
+      // No administrative emails (migration 300): the send action becomes
+      // Issue — the document is issued (in the portal when the customer has access), no mail goes out.
+      noAdminEmails: q.customer_no_admin_emails === true || q.customer_no_admin_emails === 1,
     },
     status: q.status,
     // Migration 140 — cross-document lineage UUID. Lets the frontend
@@ -118,6 +132,9 @@ function transformQuote(q) {
     // Split payment-term picker (migration 124).
     paymentNetDaysTemplateId: q.payment_net_days_template_id || null,
     paymentTimingTemplateId: q.payment_timing_template_id || null,
+    // Migration 142 — the per-quote installment override, so the editor can
+    // show (and clear) the plan it saved; null = the timing template's.
+    installmentsOverride: parseInstallmentsOverride(q.payment_term_installments_override),
     netAmountMinor: q.net_amount_minor,
     vatRate: q.vat_rate == null ? null : Number(q.vat_rate),
     vatAmountMinor: q.vat_amount_minor,

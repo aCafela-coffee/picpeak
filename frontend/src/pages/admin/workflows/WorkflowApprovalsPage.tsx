@@ -8,9 +8,11 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { Check, X } from 'lucide-react';
-import { Button, Card, Loading } from '../../../components/common';
+import { Check, CheckSquare, X } from 'lucide-react';
+import { Button, Card, EmptyState, ErrorState, Loading } from '../../../components/common';
+import { SectionPageHeader } from '../../../components/admin/SectionPageHeader';
 import { workflowsService, type WorkflowApproval } from '../../../services/workflows.service';
+import { approvalEntityHref, approvalPrompt } from '../../../utils/workflowApprovals';
 import { useLocalizedDate } from '../../../hooks/useLocalizedDate';
 import { useMutationWithToast } from '../../../hooks';
 
@@ -19,7 +21,7 @@ export const WorkflowApprovalsPage: React.FC = () => {
   const navigate = useNavigate();
   const { formatDateTime } = useLocalizedDate();
 
-  const { data: approvals, isLoading } = useQuery({
+  const { data: approvals, isLoading, isError, isRefetching, refetch } = useQuery({
     queryKey: ['workflow-approvals'],
     queryFn: () => workflowsService.approvals(),
   });
@@ -31,35 +33,39 @@ export const WorkflowApprovalsPage: React.FC = () => {
     errorMessage: t('common.error', 'Something went wrong') as string,
   });
 
-  const promptOf = (a: WorkflowApproval) => (a.payload && (a.payload.prompt as string)) || t('workflows.approvals.defaultPrompt', 'A workflow needs your confirmation.');
-
-  // The admin detail route for the run's entity, so a row click opens the
-  // document they're being asked to approve. `invoice` lives under /bills.
-  const entityHref = (a: WorkflowApproval): string | null => {
-    if (!a.entity_type || a.entity_id == null) return null;
-    const base: Record<string, string> = {
-      quote: 'quotes', invoice: 'bills', event: 'events', contract: 'contracts', customer: 'customers',
-    };
-    const seg = base[a.entity_type];
-    return seg ? `/admin/${seg}/${a.entity_id}` : null;
-  };
+  const promptOf = (a: WorkflowApproval) => approvalPrompt(a) || t('workflows.approvals.defaultPrompt', 'A workflow needs your confirmation.');
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-xl font-semibold text-heading">{t('workflows.approvals.title', 'Approvals')}</h1>
-        <p className="text-sm text-soft">{t('workflows.approvals.subtitle', 'Workflow runs waiting on your confirmation.')}</p>
-      </div>
+      <SectionPageHeader
+        icon={CheckSquare}
+        title={t('workflows.approvals.title', 'Approvals')}
+        description={t('workflows.approvals.subtitle', 'Workflow runs waiting on your confirmation.')}
+        feature="workflows"
+        className=""
+      />
 
       <Card padding="none">
         {isLoading ? (
           <div className="p-10"><Loading /></div>
+        ) : isError && !approvals ? (
+          <ErrorState
+            size="inline"
+            title={t('workflows.approvals.loadFailed', 'Could not load the approvals')}
+            onRetry={() => refetch()}
+            retrying={isRefetching}
+          />
         ) : !approvals || approvals.length === 0 ? (
-          <div className="p-10 text-center text-muted">{t('workflows.approvals.empty', 'Nothing waiting for you right now.')}</div>
+          <EmptyState
+            size="inline"
+            icon={<CheckSquare />}
+            title={t('workflows.approvals.empty', 'Nothing waiting for you right now.')}
+            description={t('workflows.approvals.emptyHint', 'A workflow with a confirmation gate lists its paused runs here.')}
+          />
         ) : (
           <ul className="divide-y divide-line">
             {approvals.map((a) => {
-              const href = entityHref(a);
+              const href = approvalEntityHref(a);
               const meta = (
                 <>
                   <div className="text-sm text-heading">{promptOf(a)}</div>
@@ -76,7 +82,7 @@ export const WorkflowApprovalsPage: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => navigate(href)}
-                      className="min-w-0 flex-1 text-left rounded -mx-1 px-1 py-0.5 hover:bg-neutral-50 dark:hover:bg-neutral-800/60 transition-colors cursor-pointer"
+                      className="min-w-0 flex-1 text-left rounded -mx-1 px-1 py-0.5 hover:bg-hover-soft transition-colors cursor-pointer"
                       title={t('workflows.approvals.openEntity', 'Open {{type}} #{{id}}', { type: a.entity_type, id: a.entity_id }) as string}
                     >
                       {meta}

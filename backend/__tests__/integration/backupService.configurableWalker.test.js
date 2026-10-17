@@ -61,7 +61,7 @@ describe('backupService — configurable walker (backup_paths)', () => {
     })));
   });
 
-  it('migration 109 seeds the canonical 7 paths', async () => {
+  it('migration 109 seeds the canonical 10 paths', async () => {
     const rows = await db('backup_paths').orderBy('display_order', 'asc').select();
     expect(rows.map((r) => r.path)).toEqual([
       'events/active',
@@ -71,6 +71,9 @@ describe('backupService — configurable walker (backup_paths)', () => {
       'heroes',
       'uploads',
       'business-docs',
+      'videos',
+      'transfers',
+      'watermarks',
     ]);
     // Only events/archived is gated by a feature flag.
     expect(rows.filter((r) => r.feature_flag).map((r) => r.path)).toEqual([
@@ -248,8 +251,8 @@ describe('backupService — configurable walker (backup_paths)', () => {
         expect.arrayContaining(['thumbnails', 'events/archived'])
       );
 
-      const args = backupService.buildRsyncArgs(
-        { backup_rsync_host: 'backup.example.com', backup_rsync_path: '/srv/backups' },
+      const args = await backupService.buildRsyncArgs(
+        { backup_rsync_host: '8.8.8.8', backup_rsync_path: '/srv/backups' },
         excluded.map((r) => `/${r.path}/`)
       );
       const excludes = args
@@ -375,5 +378,119 @@ describe('backupService — configurable walker (backup_paths)', () => {
     const info = await backupService.getDatabaseBackupInfo();
     expect(typeof info.size).toBe('number');
     expect(info.size).toBe(421988);
+  });
+
+  // Issue 1780: a local destination inside a backed-up folder made every run
+  // copy the previous run's output, one nesting level deeper each time.
+  describe('the backup\'s own output', () => {
+    const inDestination = (rels, dir) => rels.filter((rel) => rel.startsWith(`${dir}${path.sep}`));
+
+    it('is not walked when the local destination lies inside a backed-up folder', async () => {
+      seedFile('uploads/logos/logo.png');
+      // What an earlier run left in the destination.
+      seedFile('uploads/own-backups/uploads/logos/logo.png');
+      seedFile('uploads/own-backups/database/dump.sql');
+      seedFile('uploads/own-backups/manifests/backup-1.json');
+
+      const files = await backupService.getFilesToBackup({
+        backup_destination_type: 'local',
+        backup_destination_path: path.join(storagePath, 'uploads', 'own-backups'),
+      });
+      const rels = files.map((f) => f.relativePath);
+
+      expect(rels).toContain(path.join('uploads', 'logos', 'logo.png'));
+      expect(inDestination(rels, path.join('uploads', 'own-backups'))).toEqual([]);
+    });
+
+    it('recognises the destination when it is configured through a symlink', async () => {
+      seedFile('uploads/linked-backups/uploads/logos/logo.png');
+      const link = path.join(path.dirname(storagePath), `backup-link-${process.pid}`);
+      fs.symlinkSync(path.join(storagePath, 'uploads', 'linked-backups'), link);
+      try {
+        const files = await backupService.getFilesToBackup({
+          backup_destination_type: 'local',
+          backup_destination_path: link,
+        });
+        expect(inDestination(files.map((f) => f.relativePath), path.join('uploads', 'linked-backups'))).toEqual([]);
+      } finally {
+        fs.unlinkSync(link);
+      }
+    });
+
+    it('recognises the destination when the same folder is mounted at a second path', async () => {
+      // Docker can show one host folder at two container paths, e.g. /backup
+      // and <storage>/uploads/mounted-backups. No symlink connects them, so
+      // only what the directory is on disk gives it away; the second mount
+      // is played here by answering stat for the outside path with the
+      // inside folder's.
+      seedFile('uploads/mounted-backups/uploads/logos/logo.png');
+      const inside = path.join(storagePath, 'uploads', 'mounted-backups');
+      const alias = path.join(path.dirname(storagePath), `backup-mount-${process.pid}`);
+      const realStat = fs.promises.stat.bind(fs.promises);
+      const stat = jest.spyOn(fs.promises, 'stat')
+        .mockImplementation((p, options) => realStat(p === alias ? inside : p, options));
+      try {
+        const files = await backupService.getFilesToBackup({
+          backup_destination_type: 'local',
+          backup_destination_path: alias,
+        });
+        expect(inDestination(files.map((f) => f.relativePath), path.join('uploads', 'mounted-backups'))).toEqual([]);
+        expect(await backupService.backedUpFolderAtDestination({
+          backup_destination_type: 'local',
+          backup_destination_path: alias,
+        })).toBeNull();
+      } finally {
+        stat.mockRestore();
+      }
+    });
+
+    it('skips a manifest folder inside a backed-up folder too', async () => {
+      seedFile('uploads/own-manifests/backup-1.json');
+
+      const files = await backupService.getFilesToBackup({
+        backup_destination_type: 'local',
+        backup_destination_path: path.join(path.dirname(storagePath), 'elsewhere'),
+        backup_manifest_path: path.join(storagePath, 'uploads', 'own-manifests'),
+      });
+
+      expect(inDestination(files.map((f) => f.relativePath), path.join('uploads', 'own-manifests'))).toEqual([]);
+    });
+
+    it('still walks a folder that only shares the destination\'s name', async () => {
+      seedFile('uploads/own-backups/earlier.bin');
+      seedFile('uploads/intake/own-backups/keep.bin');
+
+      const files = await backupService.getFilesToBackup({
+        backup_destination_type: 'local',
+        backup_destination_path: path.join(storagePath, 'uploads', 'own-backups'),
+      });
+
+      expect(files.map((f) => f.relativePath)).toContain(path.join('uploads', 'intake', 'own-backups', 'keep.bin'));
+    });
+
+    it('walks a leftover local path when the destination is not local', async () => {
+      // With S3 or rsync selected nothing is written there, so the folder is
+      // ordinary content and leaving it out would lose files.
+      seedFile('uploads/own-backups/earlier.bin');
+
+      for (const type of ['s3', 'rsync']) {
+        const files = await backupService.getFilesToBackup({
+          backup_destination_type: type,
+          backup_destination_path: path.join(storagePath, 'uploads', 'own-backups'),
+        });
+        expect(files.map((f) => f.relativePath)).toContain(path.join('uploads', 'own-backups', 'earlier.bin'));
+      }
+    });
+
+    it('leaves a destination outside the backed-up folders alone', async () => {
+      seedFile('uploads/logos/logo.png');
+
+      const files = await backupService.getFilesToBackup({
+        backup_destination_type: 'local',
+        backup_destination_path: path.join(storagePath, 'backups'),
+      });
+
+      expect(files.map((f) => f.relativePath)).toContain(path.join('uploads', 'logos', 'logo.png'));
+    });
   });
 });

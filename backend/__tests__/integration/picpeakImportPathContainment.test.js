@@ -10,6 +10,7 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret-at-least-32-char
 const fs = require('fs');
 const path = require('path');
 const { bootCrmDb, seedMinimal } = require('./helpers/crmDb');
+const { decodeSettingValue } = require('../helpers/settingValue');
 
 let db;
 let cleanup;
@@ -21,7 +22,7 @@ const photoId = 81002;
 
 async function getMarker() {
   const row = await db('app_settings').where({ setting_key: 'containment_marker' }).first();
-  return row ? JSON.parse(row.setting_value) : null;
+  return row ? decodeSettingValue(db, row.setting_value) : null;
 }
 async function setMarker(value) {
   await db('app_settings')
@@ -38,6 +39,10 @@ async function exportWith(poison) {
   await db('photos').where({ id: photoId }).update({ watermark_path: null, path: 'containment/individual/fixture.jpg' });
   return filePath;
 }
+
+// importFromPicpeak runs the coordinated portable restore, which needs a Linux
+// host (portableRestoreCapability); elsewhere it refuses before restoring.
+const linuxIt = process.platform === 'linux' ? it : it.skip;
 
 beforeAll(async () => {
   ({ db, cleanup } = await bootCrmDb());
@@ -56,7 +61,7 @@ afterAll(async () => {
 });
 
 describe('.picpeak import path containment', () => {
-  it('refuses an archive whose events.archive_path climbs out of storage, and restores nothing', async () => {
+  linuxIt('refuses an archive whose events.archive_path climbs out of storage, and restores nothing', async () => {
     await setMarker('in_backup');
     const archive = await exportWith(() => db('events').where({ id: eventId }).update({ archive_path: '../../../etc/passwd' }));
     await setMarker('current');
@@ -70,7 +75,7 @@ describe('.picpeak import path containment', () => {
     expect((await db('events').where({ id: eventId }).first()).archive_path).toBeNull();
   });
 
-  it('refuses an archive whose photos.watermark_path climbs out of storage, whichever separator it uses', async () => {
+  linuxIt('refuses an archive whose photos.watermark_path climbs out of storage, whichever separator it uses', async () => {
     await setMarker('in_backup');
     const archive = await exportWith(() => db('photos').where({ id: photoId }).update({ watermark_path: 'watermarks\\..\\..\\outside\\secret.bin' }));
     await setMarker('current');
@@ -83,7 +88,7 @@ describe('.picpeak import path containment', () => {
     expect(await getMarker()).toBe('current');
   });
 
-  it('restores an archive whose paths stay inside their roots', async () => {
+  linuxIt('restores an archive whose paths stay inside their roots', async () => {
     await setMarker('in_backup');
     const archive = await exportWith(() => db('events').where({ id: eventId }).update({ archive_path: 'events/archived/containment.zip' }));
     await setMarker('current');

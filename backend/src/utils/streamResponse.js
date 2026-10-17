@@ -18,6 +18,7 @@
  */
 
 const logger = require('./logger');
+const { isStorageUnavailableError, isStorageNotFoundError } = require('../services/storage/storageErrors');
 
 /**
  * @param {import('stream').Readable} stream  source, already opened or lazy
@@ -25,11 +26,22 @@ const logger = require('./logger');
  * @param {object}  [options]
  * @param {string}  [options.context]  what was being served, for the log line
  * @param {number}  [options.missingStatus=404]  status when the source is gone
+ * @param {(res: import('express').Response) => void} [options.onStorageUnavailable]
+ *        answers in place of the 500 when the stream fails, before any byte
+ *        is sent, because the storage backend could not be reached
  */
 function pipeStreamToResponse(stream, res, options = {}) {
-  const { context = 'file', missingStatus = 404 } = options;
+  const { context = 'file', missingStatus = 404, onStorageUnavailable } = options;
 
   stream.on('error', (err) => {
+    // The client is gone (or the stream was torn down because it left), or
+    // the response is already complete: there is nobody left to answer, and
+    // a 404/500 written now either goes nowhere or writes after end.
+    if (res.destroyed || res.writableEnded) {
+      logger.debug(`Stream for ${context} failed after the response was over: ${err && err.message}`);
+      return;
+    }
+
     const gone = err && (err.code === 'ENOENT' || err.code === 'EISDIR');
 
     // Once bytes are on the wire the status line is spent — there is no way to
@@ -70,9 +82,32 @@ function pipeStreamToResponse(stream, res, options = {}) {
       return;
     }
 
+    // S3 resolves get() once the response headers are in; a timeout or reset
+    // while the body is read arrives here, not in the caller's catch. A route
+    // with its own answer for an unreachable backend gets to give it.
+    if (onStorageUnavailable && isStorageUnavailableError(err)) {
+      logger.warn(`Storage unavailable while serving ${context}: ${err.message}`);
+      onStorageUnavailable(res);
+      return;
+    }
+
     logger.error(`Failed to stream ${context}`, { error: err.message, code: err.code });
     res.status(500).json({ error: 'Failed to serve file' });
   });
+
+  // The caller awaited storage.get() before handing the stream over. A client
+  // that left during that await has already emitted 'close', so the listener
+  // below would never fire and pipe() into a destroyed response just parks
+  // the source. For S3 that is an opened GetObject body holding a pooled
+  // socket until socketTimeout; under fast scrolling, enough of them drain
+  // the pool. An already-ended response has nowhere to put the bytes either.
+  // req.aborted covers an HTTP/1.1 pipelined request whose response was still
+  // queued behind another when the socket closed: Node never assigned it the
+  // socket, so it is neither destroyed nor ever sees 'close'.
+  if (res.destroyed || res.writableEnded || res.req?.aborted) {
+    stream.destroy();
+    return;
+  }
 
   // A client that navigates away mid-download leaves the source handle open
   // otherwise; on a gallery grid that is one leaked fd per abandoned tile.
@@ -83,4 +118,23 @@ function pipeStreamToResponse(stream, res, options = {}) {
   stream.pipe(res);
 }
 
-module.exports = { pipeStreamToResponse };
+/**
+ * A file stat() found and the read then did not (issues 2118, 2129): removed
+ * in between, by a replacement, a delete or a re-render. Answered as the
+ * failed stat would have been (`status`, 404 unless the route answers a
+ * missing file otherwise), not a 500. The headers staged for the file go
+ * first: Express keeps a Content-Type that is already set, and the cache
+ * lifetime staged for the file would keep the 404. False when the error is
+ * anything else, or the response has already started.
+ */
+function answerVanished(res, error, message, status = 404) {
+  if (res.headersSent || !isStorageNotFoundError(error)) return false;
+  for (const name of ['ETag', 'Content-Type', 'Content-Length', 'Content-Disposition', 'Content-Range', 'Accept-Ranges']) {
+    res.removeHeader(name);
+  }
+  res.set('Cache-Control', 'no-store');
+  res.status(status).json({ error: message });
+  return true;
+}
+
+module.exports = { pipeStreamToResponse, answerVanished };

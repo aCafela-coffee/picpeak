@@ -32,6 +32,7 @@ const bcrypt = require('bcrypt');
 
 const { bootCrmDb, seedMinimal, assignAdminRole } = require('../integration/helpers/crmDb');
 const userManagementService = require('../../src/services/userManagementService');
+const { decryptEmailData, isEncryptedEmailData } = require('../../src/utils/emailQueueEncryption');
 
 // The wordlist generateReadablePassword() used to produce:
 //   <Adjective><Noun><4 digits><1 special>, e.g. "SwiftEagle4821!"
@@ -70,7 +71,9 @@ describe('userManagementService.resetAdminPassword (GHSA-h4w8-57xq-53fx)', () =>
       .orderBy('id', 'desc')
       .first();
     expect(emailRow).toBeDefined();
-    const emailData = JSON.parse(emailRow.email_data);
+    const storedEmailData = JSON.parse(emailRow.email_data);
+    expect(isEncryptedEmailData(storedEmailData)).toBe(true);
+    const emailData = decryptEmailData(emailRow.email_type, storedEmailData, emailRow.recipient_email);
     const newPassword = emailData.new_password;
 
     // generateSecurePassword(16): fixed 16-char length, not the wordlist's
@@ -96,5 +99,24 @@ describe('userManagementService.resetAdminPassword (GHSA-h4w8-57xq-53fx)', () =>
 
     const after = await db('admin_users').where({ id: targetId }).first();
     expect(after.must_change_password === true || after.must_change_password === 1).toBe(true);
+  });
+
+  // A passkey signs in without the password, so one that survived a reset by
+  // somebody else would defeat it.
+  it('removes the passkeys of the reset account and nobody else\'s', async () => {
+    const now = new Date().toISOString();
+    const passkey = (adminId, n) => ({
+      admin_user_id: adminId, credential_id: `reset-${adminId}-${n}`, public_key: 'AQ', counter: 0, name: `k${n}`, created_at: now,
+    });
+    await db('admin_webauthn_credentials').insert([passkey(targetId, 1), passkey(targetId, 2), passkey(actorId, 1)]);
+
+    await userManagementService.resetAdminPassword(targetId, actorId);
+
+    expect(await db('admin_webauthn_credentials').where({ admin_user_id: targetId })).toHaveLength(0);
+    const kept = await db('admin_webauthn_credentials').select('admin_user_id', 'credential_id');
+    expect(kept).toEqual([{ admin_user_id: actorId, credential_id: `reset-${actorId}-1` }]);
+
+    const entry = await db('activity_logs').where({ activity_type: 'admin_password_reset' }).orderBy('id', 'desc').first();
+    expect(JSON.parse(entry.metadata)).toMatchObject({ userId: targetId, passkeysRemoved: 2 });
   });
 });

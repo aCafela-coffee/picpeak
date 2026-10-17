@@ -16,12 +16,16 @@ const fs = require('fs').promises;
 const fsSync = require('fs');
 const crypto = require('crypto');
 const multer = require('multer');
-const sharp = require('sharp');
+const sharp = require('../../services/isolatedSharp');
 const { body, query, validationResult } = require('express-validator');
 const { safeValidationErrors } = require('../../utils/routeHelpers');
 const { db, logActivity } = require('../../database/db');
+const { livePhotos } = require('../../utils/photoVisibility');
+const { parseBooleanInput } = require('../../utils/parsers');
 const { apiTokenAuth, requireApiScope } = require('../../middleware/apiTokenAuth');
 const { requireEventOwnership, scopeEventsQuery } = require('../../middleware/ownership');
+const { holdsForReview, adminUploadColumns } = require('../../services/uploadReviewService');
+const { claimPromotion } = require('../../services/watchFolderClaims');
 // GHSA-9697: migration 081 defines a token's effective permissions as the
 // INTERSECTION of the owner's role permissions and the token's scope flags.
 // requireApiScope only ever checked the scope half — so a token minted while
@@ -34,6 +38,7 @@ const { requirePermission } = require('../../middleware/permissions');
 const { buildShareLinkVariants } = require('../../services/shareLinkService');
 const {
   generateThumbnail,
+  extractCaptureDate,
   ensurePreviewImage,
   ensurePreviewImageAtWidth,
   normalizeTierWidth,
@@ -47,6 +52,11 @@ const { formatBoolean } = require('../../utils/dbCompat');
 const { isValidEventType } = require('../../services/eventTypeService');
 const { replacePhoto } = require('../../services/photoReplacementService');
 const { getMaxFileSizeBytes, DEFAULT_MAX_FILE_SIZE_MB } = require('../../services/uploadSettings');
+const { withPublicUpload } = require('../../middleware/publicUploadStream');
+const { createUploadFileGuard } = require('../../utils/uploadAdmissionType');
+const uploadQuota = require('../../services/publicUploadQuota');
+const { validateFileContent, normalizeUploadMimeType, ALLOWED_MEDIA_TYPES } = require('../../utils/fileSecurityUtils');
+const { validateUploadedFiles } = require('../../middleware/uploadValidation');
 const downloadZipService = require('../../services/downloadZipService');
 const { PhotoFilterBuilder } = require('../../utils/photoFilterBuilder');
 const { PhotoExportService } = require('../../services/photoExportService');
@@ -55,6 +65,7 @@ const feedbackService = require('../../services/feedbackService');
 const archiver = require('archiver');
 const { Readable } = require('stream');
 const { getStorage } = require('../../services/storage');
+const { isStorageNotFoundError } = require('../../services/storage/storageErrors');
 const { resolvePhotoStorageKey, resolvePhotoFilePath } = require('../../services/photoResolver');
 const { pickRawDownloadName } = require('../../services/downloadFilenameService');
 const { buildContentDisposition, sanitizeForZipEntry } = require('../../utils/filenameSanitizer');
@@ -71,52 +82,26 @@ const router = express.Router();
 // caller's own marks); the v1 surface exposes no export formats.
 const photoExportService = new PhotoExportService();
 
-const { getStoragePath } = require('../../config/storage');
-
 // ──────────────────────────────────────────────────────────────────────────
 // Multer for single-photo upload. Lean — no replace-by-name, no batching.
 // ──────────────────────────────────────────────────────────────────────────
-const photoStorage = multer.diskStorage({
-  destination: async (_req, _file, cb) => {
-    const tempDir = path.join(getStoragePath(), 'temp');
-    await fs.mkdir(tempDir, { recursive: true });
-    cb(null, tempDir);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `v1_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`);
-  }
-});
-const buildPhotoUpload = (maxFileSizeBytes) => multer({
-  storage: photoStorage,
-  // CVE-2026-82333: single unnamed `photo` field only — no legitimate
-  // array-indexed field names, so reject any bracket-index field name.
-  limits: { fileSize: maxFileSizeBytes, fieldArrayIndexLimit: 0 },
+const buildPhotoUpload = (maxFileSizeBytes, { storage, streamHandler, rejectBody }) => multer({
+  storage,
+  streamHandler,
+  defParamCharset: 'utf8', // multer's latin1 default turns UTF-8 names into mojibake
+  // Only category_id and replaces_photo_id are consumed by this endpoint.
+  limits: { fileSize: maxFileSizeBytes, files: 1, fields: 2, fieldSize: 1024,
+    parts: 3, headerPairs: 2000, fieldArrayIndexLimit: 0 },
   fileFilter: (_req, file, cb) => {
+    // Preserve v1's image-only contract; unlike the UI it accepts image types
+    // understood by its processing path without the UI's extension allow-list.
     if (/^image\//.test(file.mimetype)) cb(null, true);
-    else cb(new Error('Only image uploads are accepted on this endpoint'));
-  }
-}).single('photo');
-
-// The per-file cap was hardcoded to 100MB here, so general_max_file_size_mb
-// (Settings → General) didn't apply to the v1 upload either. Resolve it per
-// request — the admin can change it at runtime — and turn multer's generic
-// "File too large" into a 400 that names the configured limit.
-const photoUpload = async (req, res, next) => {
-  let maxFileSizeBytes;
-  try {
-    maxFileSizeBytes = await getMaxFileSizeBytes();
-  } catch {
-    maxFileSizeBytes = DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024;
-  }
-  buildPhotoUpload(maxFileSizeBytes)(req, res, (err) => {
-    if (err && err.code === 'LIMIT_FILE_SIZE') {
-      const limitMb = Math.floor(maxFileSizeBytes / (1024 * 1024));
-      return res.status(400).json({ error: `File too large. Maximum size is ${limitMb} MB per file.` });
+    else {
+      const error = new Error('Only image uploads are accepted on this endpoint');
+      rejectBody(error); cb(error);
     }
-    next(err);
-  });
-};
+  },
+}).single('photo');
 
 // slugify now imported from ../../utils/slug — shared with adminEvents
 // and events.js so the diacritic fix from #502 lands here too (#525).
@@ -417,7 +402,10 @@ router.get('/events/:id', apiTokenAuth, requireApiScope('read'), requirePermissi
  *                   Optional. If provided, the photo is filed under the
  *                   given photo_categories.id (must belong to the event
  *                   or be a global category). If omitted, the photo
- *                   lands uncategorized.
+ *                   lands uncategorized. Since nested folders (migration 265) a folder's id here
+ *                   places the photo in that folder (its `folder_id`)
+ *                   rather than setting `category_id`, which holds filter
+ *                   categories only.
  *     responses:
  *       201:
  *         description: Photo uploaded
@@ -441,195 +429,314 @@ router.post(
   requireApiScope('write'),
   requirePermission('photos.upload'),
   requireEventOwnership,
-  photoUpload,
   async (req, res) => {
-    let tempPath = null;
-    try {
-      if (!req.file) return res.status(400).json({ error: 'No file uploaded under field "photo"' });
-      tempPath = req.file.path;
+    const eventId = Number(req.params.id);
+    if (!/^\d+$/.test(req.params.id) || !Number.isSafeInteger(eventId) || eventId < 1) {
+      if (!req.readableEnded) res.set('Connection', 'close');
+      return res.status(404).json({ error: 'Event not found' });
+    }
+    req.params.id = String(eventId);
+    let maxFileSizeBytes;
+    try { maxFileSizeBytes = await getMaxFileSizeBytes(); }
+    catch { maxFileSizeBytes = DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024; }
+    await withPublicUpload(req, res, {
+      eventId, mode: 'admin', accountId: req.admin.id, maxFiles: 1, maxFileBytes: maxFileSizeBytes, fileField: 'photo',
+      fileExtension: file => {
+        const extension = path.extname(file.originalname).toLowerCase();
+        return /^\.[a-z0-9]{1,10}$/i.test(extension) ? extension : '';
+      },
+      fileGuard: file => createUploadFileGuard(file, maxFileSizeBytes, maxFileSizeBytes),
+      formatError: err => ({ status: 400, body: { error: err.code === 'LIMIT_FILE_SIZE'
+        ? `File too large. Maximum size is ${Math.floor(maxFileSizeBytes / (1024 * 1024))} MB per file.`
+        : err instanceof multer.MulterError ? `Upload error: ${err.message}` : 'Only image uploads are accepted on this endpoint' } }),
+    }, options => buildPhotoUpload(maxFileSizeBytes, options),
+    async (_session, reply) => handleV1PhotoUpload(req, reply));
+  }
+);
 
-      const event = await db('events').where({ id: req.params.id }).first();
-      if (!event) {
+// Whether Sharp reads the file as an image with dimensions. A busy image
+// worker says nothing about the file, so it passes; a resource limit is
+// thrown like the metadata read further down throws it.
+async function readsAsImage(filePath) {
+  try {
+    const meta = await sharp(filePath).metadata();
+    return Boolean(meta && meta.width && meta.height);
+  } catch (error) {
+    const policy = require('../../services/imageResourcePolicy');
+    if (policy.isTransient(error)) return true;
+    if (policy.isResourceError(error)) throw error;
+    return false;
+  }
+}
+
+async function handleV1PhotoUpload(req, res) {
+  let tempPath = null;
+  let object;
+  let promotionSettled = false;
+  let storage;
+  let releaseClaim = null;
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded under field "photo"' });
+    tempPath = req.file.path;
+
+    // The same content check the admin multipart upload applies: the bytes
+    // must match the declared type, and an image must decode. The declared
+    // image/* type says nothing about the file. v1 takes any image/* type
+    // (TIFF, AVIF, ...); one the signature table does not know has to be an
+    // image Sharp can read instead.
+    const declaredType = normalizeUploadMimeType(req.file.originalname, req.file.mimetype);
+    const contentMatches = ALLOWED_MEDIA_TYPES[declaredType]
+      ? await validateFileContent(tempPath, declaredType)
+      : await readsAsImage(tempPath);
+    if (!contentMatches) {
+      await fs.unlink(tempPath).catch(() => {});
+      return res.status(400).json({ error: `File content does not match declared type: ${req.file.originalname}` });
+    }
+    const checked = {
+      files: [{ originalname: req.file.originalname, path: tempPath, mimetype: declaredType }],
+      publicUploadReservation: req.publicUploadReservation,
+    };
+    await validateUploadedFiles(checked, res, () => {});
+    if (checked.files.length === 0) {
+      await fs.unlink(tempPath).catch(() => {});
+      return res.status(400).json({ error: `Invalid image file: ${req.file.originalname}` });
+    }
+
+    const event = await db('events').where({ id: req.params.id }).first();
+    if (!event) {
+      await fs.unlink(tempPath).catch(() => {});
+      return res.status(404).json({ error: 'Event not found' });
+    }
+
+    // Optional category assignment, mirroring the admin upload route
+    // (adminPhotos.js). Multipart form field `category_id`. If the
+    // category looks up to a "collage" slug, the photo's `type` flips
+    // accordingly so existing collage-aware UI paths still work.
+    const rawCategoryId = req.body?.category_id;
+    const parsedCategoryId = rawCategoryId ? parseInt(rawCategoryId, 10) : NaN;
+    let categoryId = null;
+    let folderId = null;
+    let photoType = 'individual';
+    if (!Number.isNaN(parsedCategoryId)) {
+      // Scope to categories owned by this event (event_id = event.id) or
+      // marked global (is_global = true) — see migration
+      // backend/migrations/legacy/004_add_categories_and_cms.js. An API
+      // token inherits its owning admin's powers (no per-event scoping
+      // in apiTokenAuth), so accepting any category_id would silently
+      // mis-file uploads under a category belonging to a different event.
+      const category = await db('photo_categories')
+        .where({ id: parsedCategoryId })
+        .andWhere(function () {
+          this.where({ event_id: event.id }).orWhere('is_global', true);
+        })
+        .first();
+      if (!category) {
+        // The staged file is on disk by now and the temp sweeper ignores v1_*
+        // files, so an early exit without this leaks it for good
+        // (Codex security audit 2026-09-30).
         await fs.unlink(tempPath).catch(() => {});
-        return res.status(404).json({ error: 'Event not found' });
-      }
-
-      // Optional category assignment, mirroring the admin upload route
-      // (adminPhotos.js). Multipart form field `category_id`. If the
-      // category looks up to a "collage" slug, the photo's `type` flips
-      // accordingly so existing collage-aware UI paths still work.
-      const rawCategoryId = req.body?.category_id;
-      const parsedCategoryId = rawCategoryId ? parseInt(rawCategoryId, 10) : NaN;
-      let categoryId = null;
-      let photoType = 'individual';
-      if (!Number.isNaN(parsedCategoryId)) {
-        // Scope to categories owned by this event (event_id = event.id) or
-        // marked global (is_global = true) — see migration
-        // backend/migrations/legacy/004_add_categories_and_cms.js. An API
-        // token inherits its owning admin's powers (no per-event scoping
-        // in apiTokenAuth), so accepting any category_id would silently
-        // mis-file uploads under a category belonging to a different event.
-        const category = await db('photo_categories')
-          .where({ id: parsedCategoryId })
-          .andWhere(function () {
-            this.where({ event_id: event.id }).orWhere('is_global', true);
-          })
-          .first();
-        if (!category) {
-          // The staged file is on disk by now and the temp sweeper ignores v1_*
-          // files, so an early exit without this leaks it for good
-          // (Codex security audit 2026-09-30).
-          await fs.unlink(tempPath).catch(() => {});
-          return res.status(400).json({
-            error: `Unknown or out-of-scope category_id ${parsedCategoryId}`,
-          });
-        }
-        categoryId = category.id;
-        if (category.slug === 'collage' || category.slug === 'collages') {
-          photoType = 'collage';
-        }
-      }
-
-      // Replacement (#745). The Lightroom plugin stores the picpeak photo id
-      // on the catalogue photo, so the id rides along even after the editor
-      // renames the render — which makes the id, not the filename, the
-      // reliable key for putting a finished edit back over its proof.
-      //
-      // Scoped to this event on purpose: a token inherits its owner's powers
-      // across every event they can see, so an id from another gallery would
-      // otherwise overwrite a photo the caller never named in the URL.
-      const rawReplacesId = req.body?.replaces_photo_id;
-      if (rawReplacesId !== undefined && rawReplacesId !== null && rawReplacesId !== '') {
-        const replacesId = parseInt(rawReplacesId, 10);
-        if (Number.isNaN(replacesId)) {
-          // Cleanup is in this route's catch block, so an early return has to
-          // drop the multer temp file itself or it leaks.
-          await fs.unlink(tempPath).catch(() => {});
-          tempPath = null;
-          return res.status(400).json({ error: 'replaces_photo_id must be an integer' });
-        }
-        const target = await db('photos')
-          .where({ id: replacesId, event_id: event.id })
-          .first();
-        if (!target) {
-          await fs.unlink(tempPath).catch(() => {});
-          tempPath = null;
-          return res.status(404).json({
-            error: `No photo ${replacesId} in event ${event.id}`,
-          });
-        }
-
-        const result = await replacePhoto(target, tempPath, {
-          originalFilename: req.file.originalname,
-          mimeType: req.file.mimetype,
-          event,
+        return res.status(400).json({
+          error: `Unknown or out-of-scope category_id ${parsedCategoryId}`,
         });
+      }
+      categoryId = category.id;
+      if (category.slug === 'collage' || category.slug === 'collages') {
+        photoType = 'collage';
+      }
+      // A folder (issue 1786) lives in folder_id since migration 265.
+      if (parseBooleanInput(category.is_folder, false)) folderId = category.id;
+    }
+
+    // Replacement (#745). The Lightroom plugin stores the picpeak photo id
+    // on the catalogue photo, so the id rides along even after the editor
+    // renames the render — which makes the id, not the filename, the
+    // reliable key for putting a finished edit back over its proof.
+    //
+    // Scoped to this event on purpose: a token inherits its owner's powers
+    // across every event they can see, so an id from another gallery would
+    // otherwise overwrite a photo the caller never named in the URL.
+    const rawReplacesId = req.body?.replaces_photo_id;
+    if (rawReplacesId !== undefined && rawReplacesId !== null && rawReplacesId !== '') {
+      // Held team uploads cannot replace a published photo (issue 743).
+      if (await holdsForReview(req.admin, event)) {
+        await fs.unlink(tempPath).catch(() => {});
+        tempPath = null;
+        return res.status(403).json({
+          error: 'Uploads to this event wait for the owner\'s review; replacing a photo is not available',
+          code: 'UPLOAD_REVIEW_REQUIRED',
+        });
+      }
+      const replacesId = parseInt(rawReplacesId, 10);
+      if (Number.isNaN(replacesId)) {
+        // Cleanup is in this route's catch block, so an early return has to
+        // drop the multer temp file itself or it leaks.
+        await fs.unlink(tempPath).catch(() => {});
+        tempPath = null;
+        return res.status(400).json({ error: 'replaces_photo_id must be an integer' });
+      }
+      const target = await livePhotos(db)
+        .where({ id: replacesId, event_id: event.id })
+        .first();
+      if (!target) {
+        await fs.unlink(tempPath).catch(() => {});
+        tempPath = null;
+        return res.status(404).json({
+          error: `No photo ${replacesId} in event ${event.id}`,
+        });
+      }
+
+      const result = await replacePhoto(target, tempPath, {
+        originalFilename: req.file.originalname,
+        mimeType: req.file.mimetype,
+        event,
+        uploadReservation: req.publicUploadReservation,
+      });
         // replacePhoto unlinks the temp file on success. Unlink again anyway:
         // a FAILED replacement returns before doing so, and this route only
         // cleans up in its catch block, so the failure path would otherwise
         // strand the upload. Already-gone is not an error here.
-        await fs.unlink(tempPath).catch(() => {});
-        tempPath = null;
-        if (!result.success) {
-          return res.status(500).json({ error: `Replacement failed: ${result.error}` });
-        }
-
-        // Guests are served a cached ZIP of the whole gallery. Without this
-        // they keep downloading the pre-edit photo indefinitely, which
-        // defeats the point of putting the edit back. adminPhotos.js does the
-        // same after its replacements.
-        downloadZipService.invalidate(event.id);
-
-        // event.id, not null: the dashboard feed excludes NULL-event rows for
-        // scoped callers (GHSA-jhcf), so a system-level entry would vanish
-        // from the audit trail of the photographer who owns the event.
-        await logActivity('photo_replaced', {
-          photoId: result.photo.id,
-          originalFilename: req.file.originalname,
-          previousFilename: result.previousFilename,
-          eventName: event.event_name,
-          via: 'v1_api',
-        }, event.id, { type: 'admin', id: req.admin.id, name: req.admin.username });
-
-        return res.status(200).json({
-          replaced: true,
-          photo: {
-            id: result.photo.id,
-            filename: result.photo.filename,
-            original_filename: result.photo.original_filename,
-            source_filename: result.photo.source_filename,
-            previous_filename: result.previousFilename,
-            size_bytes: result.photo.size_bytes,
-            width: result.photo.width,
-            height: result.photo.height,
-          },
-        });
-      }
-
-      const ext = path.extname(req.file.originalname);
-      const finalName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
-      // photo.path is stored relative to events/active so resolvePhotoStorageKey
-      // can rebuild the full key on read. Same shape as adminPhotos uploads.
-      const relPath = path.posix.join(event.slug, finalName);
-      const finalKey = path.posix.join('events/active', relPath);
-
-      const stat = fsSync.statSync(tempPath);
-
-      // Read sharp metadata + generate thumbnail FROM the local temp file
-      // before uploading the original through the storage backend. (Same
-      // ordering as adminPhotos.js so sharp/ffmpeg always have a real fs path.)
-      let width = null;
-      let height = null;
-      try {
-        const meta = await sharp(tempPath).metadata();
-        // Oriented, not raw — see imageProcessor.orientedDimensions (#1185).
-        ({ width, height } = require('../../services/imageProcessor').orientedDimensions(meta));
-      } catch { /* non-fatal */ }
-
-      // Credit from EXIF (#1561), read before the temp file is moved away.
-      const credit = await require('../../services/photoCredit').resolveCredit({ localPath: tempPath });
-
-      let thumbRel = null;
-      try {
-        thumbRel = await generateThumbnail(tempPath);
-      } catch (err) {
-        logger.warn('v1 thumbnail generation failed', { err: err.message });
-      }
-
-      // Upload the original via the storage backend (local fs OR S3),
-      // then drop the multer temp file.
-      const { getStorage } = require('../../services/storage');
-      await getStorage().putFromFile(finalKey, tempPath, { contentType: req.file.mimetype });
       await fs.unlink(tempPath).catch(() => {});
       tempPath = null;
+      if (!result.success) {
+        return res.status(500).json({ error: `Replacement failed: ${result.error}` });
+      }
 
-      const insertResult = await db('photos').insert({
-        event_id: event.id,
-        filename: finalName,
-        original_filename: req.file.originalname,
-        // The camera-original name, kept separate so a later replace can
-        // overwrite original_filename without losing the round-trip's match
-        // key (migration 193, #745).
-        source_filename: req.file.originalname,
-        path: relPath,
-        thumbnail_path: thumbRel,
-        type: photoType,
-        category_id: categoryId,
-        size_bytes: stat.size,
-        width,
-        height,
-        media_type: 'image',
-        mime_type: req.file.mimetype,
-        uploaded_at: new Date().toISOString(),
-        uploaded_by: 'admin',
-        ...credit
-      }).returning('id');
-      const id = insertResult[0]?.id || insertResult[0];
+      // Guests are served a cached ZIP of the whole gallery. Without this
+      // they keep downloading the pre-edit photo indefinitely, which
+      // defeats the point of putting the edit back. adminPhotos.js does the
+      // same after its replacements.
+      downloadZipService.invalidate(event.id);
 
-      await logActivity('photo_uploaded', { via: 'api_v1', filename: finalName }, event.id, {
-        type: 'admin', id: req.admin.id, name: req.admin.username
+      // event.id, not null: the dashboard feed excludes NULL-event rows for
+      // scoped callers (GHSA-jhcf), so a system-level entry would vanish
+      // from the audit trail of the photographer who owns the event.
+      await logActivity('photo_replaced', {
+        photoId: result.photo.id,
+        originalFilename: req.file.originalname,
+        previousFilename: result.previousFilename,
+        eventName: event.event_name,
+        via: 'v1_api',
+      }, event.id, { type: 'admin', id: req.admin.id, name: req.admin.username });
+
+      return res.status(200).json({
+        replaced: true,
+        photo: {
+          id: result.photo.id,
+          filename: result.photo.filename,
+          original_filename: result.photo.original_filename,
+          source_filename: result.photo.source_filename,
+          previous_filename: result.previousFilename,
+          size_bytes: result.photo.size_bytes,
+          width: result.photo.width,
+          height: result.photo.height,
+        },
       });
+    }
 
+    const ext = path.extname(req.file.originalname);
+    const finalName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+    // photo.path is stored relative to events/active so resolvePhotoStorageKey
+    // can rebuild the full key on read. Same shape as adminPhotos uploads.
+    const relPath = path.posix.join(event.slug, finalName);
+    const finalKey = path.posix.join('events/active', relPath);
+
+    const stat = fsSync.statSync(tempPath);
+
+    // Read sharp metadata + generate thumbnail FROM the local temp file
+    // before uploading the original through the storage backend. (Same
+    // ordering as adminPhotos.js so sharp/ffmpeg always have a real fs path.)
+    let width = null;
+    let height = null;
+    try {
+      const meta = await sharp(tempPath).metadata();
+      // Oriented, not raw — see imageProcessor.orientedDimensions (#1185).
+      ({ width, height } = require('../../services/imageProcessor').orientedDimensions(meta));
+    } catch (error) {
+      if (require('../../services/imageResourcePolicy').isResourceError(error)) throw error;
+    }
+
+    // Credit from EXIF (#1561), read before the temp file is moved away.
+    const credit = await require('../../services/photoCredit').resolveCredit({ localPath: tempPath });
+    // Camera details (issue 1733, D1), from the same temp file.
+    const exif = await require('../../services/photoExif').exifColumn(tempPath);
+    // Capture date, for the same reason: the worker never runs for this row.
+    const capturedAt = await extractCaptureDate(tempPath);
+
+    let thumbRel = null;
+    const thumbMeta = {};
+    try {
+      thumbRel = await generateThumbnail(tempPath, { meta: thumbMeta });
+    } catch (err) {
+      if (require('../../services/imageResourcePolicy').isResourceError(err)) throw err;
+      logger.warn('v1 thumbnail generation failed', { err: err.message });
+    }
+
+    // Content hash (issue 1733, C2), stored for the admin uploader's
+    // duplicate check; this route itself refuses nothing.
+    const contentSha256 = await require('../../services/photoDuplicates').sha256File(tempPath);
+
+    // Upload the original via the storage backend (local fs OR S3),
+    // then drop the multer temp file.
+    storage = getStorage();
+    object = await uploadQuota.prepareObject(req.publicUploadReservation, finalKey, stat.size);
+    // Held until the row exists, so the file watcher does not import the
+    // file first (issue 1970).
+    releaseClaim = claimPromotion(finalKey);
+    await storage.putFromFile(finalKey, tempPath, { contentType: req.file.mimetype });
+    promotionSettled = true;
+    const promoted = await storage.stat(finalKey);
+    if (!promoted || promoted.size !== stat.size) throw new Error('Size mismatch after upload');
+    await fs.unlink(tempPath).catch(() => {});
+    tempPath = null;
+
+    const uploadColumns = await adminUploadColumns(req.admin, event);
+    const photoData = {
+      event_id: event.id,
+      filename: finalName,
+      original_filename: req.file.originalname,
+      // The camera-original name, kept separate so a later replace can
+      // overwrite original_filename without losing the round-trip's match
+      // key (migration 193, #745).
+      source_filename: req.file.originalname,
+      path: relPath,
+      thumbnail_path: thumbRel,
+      thumb_hash: thumbMeta.thumbHash || null,
+      type: photoType,
+      category_id: folderId ? null : categoryId,
+      folder_id: folderId,
+      size_bytes: stat.size,
+      content_sha256: contentSha256,
+      captured_at: capturedAt ? capturedAt.toISOString() : null,
+      width,
+      height,
+      media_type: 'image',
+      mime_type: req.file.mimetype,
+      uploaded_at: new Date().toISOString(),
+      uploaded_by: 'admin',
+      // Retain uploader identity and held-review visibility with the quota commit.
+      ...uploadColumns,
+      ...credit,
+      ...exif
+    };
+    const id = await uploadQuota.commitObject(object, 'photo', async conn => {
+      const insertResult = await conn('photos').insert(photoData).returning('id');
+      return insertResult[0]?.id || insertResult[0];
+    });
+    releaseClaim();
+
+    // Scene tagging (issue 1733): this route writes a finished row itself.
+    try {
+      await require('../../services/tagSettings').enqueueFinishedPhotos(event.id, [id]);
+    } catch (e) {
+      logger.warn(`v1 upload: tag enqueue failed for photo ${id}`, { error: e.message });
+    }
+
+    await logActivity('photo_uploaded', { via: 'api_v1', filename: finalName }, event.id, {
+      type: 'admin', id: req.admin.id, name: req.admin.username
+    });
+
+    // Held uploads fire only on approval (issue 743).
+    if (!uploadColumns.moderation_status) {
       // Webhook (#327): one event per uploaded photo so receivers get a
       // 1:1 stream they can react to.
       try {
@@ -639,22 +746,30 @@ router.post(
           photo: { id, filename: finalName, original_filename: req.file.originalname, size_bytes: stat.size, width, height },
         });
       } catch (e) { /* non-fatal */ }
-
-      res.status(201).json({
-        id,
-        filename: finalName,
-        path: relPath,
-        thumbnail_path: thumbRel,
-        size_bytes: stat.size,
-        category_id: categoryId
-      });
-    } catch (error) {
-      logger.error('v1 POST /events/:id/photos failed', { error: error.message });
-      if (tempPath) await fs.unlink(tempPath).catch(() => {});
-      res.status(500).json({ error: 'Failed to upload photo' });
     }
+
+    res.status(201).json({
+      id,
+      filename: finalName,
+      path: relPath,
+      thumbnail_path: thumbRel,
+      size_bytes: stat.size,
+      category_id: categoryId
+    });
+  } catch (error) {
+    if (object) {
+      try { await uploadQuota.failedObject(object, { storage, settled: promotionSettled }); }
+      catch (cleanupError) {
+        logger.warn('v1 object cleanup failed; charge retained', { objectId: object.id, error: cleanupError.message });
+      }
+    }
+    logger.error('v1 POST /events/:id/photos failed', { error: error.message });
+    if (tempPath) await fs.unlink(tempPath).catch(() => {});
+    res.status(500).json({ error: 'Failed to upload photo' });
+  } finally {
+    releaseClaim?.();
   }
-);
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // GET /events/:id/share-link — full URL for sending to guests
@@ -887,7 +1002,7 @@ router.get(
       // not filter. Filter to a page of ids first, then enrich just those —
       // which also keeps the per-colour tally query bounded by page size.
       const filterBuilder = new PhotoFilterBuilder(
-        db('photos').select('photos.id'),
+        livePhotos(db).select('photos.id'),
         eventId,
         identityMode
       );
@@ -918,8 +1033,8 @@ router.get(
       // the scoping is local to the query rather than inherited from two
       // statements above.
       const mediaRows = pageIds.length
-        ? await db('photos').where('event_id', eventId).whereIn('id', pageIds)
-          .select('id', 'media_type', 'mime_type', 'processing_status')
+        ? await livePhotos(db).where('event_id', eventId).whereIn('id', pageIds)
+          .select('id', 'media_type', 'mime_type', 'processing_status', 'moderation_status')
         : [];
       const mediaById = new Map(mediaRows.map((r) => [r.id, r]));
 
@@ -938,7 +1053,12 @@ router.get(
             // external-media ingest never set original_filename, so for NAS
             // and auto-import galleries the camera name lives only there.
             source_filename: photo.source_filename || photo.original_filename || photo.filename || null,
+            // Filter category only. Since migration 265 a photo's folder is
+            // its own field; for photos that were in a folder before the
+            // upgrade, `category` went from the folder's name to null and
+            // the name moved to `folder` (issue 1786).
             category: photo.category_name || null,
+            folder: photo.folder_name || null,
             average_rating: photo.average_rating ? parseFloat(photo.average_rating) : 0,
             feedback_count: photo.feedback_count || 0,
             like_count: photo.like_count || 0,
@@ -962,6 +1082,9 @@ router.get(
             // 'complete' unless the async worker is still on it. The preview
             // and download routes answer 503/422 for the other states.
             processing_status: mediaById.get(photo.id)?.processing_status ?? null,
+            // A team upload waiting for review, or rejected (issue 743): not
+            // shown to any gallery viewer until approved.
+            moderation_status: mediaById.get(photo.id)?.moderation_status ?? null,
             uploaded_at: photo.uploaded_at || null
           };
         }),
@@ -1404,7 +1527,7 @@ router.get(
         if (ids.length > MAX_ZIP_IDS) {
           return res.status(400).json({ error: `At most ${MAX_ZIP_IDS} ids per request`, code: 'TOO_MANY_PHOTO_IDS' });
         }
-        const owned = await db('photos').where('event_id', event.id).whereIn('id', ids).count('id as count').first();
+        const owned = await livePhotos(db).where('event_id', event.id).whereIn('id', ids).count('id as count').first();
         if (Number(owned?.count || 0) !== ids.length) {
           // Deliberately not naming the offenders: an id that isn't in this
           // event is either a typo or someone else's photo.
@@ -1416,7 +1539,7 @@ router.get(
       const { identity_mode: identityMode } =
         await feedbackService.getEventFeedbackSettings(event.id);
       const selection = () => {
-        const builder = new PhotoFilterBuilder(db('photos'), event.id, identityMode);
+        const builder = new PhotoFilterBuilder(livePhotos(db), event.id, identityMode);
         builder.applyFilters(buildPhotoFilters(req));
         if (ids) builder.getQuery().whereIn('photos.id', ids);
         return builder;
@@ -1752,7 +1875,7 @@ router.get(
 
       // One answer for unknown, malformed and other-event ids.
       const photo = isRowId(req.params.photoId)
-        ? await db('photos').where({ id: Number(req.params.photoId), event_id: event.id }).first()
+        ? await livePhotos(db).where({ id: Number(req.params.photoId), event_id: event.id }).first()
         : null;
       if (!photo) return res.status(404).json({ error: 'Photo not found' });
 
@@ -1927,7 +2050,7 @@ router.get(
       if (!event) return;
 
       const photo = isRowId(req.params.photoId)
-        ? await db('photos').where({ id: Number(req.params.photoId), event_id: event.id }).first()
+        ? await livePhotos(db).where({ id: Number(req.params.photoId), event_id: event.id }).first()
         : null;
       if (!photo) return res.status(404).json({ error: 'Photo not found' });
 
@@ -1984,7 +2107,16 @@ router.get(
       const stat = await getStorage().stat(previewPath);
       if (!stat) return unavailable();
 
-      const stream = await getStorage().get(previewPath);
+      let stream;
+      try {
+        stream = await getStorage().get(previewPath);
+      } catch (error) {
+        // Removed since the stat (issue 2129), which S3's get() reports by
+        // rejecting: the failed stat's answer, not a 500. The local stream
+        // opens lazily and is answered by pipeStreamToResponse.
+        if (isStorageNotFoundError(error)) return unavailable();
+        throw error;
+      }
       // Left while the read was opening: pipeStreamToResponse's cleanup would
       // never run for this stream.
       if (res.destroyed) {

@@ -1,5 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
+import { ThumbsUp, ThumbsDown } from 'lucide-react';
 import { COLOR_LABEL_SWATCHES, type ColorLabel } from '../../services/feedback.service';
 
 interface ColorLabelBadgeProps {
@@ -11,6 +12,11 @@ interface ColorLabelBadgeProps {
    * gallery has feedback sharing switched off.
    */
   otherColorLabels?: string[];
+  /**
+   * The viewer's own approve / reject (issue 744), shown as a small marker in
+   * the same corner row — it is the same kind of information as their colour.
+   */
+  decision?: string | null;
   /** Extra classes for positioning inside the tile. */
   className?: string;
   /**
@@ -26,6 +32,12 @@ interface ColorLabelBadgeProps {
    * default would land underneath them (#1189).
    */
   position?: string;
+  /**
+   * Render one half only (issue 1992). 'ring' is the tile's inset ring alone;
+   * 'dots' is the dot row alone, in normal flow, for a tile that lines it up
+   * in a row of its own beside the client's visibility toggle.
+   */
+  part?: 'ring' | 'dots';
 }
 
 /**
@@ -39,9 +51,11 @@ interface ColorLabelBadgeProps {
 export const ColorLabelBadge: React.FC<ColorLabelBadgeProps> = ({
   colorLabel,
   otherColorLabels = [],
+  decision = null,
   className = '',
   size = 'md',
   position = 'top-2 left-2',
+  part,
 }) => {
   const { t } = useTranslation();
 
@@ -52,7 +66,9 @@ export const ColorLabelBadge: React.FC<ColorLabelBadgeProps> = ({
     .filter((c) => c in COLOR_LABEL_SWATCHES && c !== colorLabel)
     .slice(0, 3) as ColorLabel[];
 
-  if (!mine && others.length === 0) return null;
+  const myDecision = decision === 'approved' || decision === 'rejected' ? decision : null;
+
+  if (!mine && others.length === 0 && !myDecision) return null;
 
   const swatch = mine ? COLOR_LABEL_SWATCHES[mine] : null;
   const name = mine ? t(`feedback.colorLabels.${mine}`, mine) : '';
@@ -66,7 +82,7 @@ export const ColorLabelBadge: React.FC<ColorLabelBadgeProps> = ({
 
   return (
     <>
-      {mine && swatch && (
+      {mine && swatch && part !== 'dots' && (
         <span
           className={`absolute inset-0 pointer-events-none rounded-[inherit] ${className}`}
           // Inset rather than an outline: the tile is often flush against its
@@ -82,7 +98,8 @@ export const ColorLabelBadge: React.FC<ColorLabelBadgeProps> = ({
           Masonry a media-type badge — and anything placed there gets painted
           over. Sharing this position also reads better: your mark and everyone
           else's are the same kind of information. */}
-      <span className={`absolute ${position} pointer-events-none flex items-center gap-1`}>
+      {part !== 'ring' && (
+      <span className={`${part === 'dots' ? '' : `absolute ${position} `}pointer-events-none flex items-center gap-1`}>
         {mine && swatch && (
           <span
             className={`flex items-center justify-center ${mineDotClass} rounded-full border-white/90 shadow`}
@@ -92,6 +109,24 @@ export const ColorLabelBadge: React.FC<ColorLabelBadgeProps> = ({
             role="img"
             aria-label={t('feedback.markedAs', 'Marked as {{color}}', { color: name })}
           />
+        )}
+        {myDecision && (
+          <span
+            className={`flex items-center justify-center ${size === 'sm' ? 'w-3.5 h-3.5' : 'w-5 h-5'} rounded-full border border-white/90 shadow text-white ${
+              myDecision === 'approved' ? 'bg-success' : 'bg-danger'
+            }`}
+            role="img"
+            aria-label={myDecision === 'approved'
+              ? t('feedback.youApproved', 'You approved this photo')
+              : t('feedback.youRejected', 'You rejected this photo')}
+            title={myDecision === 'approved'
+              ? t('feedback.youApproved', 'You approved this photo')
+              : t('feedback.youRejected', 'You rejected this photo')}
+          >
+            {myDecision === 'approved'
+              ? <ThumbsUp className={size === 'sm' ? 'w-2 h-2' : 'w-3 h-3'} aria-hidden="true" />
+              : <ThumbsDown className={size === 'sm' ? 'w-2 h-2' : 'w-3 h-3'} aria-hidden="true" />}
+          </span>
         )}
         {others.length > 0 && (
           <span
@@ -110,6 +145,7 @@ export const ColorLabelBadge: React.FC<ColorLabelBadgeProps> = ({
           </span>
         )}
       </span>
+      )}
     </>
   );
 };

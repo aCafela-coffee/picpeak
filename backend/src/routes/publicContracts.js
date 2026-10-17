@@ -26,13 +26,14 @@ const rateLimit = require('express-rate-limit');
 const { rateLimitKey } = require('../utils/rateLimitKey');
 const { body, param } = require('express-validator');
 const { handleAsync, validateRequest, successResponse } = require('../utils/routeHelpers');
+const { pipeStreamToResponse } = require('../utils/streamResponse');
 const contractService = require('../services/contractService');
 const publicDocumentViews = require('../services/publicDocumentViews');
 const verification = require('../services/publicDocumentVerificationService');
 const { clientIpForAudit } = require('../utils/clientIp');
 const { loadActionToken, preMulterTokenGuard } = require('../utils/publicTokenGuards');
 const {
-  signedPdfUpload,
+  signedPdfSingle,
   uploadSignedPdfSettingGuard,
   finishSignedPdfUpload,
 } = require('../utils/contractSignedPdfUpload');
@@ -48,6 +49,7 @@ const KIND = 'contract';
 const TABLE = 'contract_action_tokens';
 
 const router = express.Router();
+router.use(require('../database/crmAccess').crmCapabilityRouter('public contract action-token capability'));
 
 const previewLimiter = rateLimit({
   windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, keyGenerator: rateLimitKey,
@@ -163,7 +165,7 @@ router.post(
   uploadSignedPdfSettingGuard,
   preMulterTokenGuard(TABLE),
   requireGrant(KIND),
-  signedPdfUpload.single('file'),
+  signedPdfSingle,
   handleAsync(async (req, res) => finishSignedPdfUpload(req, res)),
 );
 
@@ -217,7 +219,9 @@ router.get(
     }
     res.set('Content-Type', 'application/pdf');
     res.set('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
-    return fs.createReadStream(filePath).pipe(res);
+    // Lazy open: a file removed after the path check errors outside
+    // handleAsync, so the helper answers it instead of the process dying.
+    return pipeStreamToResponse(fs.createReadStream(filePath), res, { context: `contract ${contract.id} PDF` });
   }),
 );
 

@@ -1,5 +1,6 @@
 import { api } from '../config/api';
 import i18n from '../i18n/config';
+import { mediaSplitLabel, splitMediaCount } from '../utils/mediaCounts';
 
 /**
  * Per-flag display labels for activity-log rendering. Values are
@@ -161,6 +162,8 @@ export type ActivityType =
   | "event_deactivated"
   | "photo_deleted"
   | "photos_bulk_deleted"
+  | "photos_restored"
+  | "photos_trash_purged"
   | "settings_updated"
   | "event_updated"
   | "event_renamed"
@@ -225,6 +228,11 @@ export type ActivityType =
   | "bulk_delete_completed"
   | "photo_replaced"
   | "photo_uploaded"
+  // Gallery team and review of its uploads (issue 743).
+  | "event_team_changed"
+  | "photos_review_approved"
+  | "photos_review_rejected"
+  | "guest_uploads_pending_review"
   | "category_hero_updated"
   | "public_site_reset_to_default"
   | "cms_page_logo_uploaded"
@@ -342,6 +350,9 @@ export interface AdminProfile {
   username: string;
   email: string;
   mustChangePassword?: boolean;
+  // The name this account's uploads are credited with when a file carries no
+  // EXIF name (issue 743). Null when unset.
+  creditName?: string | null;
   last_login?: string | null;
   last_login_ip?: string | null;
   created_at?: string;
@@ -470,7 +481,7 @@ export const adminService = {
     const md = activity.metadata || {};
     const messages: Record<string, string> = {
       'event_created': `New event created: ${activity.eventName || 'Unknown'}`,
-      'photos_uploaded': `${md.count || 0} photos uploaded to ${activity.eventName || 'Unknown'}`,
+      'photos_uploaded': `${md.videoCount > 0 ? mediaSplitLabel(i18n.t, splitMediaCount(md.count, md.videoCount)) : `${md.count || 0} photos`} uploaded to ${activity.eventName || 'Unknown'}`,
       'event_archived': `Event archived: ${activity.eventName || 'Unknown'}`,
       'event_published': `Event published: ${activity.eventName || md.event_name || 'Unknown'}`,
       'event_logo_uploaded': `Event logo uploaded for ${activity.eventName || 'Unknown'}`,
@@ -487,6 +498,10 @@ export const adminService = {
       'gallery_password_entry': `Password entered for ${activity.eventName || 'Unknown'}`,
       'expiration_warning_viewed': `Expiration warning viewed for ${activity.eventName || 'Unknown'}`,
       'photo_replaced': `Photo replaced in ${activity.eventName || 'Unknown'}`,
+      'event_team_changed': `Team changed for ${activity.eventName || md.eventName || 'Unknown'}`,
+      'guest_uploads_pending_review': `${md.count || 0} guest uploads waiting for review in ${activity.eventName || md.eventName || 'Unknown'}`,
+      'photos_review_approved': `${md.count || 0} uploads approved in ${activity.eventName || md.eventName || 'Unknown'}`,
+      'photos_review_rejected': `${md.count || 0} uploads rejected in ${activity.eventName || md.eventName || 'Unknown'}`,
       'photo_uploaded': `Photo uploaded to ${activity.eventName || 'Unknown'}`,
       'category_hero_updated': `Category hero photo updated`,
       'public_site_reset_to_default': 'Public site reset to default',
@@ -621,7 +636,7 @@ export const adminService = {
     return response.data;
   },
 
-  async updateAdminProfile(data: { username: string; email: string }): Promise<AdminProfile> {
+  async updateAdminProfile(data: { username: string; email: string; credit_name?: string | null }): Promise<AdminProfile> {
     const response = await api.put<{ user: AdminProfile }>('/admin/auth/profile', data);
     return response.data.user;
   }

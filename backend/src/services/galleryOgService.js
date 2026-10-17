@@ -1,8 +1,15 @@
 const { db } = require('../database/db');
+const { livePhotos, wherePhotoProcessed } = require('../utils/photoVisibility');
 const logger = require('../utils/logger');
 const { ensureThumbnail } = require('./imageProcessor');
+const { isPresentationRenditionKey } = require('./galleryAssetPolicy');
 const { getStorage } = require('./storage');
+const renditionRefresh = require('./renditionRefresh');
+const { pipeStreamToResponse } = require('../utils/streamResponse');
 const { getAbsoluteFrontendUrl } = require('../utils/frontendUrl');
+const { isGalleryAvailable } = require('../utils/galleryLifecycle');
+const { isPotentialShareToken } = require('../utils/shareLinkUtils');
+const { toDateOnly } = require('../utils/dateOnly');
 
 const SOCIAL_CRAWLER_PATTERNS = [
   /facebookexternalhit/i,
@@ -107,9 +114,9 @@ async function resolveSlug(slug) {
   let event = await db('events').where('slug', slug).first();
   if (event) return event;
   // Honour slug redirects so renamed galleries still get rich previews.
-  const hasRedirects = await db.schema.hasTable('event_slug_redirects');
+  const hasRedirects = await db.schema.hasTable('slug_redirects');
   if (hasRedirects) {
-    const redirect = await db('event_slug_redirects').where('old_slug', slug).first();
+    const redirect = await db('slug_redirects').where('old_slug', slug).first();
     if (redirect) {
       event = await db('events').where('slug', redirect.new_slug).first();
     }
@@ -122,7 +129,9 @@ async function resolveSlug(slug) {
   // would otherwise route here with `slug=<token>`, fail the slug
   // lookup, and serve the fallback site-wide OG — which is what
   // alex hit when he ran the Cloudflare Worker as a workaround.
-  if (/^[a-f0-9]{32}$/i.test(slug)) {
+  // Same token shape as everywhere else (32 hex, or 64 from an older quote
+  // or contract conversion): shareLinkUtils.isPotentialShareToken.
+  if (isPotentialShareToken(slug)) {
     event = await db('events').where('share_token', slug).first();
     if (event) return event;
   }
@@ -160,28 +169,24 @@ async function frontendBase() {
 async function formatEventDate(value) {
   if (!value) return null;
   try {
-    const d = new Date(value);
-    if (Number.isNaN(d.getTime())) return null;
+    // A calendar day, handed over as 'YYYY-MM-DD': SQLite's text would be
+    // midnight UTC as a Date (the day before west of UTC), and pg's Date is
+    // the server's local midnight, whose local day toDateOnly reads.
+    const day = toDateOnly(typeof value === 'number' ? new Date(value) : value);
+    if (!day || Number.isNaN(new Date(day).getTime())) return null;
     const { formatDate } = require('../utils/dateFormatter');
-    return await formatDate(d);
+    return await formatDate(day);
   } catch {
     return null;
   }
 }
 
-// Draft, archived and deactivated galleries are refused by /info; the OG
-// preview must not leak their name, date and welcome message to crawlers.
-function isPubliclyVisible(event) {
-  if (!event) return false;
-  const truthy = (v) => v === true || v === 1 || v === '1' || v === 'true';
-  if (truthy(event.is_draft) || truthy(event.is_archived)) return false;
-  if (event.is_active === false || event.is_active === 0 || event.is_active === '0') return false;
-  return true;
-}
-
+// Draft, archived, deactivated and expired galleries are refused by /info;
+// the OG preview must not leak their name, date and welcome message to
+// crawlers. Same predicate as gallery access, so the two never disagree.
 async function buildOgMetadata(slug, requestPath) {
   const resolved = await resolveSlug(slug);
-  const event = isPubliclyVisible(resolved) ? resolved : null;
+  const event = isGalleryAvailable(resolved) ? resolved : null;
   const branding = await fetchBranding();
   const base = await frontendBase();
   const siteName = branding.companyName || 'PicPeak';
@@ -227,8 +232,11 @@ async function buildOgMetadata(slug, requestPath) {
   // crawlers must not get the hero photo either — fall back to the brand
   // logo like the opt-out case.
   if (event.og_image_share_enabled && event.hero_photo_id && !isGalleryHidden(event)) {
-    const heroPhoto = await db('photos')
+    const heroPhoto = await wherePhotoProcessed(livePhotos(db))
       .where({ id: event.hero_photo_id, event_id: event.id })
+      // Never a team upload still under review (issue 743), nor a photo the
+      // worker has not finished, which the gallery itself does not show.
+      .whereNull('moderation_status')
       .select('id', 'thumbnail_path')
       .first();
     if (heroPhoto && heroPhoto.thumbnail_path) {
@@ -247,17 +255,23 @@ async function buildOgMetadata(slug, requestPath) {
   };
 }
 
+// The preview page is for link unfurlers, never for a search index: robots.txt
+// leaves gallery and short links crawlable (the app shell answers noindex),
+// and some crawlers that index, Applebot for one, are served this page
+// instead of the shell. Hence the robots meta here, for every caller.
 function renderOgHtml(meta) {
   const t = escapeHtml(meta.title);
   const d = escapeHtml(meta.description);
   const i = escapeHtml(meta.image);
   const u = escapeHtml(meta.url);
   const s = escapeHtml(meta.siteName);
+  const l = escapeHtml(meta.linkLabel || 'View gallery');
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="robots" content="noindex" />
   <title>${t}</title>
   <meta name="description" content="${d}" />
   <meta property="og:type" content="website" />
@@ -275,7 +289,7 @@ function renderOgHtml(meta) {
 <body>
   <h1>${t}</h1>
   <p>${d}</p>
-  <p><a href="${u}">View gallery</a></p>
+  <p><a href="${u}">${l}</a></p>
 </body>
 </html>`;
 }
@@ -290,6 +304,7 @@ async function handleGalleryOgRequest(req, res) {
     const meta = await buildOgMetadata(slug, req.originalUrl);
     res.set('Cache-Control', 'public, max-age=300');
     res.set('Content-Type', 'text/html; charset=utf-8');
+    res.set('X-Robots-Tag', 'noindex');
     res.send(renderOgHtml(meta));
   } catch (error) {
     logger.error('Failed to render gallery OG page', { error: error.message });
@@ -322,21 +337,49 @@ async function handleGalleryOgCover(req, res) {
     }
     const event = await resolveSlug(slug);
     const { isGalleryHidden } = require('../utils/revealMode');
-    if (!event || !event.og_image_share_enabled || !event.hero_photo_id || isGalleryHidden(event)) {
+    // Lifecycle first: a draft, archived, deactivated or expired gallery has
+    // no public cover, however the opt-in is set.
+    if (!isGalleryAvailable(event) || !event.og_image_share_enabled || !event.hero_photo_id || isGalleryHidden(event)) {
       res.status(404).type('text/plain').send('Cover not available');
       return;
     }
 
-    const photo = await db('photos')
+    const coverQuery = () => wherePhotoProcessed(livePhotos(db))
       .where({ id: event.hero_photo_id, event_id: event.id })
+      .whereNull('moderation_status')
       .first();
+    let photo = await coverQuery();
     if (!photo) {
       res.status(404).type('text/plain').send('Cover not available');
       return;
     }
 
-    const thumbnailPath = await ensureThumbnail(photo);
-    if (!thumbnailPath) {
+    // Renditions from before EXIF stripping (issue 2096) still carry the
+    // photo's GPS position. This is the one rendition reachable without the
+    // gallery password, so it is regenerated before it is served, not when the
+    // background pass gets to it. If that fails the old file is not served.
+    if (renditionRefresh.needsRefresh(photo)) {
+      if (!(await renditionRefresh.refreshCover(photo))) {
+        res.status(404).type('text/plain').send('Cover not available');
+        return;
+      }
+      photo = await coverQuery();
+      if (!photo) {
+        res.status(404).type('text/plain').send('Cover not available');
+        return;
+      }
+    }
+
+    // This endpoint is public, so the row's pointer gets the same check as
+    // the gallery thumbnail route: a legacy-shaped one is rebuilt, and only a
+    // key in the thumbnail namespace is ever read. The rebuild is checked
+    // against a concurrent settings change like the gallery route's (issue
+    // 2140).
+    let thumbnailPath = await ensureThumbnail(photo);
+    if (thumbnailPath && !isPresentationRenditionKey(thumbnailPath, 'thumbnail')) {
+      thumbnailPath = await ensureThumbnail(photo, { force: true, checkSettings: true });
+    }
+    if (!isPresentationRenditionKey(thumbnailPath, 'thumbnail')) {
       res.status(404).type('text/plain').send('Cover not available');
       return;
     }
@@ -366,7 +409,7 @@ async function handleGalleryOgCover(req, res) {
     });
     if (stat.size) res.setHeader('Content-Length', stat.size);
     const stream = await storage.get(thumbnailPath);
-    stream.pipe(res);
+    pipeStreamToResponse(stream, res, { context: `gallery OG cover for photo ${photo.id}` });
   } catch (error) {
     logger.error('Failed to stream gallery OG cover', { error: error.message });
     res.status(500).type('text/plain').send('Internal server error');
@@ -375,8 +418,11 @@ async function handleGalleryOgCover(req, res) {
 
 module.exports = {
   isSocialCrawler,
+  fetchBranding,
+  absoluteUrl,
   buildOgMetadata,
   renderOgHtml,
   handleGalleryOgRequest,
-  handleGalleryOgCover
+  handleGalleryOgCover,
+  formatEventDate
 };

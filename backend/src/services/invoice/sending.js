@@ -3,6 +3,7 @@
 
 const crypto = require('crypto');
 const { db, logActivity } = require('../../database/db');
+const { adminActivityActor } = require('../../utils/activityActor');
 const logger = require('../../utils/logger');
 const { AppError } = require('../../utils/errors');
 const { formatShortDate } = require('../../utils/dateFormatter');
@@ -28,7 +29,49 @@ const { auditedInsert, auditedUpdate } = require('../accountingHistory');
  *        (auto-send / scheduler) the resolved per-customer/global default
  *        decides all-or-none.
  */
+// In-progress sends in this process, by invoice id. The scheduler flush, a
+// workflow send_document and an admin click can reach the same scheduled row
+// at once; the conditional status flip below is what keeps a second one from
+// mailing, this just makes it wait for the first instead of rendering a second
+// PDF. When the send it waited for went out, a waiting caller reports that
+// send, a re-send included: two quick clicks on Send are one send, not two.
+// When it failed, the waiting caller runs the normal path and may send itself.
+const sendsInFlight = new Map();
+// Separate map: sendInvoice hands a storno row to sendStorno while it still
+// holds the id in sendsInFlight.
+const stornoSendsInFlight = new Map();
+
+/**
+ * Send (or, with options.allowResend, re-send) an invoice to the customer.
+ * Only the admin's own Send button passes allowResend: every automatic
+ * caller — scheduler, workflow, delivery release, monthly trigger — sends an
+ * invoice once, and an invoice that is already out comes back as
+ * { sent: false, alreadySent: true } with no email.
+ */
 async function sendInvoice(id, adminId, options = {}) {
+  while (sendsInFlight.has(id)) {
+    let other = null;
+    try { other = await sendsInFlight.get(id); } catch (_) { /* that send failed; this one may try */ }
+    if (other && other.sent) return { sent: false, alreadySent: true };
+  }
+  const attempt = sendInvoiceOnce(id, adminId, options);
+  sendsInFlight.set(id, attempt);
+  let result;
+  try {
+    result = await attempt;
+  } finally {
+    if (sendsInFlight.get(id) === attempt) sendsInFlight.delete(id);
+  }
+  // A first send of an invoice a waiting booking run prepared answers that
+  // run's review gate. After the in-flight entry is gone: the run continues
+  // from here and its own send_document must not wait on this very send.
+  if (result && result.firstSend) {
+    await require('../workflows').answerGatesForInvoice(id);
+  }
+  return result && result.sent ? { sent: true, pdfPath: result.pdfPath } : result;
+}
+
+async function sendInvoiceOnce(id, adminId, options = {}) {
   const data = await getInvoiceById(id);
   if (!data) throw new AppError('Invoice not found', 404);
   const { invoice, lineItems } = data;
@@ -41,6 +84,9 @@ async function sendInvoice(id, adminId, options = {}) {
   }
   if (!['scheduled', 'sent', 'overdue'].includes(invoice.status)) {
     throw new AppError(`Cannot send invoice with status '${invoice.status}'`, 409);
+  }
+  if (invoice.status !== 'scheduled' && !options.allowResend) {
+    return { sent: false, alreadySent: true };
   }
   // Monthly-draft guard (migration 128). Rows flagged
   // is_monthly_draft=true accumulate line items across the period
@@ -104,7 +150,7 @@ async function sendInvoice(id, adminId, options = {}) {
     if (storedDue && storedDue === oldAutoDue) {
       updates.due_date = computeDueDate(new Date(sendDateIso), netDays).toISOString().slice(0, 10);
     }
-    await auditedUpdate(db, 'invoices', { id }, updates, { actor: adminId, source: 'invoice.send.issueDate' });
+    await auditedUpdate(db, 'invoices', { id, status: 'scheduled' }, updates, { actor: adminId, source: 'invoice.send.issueDate' });
     invoice.issue_date = updates.issue_date;
     if (updates.due_date) invoice.due_date = updates.due_date;
   }
@@ -125,9 +171,16 @@ async function sendInvoice(id, adminId, options = {}) {
   });
 
   const newStatus = invoice.status === 'overdue' ? 'overdue' : 'sent';
-  await auditedUpdate(db, 'invoices', { id }, {
+  // Conditional on the status read above: when another process sent this
+  // scheduled invoice in the meantime, the row is no longer 'scheduled',
+  // nothing updates and no second email is queued.
+  const claimed = await auditedUpdate(db, 'invoices', { id, status: invoice.status }, {
     status: newStatus, sent_at: new Date(), pdf_path: storedPath, updated_at: new Date(),
   }, { actor: adminId, source: 'invoice.send' });
+  if (!claimed) {
+    logger.warn(`sendInvoice: ${invoice.invoice_number} was sent by another caller — not sending again`);
+    return { sent: false, alreadySent: true };
+  }
 
   const { to: invoiceTo, cc: invoiceCc } = resolveBillingRecipients(customer, invoice.cc_pdf_email);
 
@@ -161,9 +214,9 @@ async function sendInvoice(id, adminId, options = {}) {
     __language: ctx.locale,
     cc: invoiceCc,
     attachments: invoiceAttachments,
-  });
+  }, { customerAccountId: customer.id });
 
-  try { await logActivity('invoice_sent', { invoiceId: id }, invoice.event_id || null, `admin:${adminId}`); } catch (_) { /* non-fatal */ }
+  try { await logActivity('invoice_sent', { invoiceId: id }, invoice.event_id || null, adminActivityActor(adminId)); } catch (_) { /* non-fatal */ }
 
   // Fire the workflow engine's invoice.sent trigger (after the row is updated +
   // the email queued). Idempotent per invoice id; no-op when the workflows flag
@@ -186,7 +239,7 @@ async function sendInvoice(id, adminId, options = {}) {
     });
   } catch (_) { /* non-fatal */ }
 
-  return { sent: true, pdfPath };
+  return { sent: true, pdfPath, firstSend: invoice.status === 'scheduled' };
 }
 
 /**
@@ -230,8 +283,22 @@ async function releaseRebillsForCancelledInvoice(conn, invoiceId, adminId) {
   }
 }
 
+/** The original row, locked for the rest of the transaction on PostgreSQL. */
+async function lockInvoiceRow(trx, id) {
+  const query = trx('invoices').where({ id });
+  // Compatible with the KEY SHARE lock of foreign-key checks on child rows
+  // (see accountingHistory.auditedUpdate); it still serialises two
+  // transactions that both want to decide about this row.
+  if (trx.client.config.client === 'pg') query.forNoKeyUpdate();
+  return query.first();
+}
+
 async function createStorno(originalId, adminId, trx = db) {
-  const original = await trx('invoices').where({ id: originalId }).first();
+  // Read under the row lock and flip the original with a compare-and-set
+  // below: two cancellations (or a cancellation and a reissue) that both
+  // saw a live status used to each insert a Storno, and the later one took
+  // over cancellation_storno_id, leaving the other Storno orphaned.
+  const original = await lockInvoiceRow(trx, originalId);
   if (!original) throw new AppError('Invoice not found', 404);
   if (original.kind === 'storno') {
     throw new AppError('Cannot Storno a Storno', 409, 'IS_STORNO');
@@ -347,12 +414,18 @@ async function createStorno(originalId, adminId, trx = db) {
       { actor: adminId, source: 'invoice.storno.create' });
   }
 
-  // Flip the original to cancelled + link the Storno.
-  await auditedUpdate(trx, 'invoices', { id: originalId }, {
+  // Flip the original to cancelled + link the Storno — only from the status
+  // read above. A loser rolls back with its Storno row and sequence claim.
+  const flipped = await auditedUpdate(trx, 'invoices', { id: originalId, status: original.status }, {
     status: 'cancelled',
     cancellation_storno_id: stornoId,
     updated_at: now,
   }, { actor: adminId, source: 'invoice.storno.cancelOriginal' });
+  if (flipped !== 1) {
+    throw new AppError('The invoice changed while it was being cancelled. Reload and try again.', 409, 'INVOICE_STATE_CHANGED');
+  }
+  // Cancelled: no outstanding payment-check link may act on it any more.
+  await require('./payments').revokePendingPaymentCheckTokens(trx, originalId, now.toISOString(), 'revoked');
   // Free any re-billed supplier invoices so the cost isn't stranded (#866 review).
   await releaseRebillsForCancelledInvoice(trx, originalId, adminId);
 
@@ -361,7 +434,7 @@ async function createStorno(originalId, adminId, trx = db) {
     // the global db here deadlocks the single-connection SQLite pool.
     await logActivity('invoice_cancelled_via_storno',
       { invoiceId: originalId, stornoId, stornoNumber },
-      original.event_id || null, `admin:${adminId}`, trx);
+      original.event_id || null, adminActivityActor(adminId), trx);
   } catch (_) { /* non-fatal */ }
 
   return stornoId;
@@ -379,6 +452,22 @@ async function createStorno(originalId, adminId, trx = db) {
  * template — the row stays in `sent` either way.
  */
 async function sendStorno(stornoId, adminId) {
+  // Same wait as sendInvoice: a caller that finds a send of this storno in
+  // flight waits for it, then reads the row again, so it never reports "sent"
+  // for a storno whose send then failed.
+  while (stornoSendsInFlight.has(stornoId)) {
+    try { await stornoSendsInFlight.get(stornoId); } catch (_) { /* that send failed; this one may try */ }
+  }
+  const attempt = sendStornoOnce(stornoId, adminId);
+  stornoSendsInFlight.set(stornoId, attempt);
+  try {
+    return await attempt;
+  } finally {
+    if (stornoSendsInFlight.get(stornoId) === attempt) stornoSendsInFlight.delete(stornoId);
+  }
+}
+
+async function sendStornoOnce(stornoId, adminId) {
   const data = await getInvoiceById(stornoId);
   if (!data) throw new AppError('Storno not found', 404);
   const { invoice: storno, lineItems } = data;
@@ -386,7 +475,6 @@ async function sendStorno(stornoId, adminId) {
     throw new AppError(`Expected kind='storno', got '${storno.kind}'`, 409);
   }
   if (storno.status === 'sent') return { status: 'sent' };
-
   const customer = await db('customer_accounts').where({ id: storno.customer_account_id }).first();
   ensureCustomerCanBill(customer);
 
@@ -405,12 +493,15 @@ async function sendStorno(stornoId, adminId) {
     issuer: ctx.issuer,
   });
 
-  await auditedUpdate(db, 'invoices', { id: stornoId }, {
+  // Same claim as sendInvoice: only the caller that flips the row mails it
+  // (cancelInvoice's inline send and the scheduler retry can overlap).
+  const claimed = await auditedUpdate(db, 'invoices', { id: stornoId, status: storno.status }, {
     status: 'sent',
     sent_at: new Date(),
     pdf_path: storedPath,
     updated_at: new Date(),
   }, { actor: adminId, source: 'invoice.storno.send' });
+  if (!claimed) return { status: 'sent' };
 
   // Look up the original so we can include both numbers in the
   // email body — customers' bookkeepers expect to see the pair.
@@ -434,12 +525,12 @@ async function sendStorno(stornoId, adminId) {
       contentPath: pdfPath,
       contentType: 'application/pdf',
     }],
-  });
+  }, { customerAccountId: customer.id });
 
   try {
     await logActivity('storno_sent',
       { stornoId, stornoNumber: storno.invoice_number, originalInvoiceId: storno.cancels_invoice_id || null },
-      storno.event_id || null, `admin:${adminId || 'system'}`);
+      storno.event_id || null, adminActivityActor(adminId));
   } catch (_) { /* non-fatal */ }
 
   return { status: 'sent', stornoId };
@@ -502,6 +593,19 @@ async function reissueInvoice(id, adminId) {
   // getAppSetting, bank resolution, audit) all accept the trx now, so
   // the round-1 SQLite deadlock is gone the right way.
   return await db.transaction(async (trx) => {
+    // One live replacement per original. Two reissues that both found the
+    // original already cancelled (or one that lost the Storno race above and
+    // was retried) must not each create a replacement: the original is
+    // locked here, and a replacement that is not itself cancelled refuses
+    // another.
+    if (!(await lockInvoiceRow(trx, id))) throw new AppError('Invoice not found', 404);
+    const [existing] = await trx('invoices').where({ replaces_invoice_id: id }).whereNot('status', 'cancelled')
+      .select('id', 'invoice_number').limit(1);
+    if (existing) {
+      throw new AppError(
+        `This invoice was already reissued as ${existing.invoice_number}.`, 409, 'ALREADY_REISSUED',
+      );
+    }
     const lineItems = await trx('invoice_line_items as li')
       .leftJoin('invoice_line_items as parent', 'parent.id', 'li.parent_line_item_id')
       .where('li.invoice_id', id)
@@ -568,7 +672,7 @@ async function reissueInvoice(id, adminId) {
       // Pass `trx` so the audit insert rides the transaction's connection.
       await logActivity('invoice_reissued',
         { originalInvoiceId: id, newInvoiceId: newId, stornoId },
-        original.event_id || null, `admin:${adminId}`, trx);
+        original.event_id || null, adminActivityActor(adminId), trx);
     } catch (_) { /* non-fatal */ }
 
     return { id: newId, replaces: id, stornoId };
@@ -602,7 +706,7 @@ async function releaseForDelivery(id, adminId) {
     updated_at: now,
   }, { actor: adminId, source: 'invoice.releaseForDelivery' });
   try {
-    await logActivity('invoice_released_for_delivery', { invoiceId: id }, invoice.event_id || null, `admin:${adminId}`);
+    await logActivity('invoice_released_for_delivery', { invoiceId: id }, invoice.event_id || null, adminActivityActor(adminId));
   } catch (_) { /* non-fatal */ }
   // Fire immediately rather than waiting for the next scheduler
   // tick — admin clicked the button because they want it out now.
@@ -656,8 +760,10 @@ async function cancelInvoice(id, adminId) {
     try {
       await logActivity('invoice_cancelled',
         { invoiceId: id, viaStorno: false },
-        invoice.event_id || null, `admin:${adminId}`);
+        invoice.event_id || null, adminActivityActor(adminId));
     } catch (_) { /* non-fatal */ }
+    // Still unsent until now: a booking run's review gate for it is answered.
+    await require('../workflows').answerGatesForInvoice(id);
     return { cancelled: true, stornoId: null };
   }
 
@@ -700,7 +806,7 @@ async function triggerMonthlyBillNow(customerId, adminId) {
   try {
     await logActivity('monthly_bill_triggered_manually',
       { invoiceId: draft.id, customerId, periodEnd: draft.monthly_period_end },
-      null, `admin:${adminId}`);
+      null, adminActivityActor(adminId));
   } catch (_) { /* non-fatal */ }
 
   // Inline send so admin gets immediate feedback (PDF stored, status

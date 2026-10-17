@@ -63,8 +63,12 @@ export const ShareLinkCard: React.FC<ShareLinkCardProps> = ({ event, setShowPass
   const revealGeneration = useRef(0);
   // Show / reset the password and resend the email are client help: the
   // routes accept events.edit or events.support, on galleries this admin may
-  // act on.
-  const canHelpClient = useAnyPermission(['events.edit', 'events.support']) && !event.share_secrets_hidden;
+  // act on — and only the owner's (issue 743): an assigned team member gets
+  // 403 from all three, so they are not offered. An older payload without
+  // can_manage_assignments is read as the owner's.
+  const canHelpClient = useAnyPermission(['events.edit', 'events.support'])
+    && !event.share_secrets_hidden
+    && event.can_manage_assignments !== false;
 
   // #1271 — "Show password" only exists while the admin has opted into
   // recoverable storage in Settings → Security. Off is the default; the
@@ -219,7 +223,7 @@ export const ShareLinkCard: React.FC<ShareLinkCardProps> = ({ event, setShowPass
               />
             ) : (
               <div className="w-28 h-28 rounded-lg border border-line bg-inset flex items-center justify-center">
-                <QrCode className="w-8 h-8 text-neutral-300 dark:text-neutral-500" />
+                <QrCode className="w-8 h-8 text-faint" />
               </div>
             )}
             <div className="flex-1 w-full grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -256,7 +260,7 @@ export const ShareLinkCard: React.FC<ShareLinkCardProps> = ({ event, setShowPass
                 {stored ? t('events.hideGalleryPassword', 'Hide password') : t('events.showGalleryPassword', 'Show password')}
               </Button>
               {stored && (
-                <div className="rounded-lg border border-line bg-neutral-50 dark:bg-neutral-700/50 p-3 space-y-2 text-sm" data-testid="stored-gallery-password">
+                <div className="rounded-lg border border-line bg-subtle p-3 space-y-2 text-sm" data-testid="stored-gallery-password">
                   {!stored.password && !stored.client_password ? (
                     <p className="text-soft">{t('events.galleryPasswordNotStored')}</p>
                   ) : (
@@ -270,10 +274,10 @@ export const ShareLinkCard: React.FC<ShareLinkCardProps> = ({ event, setShowPass
                         <button
                           type="button"
                           onClick={() => copySecret(key, value as string)}
-                          className="p-1 text-neutral-500 hover:text-heading"
+                          className="p-1 text-muted hover:text-heading"
                           aria-label={`${t('events.copy')} ${label}`}
                         >
-                          {copiedSecret === key ? <CheckCircle className="w-4 h-4 text-green-600" /> : <Copy className="w-4 h-4" />}
+                          {copiedSecret === key ? <CheckCircle className="w-4 h-4 text-success-text" /> : <Copy className="w-4 h-4" />}
                         </button>
                       </div>
                     ))
@@ -291,27 +295,33 @@ export const ShareLinkCard: React.FC<ShareLinkCardProps> = ({ event, setShowPass
           >
             {t('events.resetGalleryPassword')}
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            leftIcon={<Mail className="w-4 h-4" />}
-            onClick={async () => {
-              try {
-                await eventsService.resendCreationEmail(event.id);
-                // #1262 — "queued" was being read as "delivered". Queueing only
-                // writes an email_queue row; say where to look when it doesn't
-                // turn up, because a queue nobody is working raises no failure.
-                toast.success(`${t('events.creationEmailResent')} ${t('events.emailQueuedHint', 'The queue processor sends it — check System health if it does not arrive.')}`);
-              } catch {
-                toast.error(t('events.failedToResendEmail'));
-              }
-            }}
-            className="w-full justify-center"
-          >
-            {t('events.resendCreationEmail')}
-          </Button>
-          {passwordRecoverable && hasSecret && (
-            <p className="text-xs text-muted text-center">{t('events.resendWithStoredPasswordHint')}</p>
+          {/* No customer email (optional at creation, clearable since issue
+              1733) means nobody to resend to; the server would answer 400. */}
+          {event.customer_email && (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                leftIcon={<Mail className="w-4 h-4" />}
+                onClick={async () => {
+                  try {
+                    await eventsService.resendCreationEmail(event.id);
+                    // #1262 — "queued" was being read as "delivered". Queueing only
+                    // writes an email_queue row; say where to look when it doesn't
+                    // turn up, because a queue nobody is working raises no failure.
+                    toast.success(`${t('events.creationEmailResent')} ${t('events.emailQueuedHint', 'The queue processor sends it — check System health if it does not arrive.')}`);
+                  } catch {
+                    toast.error(t('events.failedToResendEmail'));
+                  }
+                }}
+                className="w-full justify-center"
+              >
+                {t('events.resendCreationEmail')}
+              </Button>
+              {passwordRecoverable && hasSecret && (
+                <p className="text-xs text-muted text-center">{t('events.resendWithStoredPasswordHint')}</p>
+              )}
+            </>
           )}
         </div>
       )}

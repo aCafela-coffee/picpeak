@@ -11,6 +11,7 @@ const { isUniqueViolation } = require('../../utils/dbErrors');
 const businessProfileService = require('../businessProfileService');
 const { ensureSystemBlocksSeeded } = require('../contractBlocksService');
 const { ensureInt } = require('../../utils/numericHelpers');
+const { unicodeSearchForms } = require('../../utils/sqlSecurity');
 const { adminActor, ensureCustomerActive, nextContractNumber, releaseQuoteOnDeadContract } = require('./helpers');
 const { auditedInsert, auditedUpdate, auditedDelete } = require('../accountingHistory');
 
@@ -39,12 +40,15 @@ async function listContracts({ filters = {}, sort = 'issue_desc', page = 1, page
       query = query.where('contracts.customer_account_id', filters.customerAccountId);
     }
     if (filters.q && String(filters.q).trim()) {
-      const term = `%${String(filters.q).trim()}%`;
+      // Every stored spelling of a name (unicodeSearchForms).
+      const terms = unicodeSearchForms(String(filters.q).trim()).map((t) => `%${t}%`);
       query = query.andWhere(function() {
-        this.where('contracts.contract_number', 'like', term)
-          .orWhere('contracts.title', 'like', term)
-          .orWhere('customer_accounts.email', 'like', term)
-          .orWhere('customer_accounts.company_name', 'like', term);
+        for (const term of terms) {
+          this.orWhere('contracts.contract_number', 'like', term)
+            .orWhere('contracts.title', 'like', term)
+            .orWhere('customer_accounts.email', 'like', term)
+            .orWhere('customer_accounts.company_name', 'like', term);
+        }
       });
     }
 
@@ -103,6 +107,8 @@ async function getContractById(id) {
         'customer_accounts.last_name as customer_last_name',
         'customer_accounts.company_name as customer_company_name',
         'customer_accounts.preferred_language as customer_preferred_language',
+        // Drives the Issue (no email) button (migration 300).
+        'customer_accounts.no_admin_emails as customer_no_admin_emails',
       )
       .first();
     if (!contract) return null;

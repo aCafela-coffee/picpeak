@@ -2,16 +2,17 @@ import React from 'react';
 import { Search, Filter, SortAsc, SortDesc, UserRound } from 'lucide-react';
 import { Input } from '../common';
 import { useTranslation } from 'react-i18next';
+import type { PhotoSortKey } from '../../services/photos.service';
 
 interface PhotoFiltersProps {
   categories: Array<{ id: number | string; name: string; slug: string }>;
   selectedCategory: number | string | null | undefined;
   searchTerm: string;
-  sortBy: 'date' | 'name' | 'size' | 'rating';
+  sortBy: PhotoSortKey;
   sortOrder: 'asc' | 'desc';
   onCategoryChange: (categoryId: number | string | null | undefined) => void;
   onSearchChange: (search: string) => void;
-  onSortChange: (sort: 'date' | 'name' | 'size' | 'rating', order: 'asc' | 'desc') => void;
+  onSortChange: (sort: PhotoSortKey, order: 'asc' | 'desc') => void;
   mediaType?: 'all' | 'photo' | 'video';
   onMediaTypeChange?: (mediaType: 'all' | 'photo' | 'video') => void;
   showMediaFilter?: boolean;
@@ -57,13 +58,13 @@ export const PhotoFilters: React.FC<PhotoFiltersProps> = ({
             placeholder={t('gallery.searchByFilename', 'Search by filename...')}
             value={searchTerm}
             onChange={(e) => onSearchChange(e.target.value)}
-            leftIcon={<Search className="w-5 h-5 text-neutral-400" />}
+            leftIcon={<Search className="w-5 h-5 text-faint" />}
           />
         </div>
 
         {/* Category Filter */}
         <div className="flex items-center gap-2">
-          <Filter className="w-5 h-5 text-neutral-400" />
+          <Filter className="w-5 h-5 text-faint" />
           <select
             value={selectedCategory === null ? '' : selectedCategory || ''}
             onChange={(e) => {
@@ -72,7 +73,7 @@ export const PhotoFilters: React.FC<PhotoFiltersProps> = ({
               const numeric = Number(raw);
               onCategoryChange(Number.isNaN(numeric) ? raw : numeric);
             }}
-            className="px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-primary-500 focus:border-accent-dark"
+            className="px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-accent focus:border-accent-dark"
           >
             <option value="">{t('gallery.allCategories', 'All Categories')}</option>
             {/* The literal the backend understands, not 0 (#1211). It skips
@@ -93,12 +94,12 @@ export const PhotoFilters: React.FC<PhotoFiltersProps> = ({
             empties the list, and the filter would stay on with no way out. */}
         {onCreditChange && (credits.length > 0 || !!selectedCredit) && (
           <div className="flex items-center gap-2">
-            <UserRound className="w-5 h-5 text-neutral-400" aria-hidden="true" />
+            <UserRound className="w-5 h-5 text-faint" aria-hidden="true" />
             <select
               value={selectedCredit ?? ''}
               onChange={(e) => onCreditChange(e.target.value === '' ? undefined : e.target.value)}
               aria-label={t('admin.photos.credit.filterLabel')}
-              className="px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-primary-500 focus:border-accent-dark max-w-[16rem]"
+              className="px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-accent focus:border-accent-dark max-w-[16rem]"
             >
               <option value="">{t('admin.photos.credit.filterAll')}</option>
               {credits.map((credit) => (
@@ -121,11 +122,11 @@ export const PhotoFilters: React.FC<PhotoFiltersProps> = ({
 
         {showMediaFilter && onMediaTypeChange && (
           <div className="flex items-center gap-2">
-            <Filter className="w-5 h-5 text-neutral-400" />
+            <Filter className="w-5 h-5 text-faint" />
             <select
               value={mediaType}
               onChange={(e) => onMediaTypeChange(e.target.value as 'all' | 'photo' | 'video')}
-              className="px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-primary-500 focus:border-accent-dark"
+              className="px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-accent focus:border-accent-dark"
             >
               <option value="all">{t('gallery.allMedia', 'All media')}</option>
               <option value="photo">{t('gallery.photosOnly', 'Photos only')}</option>
@@ -138,10 +139,11 @@ export const PhotoFilters: React.FC<PhotoFiltersProps> = ({
         <div className="flex items-center gap-2">
           <select
             value={sortBy}
-            onChange={(e) => onSortChange(e.target.value as 'date' | 'name' | 'size' | 'rating', sortOrder)}
-            className="px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-primary-500 focus:border-accent-dark"
+            onChange={(e) => onSortChange(e.target.value as PhotoSortKey, sortOrder)}
+            className="px-3 py-2 border border-line-strong rounded-lg bg-panel text-heading focus:ring-2 focus:ring-accent focus:border-accent-dark"
           >
             <option value="date">{t('gallery.sortByDate', 'Sort by Date')}</option>
+            <option value="capture_date">{t('gallery.sortByCaptureDate', 'Sort by Capture Date')}</option>
             <option value="name">{t('gallery.sortByName', 'Sort by Name')}</option>
             <option value="size">{t('gallery.sortBySize', 'Sort by Size')}</option>
             <option value="rating">{t('gallery.sortByRating', 'Sort by Rating')}</option>

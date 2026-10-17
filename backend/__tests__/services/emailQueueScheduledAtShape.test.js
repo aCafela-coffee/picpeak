@@ -27,13 +27,12 @@ const { bootCrmDb, seedMinimal } = require('../integration/helpers/crmDb');
 const SRC = path.join(__dirname, '../../src');
 // Every `db('email_queue').insert({ ... status: 'pending' ... })` in the
 // backend. adminEmail.js inserts an already-sent manual message and is not a
-// queue writer.
+// queue writer. Gallery notices (create, publish, send later) go through
+// galleryNotificationService → queueEmail.
 const PENDING_WRITERS = [
   'services/emailProcessor.js',
-  'services/eventCreationService.js',
   'services/projectService.js',
   'services/newsletterService.js',
-  'routes/adminEvents/crud.js',
 ];
 
 describe('every pending-row writer names scheduled_at', () => {
@@ -47,10 +46,10 @@ describe('every pending-row writer names scheduled_at', () => {
     const bodies = statements.map((stmt) => (/^\s*row\s*\)?$/.test(stmt.replace(/\)\.returning\([^)]*\)/, ''))
       ? src.match(/const row = \{([\s\S]*?)\n\s*\};/)[1]
       : stmt));
-    const pendingBodies = bodies.filter((body) => /status:\s*'pending'/.test(body));
-    expect(pendingBodies.length).toBeGreaterThan(0);
-    // The key itself, not a comment that names it.
-    for (const body of pendingBodies) expect(body).toMatch(/scheduled_at\s*:/);
+    // These writers now choose ordinary/protected pending states at runtime.
+    // Require the schedule on every inserted queue body, independent of the
+    // status expression, so encrypted messages cannot escape this invariant.
+    for (const body of bodies) expect(body).toMatch(/scheduled_at\s*:/);
   });
 
   test('no writer leaves the column to its default any more', () => {
