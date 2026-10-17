@@ -72,7 +72,7 @@ git fetch https://github.com/PicPeak/picpeak.git ec7b22354fd6b5a66aec9e2a965e22f
 node scripts/ci/check-official-source.cjs
 node scripts/check-korean-locales.cjs
 npm ci
-npm ci --legacy-peer-deps --prefix frontend
+npm ci --prefix frontend
 npm run build:check --prefix frontend
 npm run lint --prefix frontend
 npm test --prefix frontend -- --run

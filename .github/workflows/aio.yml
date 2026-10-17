@@ -35,7 +35,7 @@ jobs:
         run: node scripts/ci/check-official-source.cjs
       - run: npm ci
       - run: npx playwright install --with-deps chromium
-      - run: npm ci --legacy-peer-deps
+      - run: npm ci
         working-directory: frontend
       - name: Translation integrity
         run: node scripts/check-korean-locales.cjs

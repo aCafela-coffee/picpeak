@@ -118,7 +118,7 @@ export const CompactLanguageSelector: React.FC = () => {
 };
 
 export const LanguageSelector: React.FC = () => {
-  const { i18n } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [isOpen, setIsOpen] = React.useState(false);
 
   const currentLanguage = SUPPORTED_UI_LANGUAGES.find(lang => lang.code === normalizeScreenLanguage(i18n.language)) || SUPPORTED_UI_LANGUAGES[0];
@@ -137,7 +137,7 @@ export const LanguageSelector: React.FC = () => {
         // is enough recognition on its own and stops this control from
         // pushing into the company-name title on narrow mobile widths
         // (#523). Full name stays on sm+ where there's room.
-        aria-label={`${i18n.t('common.language')}: ${currentLanguage.name}`}
+        aria-label={`${t('common.language')}: ${currentLanguage.name}`}
         aria-expanded={isOpen}
         title={currentLanguage.name}
       >
