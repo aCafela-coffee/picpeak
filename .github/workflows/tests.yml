@@ -83,6 +83,17 @@ jobs:
           sudo apt-get install -y build-essential ffmpeg libimage-exiftool-perl sqlite3
           npm run build:native
 
+      # These unchanged upstream tests inspect the source AIO Dockerfile for
+      # native compilation and TRUST_PROXY defaults. Our overlay inherits both
+      # from the pinned image; test the official build fixture here and compare
+      # the actual overlay filesystem/config in aio.yml on both architectures.
+      - name: Verify official source and restore its AIO build fixture for Jest
+        run: |
+          official_ref=$(node -p "require('./aio-baseline.json').sourceCommit")
+          git fetch --no-tags --depth=1 https://github.com/PicPeak/picpeak.git "$official_ref"
+          node scripts/ci/check-official-source.cjs
+          git show "${official_ref}:Dockerfile.aio" > Dockerfile.aio
+
       - name: Run Jest suite
         working-directory: ./backend
         # On the step, not only on the job: a job that hits its own cap is

@@ -33,6 +33,7 @@ for key in set(configs[0]['Config']) | set(configs[1]['Config']):
     assert configs[0]['Config'].get(key) == configs[1]['Config'].get(key), f'Runtime configuration changed: {key}'
 assert configs[0]['RootFS']['Layers'] == configs[1]['RootFS']['Layers'][:len(configs[0]['RootFS']['Layers'])], 'Official layers must be inherited'
 assert configs[0]['Config']['Labels']['org.opencontainers.image.revision'] == baseline['sourceCommit'], 'Official source/image pair mismatch'
+assert 'TRUST_PROXY=0' in configs[0]['Config']['Env'], 'Official AIO must not trust forwarding hops by default'
 
 containers = []
 def fingerprint(image):
@@ -69,6 +70,9 @@ def fingerprint(image):
 
 try:
     a, b = fingerprint(official), fingerprint(candidate)
+    for binary in ('app/bin/media-process-guard', 'app/bin/local-process-lease.node'):
+        assert binary in a and a[binary][-1], f'Official native component missing: {binary}'
+    assert a['app/bin/media-process-guard'][1] & 0o100, 'Official media guard must be executable'
     changes = [path for path in sorted(a.keys() | b.keys()) if a.get(path) != b.get(path)]
     assert not changes, f'Runtime files changed outside frontend/dist: {changes[:30]}'
     print('Image invariant passed: runtime configuration, backend, migrations, dependencies and filesystem unchanged.')
