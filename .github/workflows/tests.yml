@@ -103,7 +103,9 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The upstream suite already takes over eight minutes; keep headroom for
+    # the complete gallery and browser-language regression suite.
+    timeout-minutes: 20
 
     steps:
       - name: Checkout code

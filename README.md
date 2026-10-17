@@ -1,3 +1,7 @@
+> **한국어 화면 전용 포크:** 공식 `3.175.1-beta.0` AIO의 프런트엔드만 교체합니다.
+> 공개 이미지: `ghcr.io/acafela-coffee/picpeak/aio:main`.
+> [고정 기준·지원 범위·검증·운영 전환 및 복귀 안내](docs/deployment/korean-aio.md)를 먼저 확인하세요.
+
 <div align="center">
   <img src="docs/picpeak-logo.png" alt="PicPeak Logo" width="300" />
 

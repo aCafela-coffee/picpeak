@@ -47,7 +47,7 @@ vi.mock('../../hooks/useLocalizedDate', () => ({
 }));
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (_key: string, fallback?: string) => fallback ?? _key }),
+  useTranslation: () => ({ i18n: { language: 'en', changeLanguage: vi.fn() }, t: (_key: string, fallback?: string) => fallback ?? _key }),
 }));
 
 vi.mock('../../components/gallery', () => ({
